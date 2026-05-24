@@ -227,7 +227,9 @@ def register_messaging_tools(
 
         Args:
             linkedin_username: LinkedIn username of the recipient
-            message: The message text to send
+            message: The message text to send. `\n` is preserved as a line
+                break and `\n\n` as a paragraph break, matching how LinkedIn
+                renders multi-paragraph messages in the web composer.
             confirm_send: Must be True to send the message
             ctx: FastMCP context for progress reporting
             profile_urn: Optional profile URN (e.g. ACoAAB...) to construct the
