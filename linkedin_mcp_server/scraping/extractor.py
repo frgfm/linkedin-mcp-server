@@ -3204,7 +3204,23 @@ class LinkedInExtractor:
                 name: clean(a.textContent) || null,
             }));
 
-            return { events, header_profiles: headerProfiles };
+            // Viewer URN: every event item's data-event-urn carries the
+            // authenticated user's fsd_profile URN as its first tuple
+            // component (regardless of who authored the message). Pull it
+            // from the first available event so the normalizer can rewrite
+            // sender to "self" wherever LinkedIn renders the viewer's
+            // profile anchor.
+            let viewerUrn = null;
+            const firstEventItem = eventLis.length > 0
+                ? eventLis[0].querySelector('[data-event-urn^="urn:li:msg_message:"]')
+                : null;
+            if (firstEventItem) {
+                const urn = firstEventItem.getAttribute('data-event-urn') || '';
+                const m = urn.match(/urn:li:fsd_profile:([^,)]+)/);
+                if (m) viewerUrn = m[1];
+            }
+
+            return { events, header_profiles: headerProfiles, viewer_urn: viewerUrn };
         }
     """
 
@@ -3344,6 +3360,13 @@ class LinkedInExtractor:
         """Convert the JS dump into structured Message/Member lists."""
         events: list[dict[str, Any]] = raw.get("events") or []
         header_profiles: list[dict[str, Any]] = raw.get("header_profiles") or []
+        # Viewer URN, harvested in JS from the first event's data-event-urn.
+        # Whenever a message's sender URL contains this URN we rewrite the
+        # sender field to "self" — covers both the modern "no profile anchor"
+        # path (LinkedIn omits the link, JS returns sender_url=None → "self")
+        # and the older / deleted-message path where LinkedIn does render the
+        # viewer's own profile anchor.
+        viewer_urn: str | None = raw.get("viewer_urn") or None
 
         reference_year = datetime.now().year
         running_day: str | None = None
@@ -3372,7 +3395,10 @@ class LinkedInExtractor:
             status, content_base = self._classify_status(body_text)
 
             sender_url = self._normalize_profile_url(event.get("sender_url"))
-            sender = sender_url or "self"
+            if sender_url and viewer_urn and viewer_urn in sender_url:
+                sender = "self"
+            else:
+                sender = sender_url or "self"
 
             sender_name = event.get("sender_name")
             if sender_url and sender_name and sender_url not in member_names:
@@ -3420,6 +3446,8 @@ class LinkedInExtractor:
             member: Member = {"kind": "person", "url": url}
             if name:
                 member["name"] = name
+            if viewer_urn and viewer_urn in url:
+                member["is_self"] = True
             members.append(member)
 
         return messages, members

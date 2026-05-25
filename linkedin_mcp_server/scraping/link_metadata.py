@@ -69,11 +69,18 @@ class Message(TypedDict):
 
 
 class Member(TypedDict):
-    """One participant in a conversation thread."""
+    """One participant in a conversation thread.
+
+    ``is_self`` is present (and ``True``) on exactly one member when the
+    authenticated user is a participant; omitted on everyone else. Inferred
+    from the viewer URN embedded in every ``data-event-urn`` attribute
+    LinkedIn renders on message events.
+    """
 
     kind: Required[Literal["person"]]
     url: Required[str]
     name: NotRequired[str]
+    is_self: NotRequired[bool]
 
 
 _GENERIC_LABELS = {

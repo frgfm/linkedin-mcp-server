@@ -4416,6 +4416,95 @@ class TestNormalizeConversationEvents:
         urls = {m["url"]: m.get("name") for m in members}
         assert urls == {"/in/alice/": "Alice", "/in/bob/": "Bob"}
 
+    def test_self_rewrite_when_sender_url_matches_viewer_urn(self):
+        """When LinkedIn renders the viewer's own profile anchor (older
+        messages, deleted tombstones), the normalizer rewrites the sender
+        field to 'self' so downstream consumers don't have to recognize the
+        viewer's URN themselves."""
+        raw = {
+            "events": [
+                # Viewer's own message — LinkedIn renders the profile link.
+                {
+                    "day_heading": "Feb 16, 2026",
+                    "time_text": "9:01 AM",
+                    "sender_url": "https://www.linkedin.com/in/ACoAA_VIEWER_URN/",
+                    "sender_name": "Me Myself",
+                    "body_text": "I sent this",
+                    "quoted_text": None,
+                },
+                # Other participant — profile link does NOT contain viewer URN.
+                {
+                    "day_heading": None,
+                    "time_text": "9:02 AM",
+                    "sender_url": "/in/ACoAA_OTHER_URN/",
+                    "sender_name": "Other Person",
+                    "body_text": "And I sent this",
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [],
+            "viewer_urn": "ACoAA_VIEWER_URN",
+        }
+        extractor = self._make_extractor()
+        messages, members = extractor._normalize_conversation_events(raw)
+        assert messages[0]["sender"] == "self"
+        assert messages[1]["sender"] == "/in/ACoAA_OTHER_URN/"
+        flag = {m["url"]: m.get("is_self", False) for m in members}
+        assert flag == {
+            "/in/ACoAA_VIEWER_URN/": True,
+            "/in/ACoAA_OTHER_URN/": False,
+        }
+
+    def test_self_member_url_still_present_in_members(self):
+        """Even though the sender field becomes 'self', the viewer's profile
+        URL must still appear in members (with name + is_self) so consumers
+        can resolve it via get_my_profile."""
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Feb 16, 2026",
+                    "time_text": "9:01 AM",
+                    "sender_url": "/in/ACoAA_VIEWER_URN/",
+                    "sender_name": "Authenticated User",
+                    "body_text": "hi",
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [],
+            "viewer_urn": "ACoAA_VIEWER_URN",
+        }
+        extractor = self._make_extractor()
+        _, members = extractor._normalize_conversation_events(raw)
+        assert members == [
+            {
+                "kind": "person",
+                "url": "/in/ACoAA_VIEWER_URN/",
+                "name": "Authenticated User",
+                "is_self": True,
+            },
+        ]
+
+    def test_is_self_omitted_when_viewer_urn_absent(self):
+        """If JS couldn't determine the viewer URN (no events yet), no member
+        is flagged as self — backwards-compatible silent fallback."""
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Feb 16, 2026",
+                    "time_text": "9:01 AM",
+                    "sender_url": "/in/ACoAA_SOMEONE/",
+                    "sender_name": "Someone",
+                    "body_text": "hi",
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [],
+            "viewer_urn": None,
+        }
+        extractor = self._make_extractor()
+        _, members = extractor._normalize_conversation_events(raw)
+        assert all("is_self" not in m for m in members)
+
     def test_header_profile_adds_silent_participant(self):
         """A participant who hasn't sent a visible message still appears via header."""
         raw = {
