@@ -4464,8 +4464,11 @@ class TestNormalizeConversationEvents:
 
     def test_self_synthesized_when_viewer_urn_unobserved(self):
         """If viewer URN is known but the viewer never appears as a sender
-        anchor (rare — happens when LinkedIn always omits the link), still
-        synthesize a self member at index 0 from the viewer URN."""
+        anchor (rare — happens when LinkedIn always omits the link), the
+        self member still occupies index 0 but carries NO url field. The
+        fsd_profile URN from data-event-urn is an internal identifier,
+        not a guaranteed valid vanity slug, so synthesizing /in/<URN>/
+        would emit a misleading URL."""
         raw = {
             "events": [
                 {
@@ -4490,13 +4493,14 @@ class TestNormalizeConversationEvents:
         }
         extractor = self._make_extractor()
         messages, members = extractor._normalize_conversation_events(raw)
-        # Self synthesized from viewer URN — no name available.
-        assert members[0] == {
-            "kind": "person",
-            "url": "/in/ACoAA_VIEWER/",
-            "is_self": True,
-        }
+        # Self has is_self True but NO url — we don't synthesize one
+        # from the viewer URN.
+        assert members[0] == {"kind": "person", "is_self": True}
+        assert "url" not in members[0]
+        # Other participant has the regular shape (url + is_self False).
         assert members[1]["is_self"] is False
+        assert members[1]["url"] == "/in/ACoAA_OTHER/"
+        # Sender indices still work — self is at index 0, other at 1.
         assert [m["sender"] for m in messages] == [0, 1]
 
     def test_is_self_false_on_everyone_when_viewer_urn_absent(self):

@@ -72,10 +72,18 @@ class Message(TypedDict):
 class Member(TypedDict):
     """One participant in a conversation thread.
 
+    ``url`` is the participant's LinkedIn profile path (``/in/<slug>/``)
+    when LinkedIn renders a profile anchor for them somewhere in the
+    thread. It is omitted on the authenticated user when no such anchor
+    has been observed — the viewer URN from ``data-event-urn`` is an
+    internal ``fsd_profile`` identifier, not a guaranteed vanity slug,
+    so we do not synthesize a URL from it. In that case ``is_self``
+    alone identifies the participant.
+
     ``is_self`` is always set; ``True`` for the authenticated user (when
-    detectable from the viewer URN embedded in every ``data-event-urn``)
-    and ``False`` for every other participant. When the viewer URN cannot
-    be determined ``is_self`` is ``False`` on every member.
+    detectable from the viewer URN) and ``False`` for every other
+    participant. When the viewer URN cannot be determined ``is_self`` is
+    ``False`` on every member.
 
     Member order is significant: index 0 is the authenticated user when
     detectable; remaining members follow first-appearance order in the
@@ -83,7 +91,7 @@ class Member(TypedDict):
     """
 
     kind: Required[Literal["person"]]
-    url: Required[str]
+    url: NotRequired[str]
     name: NotRequired[str]
     is_self: Required[bool]
 

@@ -3396,34 +3396,42 @@ class LinkedInExtractor:
                 hp.get("name"),
             )
 
-        # Resolve the self URL. Prefer an existing entry whose path
-        # contains the viewer URN; otherwise synthesize one so the
-        # authenticated user always sits at members[0] when detectable.
-        self_url: str | None = None
+        # Resolve the self entry. Prefer an existing url whose path
+        # contains the viewer URN; otherwise track an internal sentinel
+        # so the authenticated user still sits at members[0]. The
+        # sentinel is never emitted as a URL — fsd_profile IDs from
+        # data-event-urn aren't guaranteed valid vanity paths, so we
+        # surface ``is_self: true`` alone rather than a misleading URL.
+        self_key: str | None = None
+        self_key_synthesized = False
         if viewer_urn:
-            self_url = next((u for u in candidate_members if viewer_urn in u), None)
-            if not self_url:
-                self_url = f"/in/{viewer_urn}/"
-                candidate_members.setdefault(self_url, None)
+            self_key = next((u for u in candidate_members if viewer_urn in u), None)
+            if not self_key:
+                self_key = f"__self__{viewer_urn}"
+                self_key_synthesized = True
+                candidate_members[self_key] = None
 
-        ordered_urls: list[str] = []
-        if self_url:
-            ordered_urls.append(self_url)
-        ordered_urls.extend(u for u in candidate_members if u != self_url)
+        ordered_keys: list[str] = []
+        if self_key:
+            ordered_keys.append(self_key)
+        ordered_keys.extend(u for u in candidate_members if u != self_key)
 
         members: list[Member] = []
-        for url in ordered_urls:
+        for key in ordered_keys:
             member: Member = {
                 "kind": "person",
-                "url": url,
-                "is_self": url == self_url,
+                "is_self": key == self_key,
             }
-            name = candidate_members.get(url)
+            # Only emit url when we observed an actual /in/ anchor in
+            # the DOM. The synthesized self sentinel never gets a URL.
+            if not (self_key_synthesized and key == self_key):
+                member["url"] = key
+            name = candidate_members.get(key)
             if name:
                 member["name"] = name
             members.append(member)
 
-        url_to_index: dict[str, int] = {url: i for i, url in enumerate(ordered_urls)}
+        url_to_index: dict[str, int] = {key: i for i, key in enumerate(ordered_keys)}
 
         # ------------------------------------------------------------
         # Pass 2: emit messages with integer sender indices.
@@ -3464,11 +3472,11 @@ class LinkedInExtractor:
             raw_sender_url = self._normalize_profile_url(event.get("sender_url"))
             sender_idx: int | None
             if raw_sender_url and viewer_urn and viewer_urn in raw_sender_url:
-                sender_idx = url_to_index.get(self_url) if self_url else None
+                sender_idx = url_to_index.get(self_key) if self_key else None
             elif raw_sender_url:
                 sender_idx = url_to_index.get(raw_sender_url)
-            elif self_url:
-                sender_idx = url_to_index.get(self_url)
+            elif self_key:
+                sender_idx = url_to_index.get(self_key)
             else:
                 sender_idx = None
 
