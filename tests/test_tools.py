@@ -1,5 +1,5 @@
 from typing import Any, Callable, Coroutine, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastmcp import FastMCP
@@ -1146,20 +1146,25 @@ class TestNetworkTools:
     async def test_get_pending_invitations_success(self, mock_context):
         expected = {
             "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/",
-            "sections": {"invitations": "Alice Smith\\nBob Jones"},
             "invitations": [
                 {
-                    "type": "connection_request",
+                    "type": "page_follow",
                     "invitation_age": "1h",
                     "sender": {
-                        "name": "Alice Smith",
-                        "url": "/in/alice/",
-                        "headline": "Founder at Example",
-                        "mutual_connections": 2,
+                        "name": "juanmanuelperez",
+                        "url": "/in/juanmanuelperez/",
+                        "headline": None,
+                        "mutual_connections": None,
                     },
                     "note": None,
-                    "target": {"page": None, "newsletter": None},
-                    "message_url": "/messaging/compose/?recipient=alice",
+                    "target": {
+                        "page": {
+                            "name": "Magical Potion Consulting",
+                            "url": "/company/magical-potion-consulting/",
+                        },
+                        "newsletter": None,
+                    },
+                    "message_url": None,
                 }
             ],
         }
@@ -1173,9 +1178,9 @@ class TestNetworkTools:
         tool_fn = await get_tool_fn(mcp, "get_pending_invitations")
         result = await tool_fn(mock_context, extractor=mock_extractor)
 
-        assert result["sections"]["invitations"] == "Alice Smith\\nBob Jones"
-        assert result["invitations"][0]["type"] == "connection_request"
-        assert result["invitations"][0]["sender"]["url"] == "/in/alice/"
+        assert list(result) == ["url", "invitations"]
+        assert result["invitations"][0]["type"] == "page_follow"
+        assert result["invitations"][0]["sender"]["url"] == "/in/juanmanuelperez/"
         mock_extractor.get_pending_invitations.assert_awaited_once_with(
             limit=20,
             kind="received",
@@ -1184,7 +1189,7 @@ class TestNetworkTools:
     async def test_get_pending_invitations_sent_kind(self, mock_context):
         expected = {
             "url": "https://www.linkedin.com/mynetwork/invitation-manager/sent/",
-            "sections": {"invitations": "Sent to Carol"},
+            "invitations": [],
         }
         mock_extractor = _make_mock_extractor(expected)
 
@@ -1206,6 +1211,31 @@ class TestNetworkTools:
             limit=5,
             kind="sent",
         )
+
+    async def test_get_pending_invitations_structured_content_shape(self):
+        expected = {
+            "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/",
+            "invitations": [],
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        with patch(
+            "linkedin_mcp_server.tools.network.get_ready_extractor",
+            new_callable=AsyncMock,
+            return_value=mock_extractor,
+        ):
+            result = await mcp.call_tool(
+                "get_pending_invitations",
+                {"kind": "received", "limit": 2},
+            )
+
+        assert result.structured_content == expected
+        assert list(result.structured_content or {}) == ["url", "invitations"]
 
     async def test_get_pending_invitations_rejects_invalid_kind(self):
         from pydantic import ValidationError

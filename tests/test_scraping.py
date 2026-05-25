@@ -19,6 +19,7 @@ from linkedin_mcp_server.scraping.extractor import (
     LinkedInExtractor,
     _RATE_LIMITED_MSG,
     _build_feed_references,
+    _normalize_structured_invitation,
     _truncate_linkedin_noise,
     strip_linkedin_noise,
 )
@@ -3663,22 +3664,62 @@ class TestGetInbox:
 
 
 class TestInvitationManagement:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("", 0),
+            ("Hugo Attal mutual connection", 1),
+            ("3 mutual connections", 3),
+            ("Hugo Attal and 2 other mutual connections", 3),
+        ],
+    )
+    def test_connection_request_mutual_count_rules(self, text, expected):
+        invitation = _normalize_structured_invitation(
+            {
+                "type": "connection_request",
+                "sender": {"name": "Ayoub Chalabi", "url": "/in/ayoub-chalabi/"},
+                "text": text,
+            }
+        )
+
+        assert invitation is not None
+        assert invitation["sender"]["mutual_connections"] == expected
+
     async def test_get_pending_invitations_received(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
         invitations = [
             {
+                "type": "page_follow",
+                "invitation_age": "1h",
+                "sender": {
+                    "name": "juanmanuelperez",
+                    "url": "/in/juanmanuelperez/",
+                    "headline": None,
+                    "mutual_connections": None,
+                },
+                "note": None,
+                "target": {
+                    "page": {
+                        "name": "Magical Potion Consulting",
+                        "url": "/company/magical-potion-consulting/",
+                    },
+                    "newsletter": None,
+                },
+                "message_url": None,
+            },
+            {
                 "type": "connection_request",
                 "invitation_age": "17h",
                 "sender": {
-                    "name": "Alice Smith",
-                    "url": "/in/alice/",
-                    "headline": "Founder at Example",
+                    "name": "Ayoub Chalabi",
+                    "url": "/in/ayoub-chalabi/",
+                    "headline": "Co-founder at Example",
                     "mutual_connections": 3,
                 },
-                "note": "Please connect",
+                "note": None,
                 "target": {"page": None, "newsletter": None},
-                "message_url": "/messaging/compose/?recipient=alice",
-            }
+                "message_url": "/messaging/compose/?recipient=ayoub-chalabi",
+            },
         ]
         with (
             patch.object(
@@ -3703,36 +3744,18 @@ class TestInvitationManagement:
             ),
             patch.object(
                 extractor,
-                "_extract_root_content",
-                new_callable=AsyncMock,
-                return_value={
-                    "text": "Alice Smith\\nPlease connect",
-                    "references": [{"href": "/in/alice/", "text": "Alice Smith"}],
-                },
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.strip_linkedin_noise",
-                return_value="Alice Smith\\nPlease connect",
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.build_references",
-                return_value=[{"kind": "person", "url": "/in/alice/"}],
-            ),
-            patch.object(
-                extractor,
                 "_extract_invitation_cards",
                 new_callable=AsyncMock,
                 return_value=invitations,
             ) as mock_cards,
         ):
-            result = await extractor.get_pending_invitations(limit=10)
+            result = await extractor.get_pending_invitations(limit=2)
 
         mock_nav.assert_awaited_once_with(
             "https://www.linkedin.com/mynetwork/invitation-manager/received/"
         )
-        mock_cards.assert_awaited_once_with(kind="received", limit=10)
-        assert result["sections"]["invitations"] == "Alice Smith\\nPlease connect"
-        assert result["references"]["invitations"][0]["url"] == "/in/alice/"
+        mock_cards.assert_awaited_once_with(kind="received", limit=2)
+        assert list(result) == ["url", "invitations"]
         assert result["invitations"] == invitations
 
     async def test_get_pending_invitations_sent_url(self, mock_page):
@@ -3760,12 +3783,6 @@ class TestInvitationManagement:
             ),
             patch.object(
                 extractor,
-                "_extract_root_content",
-                new_callable=AsyncMock,
-                return_value={"text": "", "references": []},
-            ),
-            patch.object(
-                extractor,
                 "_extract_invitation_cards",
                 new_callable=AsyncMock,
                 return_value=[],
@@ -3776,43 +3793,48 @@ class TestInvitationManagement:
         mock_nav.assert_awaited_once_with(
             "https://www.linkedin.com/mynetwork/invitation-manager/sent/"
         )
-        assert result["sections"] == {}
+        assert result == {
+            "url": "https://www.linkedin.com/mynetwork/invitation-manager/sent/",
+            "invitations": [],
+        }
 
     async def test_extract_invitation_cards_returns_structured_payload(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
         mock_page.evaluate = AsyncMock(
             return_value=[
                 {
-                    "type": "connection_request",
-                    "invitation_age": " 2w ",
-                    "sender": {
-                        "name": "Alice Smith",
-                        "url": "/in/alice/",
-                        "headline": "Founder at Example",
-                        "mutual_connections": "7",
-                    },
-                    "note": "Please connect",
-                    "target": {"page": {"name": "Ignored", "url": "/company/x/"}},
-                    "message_url": "/messaging/compose/?recipient=alice",
-                },
-                {
                     "type": "page_follow",
-                    "invitation_age": "5d",
+                    "invitation_age": "1 hour ago",
                     "sender": {
-                        "name": "Bob Jones",
-                        "url": "/in/bob/",
+                        "name": "juanmanuelperez",
+                        "url": "/in/juanmanuelperez/",
                         "headline": "Ignored headline",
-                        "mutual_connections": 0,
+                        "mutual_connections": 4,
                     },
                     "note": "Ignored note",
                     "target": {
-                        "page": {"name": "Example Co", "url": "/company/example/"}
+                        "page": {
+                            "name": "Magical Potion Consulting",
+                            "url": "/company/magical-potion-consulting/",
+                        }
                     },
-                    "message_url": "/messaging/compose/?ignored=true",
+                    "message_url": "/messaging/compose/?recipient=alice",
+                },
+                {
+                    "type": "connection_request",
+                    "invitation_age": None,
+                    "sender": {
+                        "name": "Ayoub Chalabi",
+                        "url": "/in/ayoub-chalabi/",
+                        "headline": "Co-founder at Example",
+                    },
+                    "text": "Ayoub Chalabi Co-founder at Example Hugo Attal and 2 other mutual connections 17 hours ago",
+                    "target": {"page": {"name": "Ignored", "url": "/company/x/"}},
+                    "message_url": "/messaging/compose/?recipient=ayoub-chalabi",
                 },
                 {
                     "type": "newsletter_subscription",
-                    "invitation_age": "1m",
+                    "text": "The Example Brief 1 month ago",
                     "sender": {
                         "name": "Carol Lee",
                         "url": "/in/carol/",
@@ -3834,33 +3856,36 @@ class TestInvitationManagement:
 
         assert cards == [
             {
-                "type": "connection_request",
-                "invitation_age": "2w",
-                "sender": {
-                    "name": "Alice Smith",
-                    "url": "/in/alice/",
-                    "headline": "Founder at Example",
-                    "mutual_connections": 7,
-                },
-                "note": "Please connect",
-                "target": {"page": None, "newsletter": None},
-                "message_url": "/messaging/compose/?recipient=alice",
-            },
-            {
                 "type": "page_follow",
-                "invitation_age": "5d",
+                "invitation_age": "1h",
                 "sender": {
-                    "name": "Bob Jones",
-                    "url": "/in/bob/",
+                    "name": "juanmanuelperez",
+                    "url": "/in/juanmanuelperez/",
                     "headline": None,
-                    "mutual_connections": 0,
+                    "mutual_connections": None,
                 },
                 "note": None,
                 "target": {
-                    "page": {"name": "Example Co", "url": "/company/example/"},
+                    "page": {
+                        "name": "Magical Potion Consulting",
+                        "url": "/company/magical-potion-consulting/",
+                    },
                     "newsletter": None,
                 },
                 "message_url": None,
+            },
+            {
+                "type": "connection_request",
+                "invitation_age": "17h",
+                "sender": {
+                    "name": "Ayoub Chalabi",
+                    "url": "/in/ayoub-chalabi/",
+                    "headline": "Co-founder at Example",
+                    "mutual_connections": 3,
+                },
+                "note": None,
+                "target": {"page": None, "newsletter": None},
+                "message_url": "/messaging/compose/?recipient=ayoub-chalabi",
             },
             {
                 "type": "newsletter_subscription",
@@ -3869,7 +3894,7 @@ class TestInvitationManagement:
                     "name": "Carol Lee",
                     "url": "/in/carol/",
                     "headline": None,
-                    "mutual_connections": 2,
+                    "mutual_connections": None,
                 },
                 "note": None,
                 "target": {

@@ -253,6 +253,7 @@ _INVITATION_CARDS_JS = r"""
   if (!root) return [];
 
   const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+  const cardText = card => normalize(card.innerText || card.textContent);
   const linesFrom = el => {
     const text = el ? (el.innerText || el.textContent || '') : '';
     return text
@@ -270,18 +271,36 @@ _INVITATION_CARDS_JS = r"""
   };
   const ageFromLines = lines => {
     const exact = lines
-      .map(line => line.match(/^(\d+)\s*(h|d|w|m|mo)$/i))
+      .map(line => line.match(/^(\d+)\s*(h|hr|hrs|hour|hours|d|day|days|w|week|weeks|m|mo|month|months)(?:\s+ago)?$/i))
       .find(Boolean);
-    const found = exact || normalize(lines.join(' ')).match(/\b(\d+)\s*(h|d|w|m|mo)\b/i);
+    const found = exact || normalize(lines.join(' ')).match(/\b(\d+)\s*(h|hr|hrs|hour|hours|d|day|days|w|week|weeks|m|mo|month|months)(?:\s+ago)?\b/i);
     if (!found) return null;
-    const unit = found[2].toLowerCase() === 'mo' ? 'm' : found[2].toLowerCase();
+    const rawUnit = found[2].toLowerCase();
+    const unit = rawUnit.startsWith('h')
+      ? 'h'
+      : rawUnit.startsWith('d')
+        ? 'd'
+        : rawUnit.startsWith('w')
+          ? 'w'
+          : 'm';
     return `${found[1]}${unit}`;
   };
   const mutualCountFromText = text => {
-    const match = normalize(text).match(/(\d[\d,.\s]*)\s+mutual/i);
-    if (!match) return 0;
-    const count = Number.parseInt(match[1].replace(/[^\d]/g, ''), 10);
-    return Number.isFinite(count) ? count : 0;
+    const normalized = normalize(text);
+    if (!/\bmutual\b/i.test(normalized)) return 0;
+    const otherMatch = normalized.match(
+      /(\d[\d,.\s]*)\s+other(?:s)?(?:\s+mutual)?/i
+    );
+    if (otherMatch) {
+      const count = Number.parseInt(otherMatch[1].replace(/[^\d]/g, ''), 10);
+      return Number.isFinite(count) ? count + 1 : 1;
+    }
+    const countMatch = normalized.match(/(\d[\d,.\s]*)\s+mutual/i);
+    if (countMatch) {
+      const count = Number.parseInt(countMatch[1].replace(/[^\d]/g, ''), 10);
+      return Number.isFinite(count) ? count : 0;
+    }
+    return 1;
   };
   const bestAnchorText = anchor => {
     const firstLine = linesFrom(anchor)[0];
@@ -356,16 +375,20 @@ _INVITATION_CARDS_JS = r"""
 
     const note = type === 'connection_request' ? noteText(card, buttonTexts) : null;
     const senderName = profileLink?.text || null;
+    const text = cardText(card);
     result.push({
       type,
       invitation_age: ageFromLines(cardLines),
+      text,
       sender: {
         name: senderName,
         url: profileLink?.path || null,
         headline: type === 'connection_request'
           ? headlineFromLines(cardLines, senderName, note, buttonTexts)
           : null,
-        mutual_connections: mutualCountFromText(card.innerText || card.textContent),
+        mutual_connections: type === 'connection_request'
+          ? mutualCountFromText(text)
+          : null,
       },
       note,
       target: {
@@ -599,6 +622,66 @@ def _coerce_non_negative_int(value: Any) -> int:
         return 0
 
 
+def _normalize_invitation_age(*values: Any) -> str | None:
+    for value in values:
+        text = _optional_text(value)
+        if not text:
+            continue
+        match = re.search(
+            r"\b(\d+)\s*"
+            r"(h|hr|hrs|hour|hours|d|day|days|w|week|weeks|m|mo|month|months)"
+            r"(?:\s+ago)?\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        raw_unit = match.group(2).lower()
+        if raw_unit.startswith("h"):
+            unit = "h"
+        elif raw_unit.startswith("d"):
+            unit = "d"
+        elif raw_unit.startswith("w"):
+            unit = "w"
+        else:
+            unit = "m"
+        return f"{match.group(1)}{unit}"
+    return None
+
+
+def _invitation_mutual_connections(
+    invitation_type: str, raw_sender: dict[str, Any], raw_text: Any
+) -> int | None:
+    if invitation_type != "connection_request":
+        return None
+
+    text = _optional_text(raw_text)
+    if text and re.search(r"\bmutual\b", text, flags=re.IGNORECASE):
+        other_match = re.search(
+            r"(\d[\d,.\s]*)\s+other(?:s)?(?:\s+mutual)?",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if other_match:
+            return _coerce_non_negative_int(other_match.group(1).replace(",", "")) + 1
+
+        count_match = re.search(
+            r"(\d[\d,.\s]*)\s+mutual",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if count_match:
+            return _coerce_non_negative_int(count_match.group(1).replace(",", ""))
+
+        return 1
+
+    explicit = raw_sender.get("mutual_connections")
+    if explicit is not None:
+        return _coerce_non_negative_int(explicit)
+
+    return 0
+
+
 def _invitation_entity(
     value: Any, *, label_key: Literal["name", "title"]
 ) -> dict[str, str | None] | None:
@@ -634,8 +717,10 @@ def _normalize_structured_invitation(raw: Any) -> dict[str, Any] | None:
             if invitation_type == "connection_request"
             else None
         ),
-        "mutual_connections": _coerce_non_negative_int(
-            raw_sender.get("mutual_connections")
+        "mutual_connections": _invitation_mutual_connections(
+            invitation_type,
+            raw_sender,
+            raw.get("text"),
         ),
     }
 
@@ -659,7 +744,10 @@ def _normalize_structured_invitation(raw: Any) -> dict[str, Any] | None:
 
     return {
         "type": invitation_type,
-        "invitation_age": _optional_text(raw.get("invitation_age")),
+        "invitation_age": _normalize_invitation_age(
+            raw.get("invitation_age"),
+            raw.get("text"),
+        ),
         "sender": sender,
         "note": (
             _optional_text(raw.get("note"))
@@ -3811,25 +3899,8 @@ class LinkedInExtractor:
         )
         await self._expand_invitation_note_toggles()
 
-        raw_result = await self._extract_root_content(["main"])
-        raw = raw_result["text"]
-        cleaned = strip_linkedin_noise(raw) if raw else ""
-        references: list[Reference] = (
-            build_references(raw_result["references"], "invitations")[:limit]
-            if cleaned
-            else []
-        )
         invitations = await self._extract_invitation_cards(kind=kind, limit=limit)
-
-        result = self._single_section_result(
-            url,
-            "invitations",
-            cleaned,
-            references=references,
-        )
-        if invitations:
-            result["invitations"] = invitations
-        return result
+        return {"url": url, "invitations": invitations}
 
     async def _expand_invitation_note_toggles(self) -> None:
         """Reveal truncated invitation notes using locale-independent test ids.

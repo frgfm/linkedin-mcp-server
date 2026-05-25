@@ -41,11 +41,10 @@ Through this LinkedIn MCP server, AI assistants like Claude can connect to your 
 | `get_feed` | Get recent posts from the authenticated user's home feed | working |
 | `close_session` | Close browser session and clean up resources | working |
 
-`get_pending_invitations` returns the standard `{url, sections}` payload with
-optional `references["invitations"]`. It may also include an `invitations` array
-whose entries expose `type` (`connection_request`, `page_follow`, or
-`newsletter_subscription`), `invitation_age`, `sender`, optional `note`,
-`target`, and `message_url` for follow-up triage without parsing raw page text.
+`get_pending_invitations` returns `{url, invitations}`. Each invitation exposes
+`type` (`connection_request`, `page_follow`, or `newsletter_subscription`),
+`invitation_age`, `sender`, optional `note`, `target`, and `message_url` for
+follow-up triage without parsing raw page text.
 
 <br/>
 <br/>
