@@ -1189,7 +1189,17 @@ class TestNetworkTools:
     async def test_get_pending_invitations_sent_kind(self, mock_context):
         expected = {
             "url": "https://www.linkedin.com/mynetwork/invitation-manager/sent/",
-            "invitations": [],
+            "invitations": [
+                {
+                    "type": "connection_request",
+                    "invitation_age": "1w",
+                    "recipient": {
+                        "name": "Laurent SORBIER",
+                        "url": "/in/laurent-sorbier/",
+                        "headline": "chargé d’affaires chez belectric",
+                    },
+                }
+            ],
         }
         mock_extractor = _make_mock_extractor(expected)
 
@@ -1207,6 +1217,9 @@ class TestNetworkTools:
         )
 
         assert result["url"].endswith("/sent/")
+        invitation = result["invitations"][0]
+        assert invitation["recipient"]["headline"] == "chargé d’affaires chez belectric"
+        assert "sender" not in invitation
         mock_extractor.get_pending_invitations.assert_awaited_once_with(
             limit=5,
             kind="sent",

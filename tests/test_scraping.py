@@ -3670,6 +3670,11 @@ class TestInvitationManagement:
         assert "getBoundingClientRect()" in _INVITATION_CARDS_JS
         assert "cards.sort" in _INVITATION_CARDS_JS
         assert 'a[href*="/school/"]' in _INVITATION_CARDS_JS
+        assert "if (kind === 'sent')" in _INVITATION_CARDS_JS
+        assert "recipient:" in _INVITATION_CARDS_JS
+        assert "sent|envoyé|envoyée" in _INVITATION_CARDS_JS
+        assert "a[aria-label][href]" in _INVITATION_CARDS_JS
+        assert '[role="listitem"]' in _INVITATION_CARDS_JS
 
     @pytest.mark.parametrize(
         ("text", "expected"),
@@ -3771,7 +3776,7 @@ class TestInvitationManagement:
             ),
             patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
             patch.object(
-                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
+                extractor, "_scroll_invitation_manager_down", new_callable=AsyncMock
             ),
             patch.object(
                 extractor, "_expand_invitation_note_toggles", new_callable=AsyncMock
@@ -3792,6 +3797,76 @@ class TestInvitationManagement:
         assert list(result) == ["url", "invitations"]
         assert result["invitations"] == invitations
 
+    async def test_get_pending_invitations_collects_before_scrolling(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        first_rows = [
+            {
+                "type": "connection_request",
+                "invitation_age": "1w",
+                "recipient": {
+                    "name": "Laurent SORBIER",
+                    "url": "/in/laurent-sorbier/",
+                    "headline": "chargé d’affaires chez belectric",
+                },
+            },
+            {
+                "type": "connection_request",
+                "invitation_age": "1w",
+                "recipient": {
+                    "name": "Hugues Jouffroy",
+                    "url": "/in/hugues-jouffroy/",
+                    "headline": "Directeur Général Délégué aux Opérations",
+                },
+            },
+        ]
+        second_rows = [
+            first_rows[1],
+            {
+                "type": "connection_request",
+                "invitation_age": "1w",
+                "recipient": {
+                    "name": "Rémi SACHOT",
+                    "url": "/in/remisachotenr/",
+                    "headline": "Directeur Exploitation chez TSE Energy",
+                },
+            },
+        ]
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor,
+                "_scroll_invitation_manager_down",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_scroll,
+            patch.object(
+                extractor, "_expand_invitation_note_toggles", new_callable=AsyncMock
+            ),
+            patch.object(
+                extractor,
+                "_extract_invitation_cards",
+                new_callable=AsyncMock,
+                side_effect=[first_rows, second_rows],
+            ),
+        ):
+            result = await extractor.get_pending_invitations(limit=6, kind="sent")
+
+        assert result["invitations"] == [
+            first_rows[0],
+            first_rows[1],
+            second_rows[1],
+        ]
+        mock_scroll.assert_awaited_once()
+
     async def test_get_pending_invitations_sent_url(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
         with (
@@ -3810,7 +3885,7 @@ class TestInvitationManagement:
             ),
             patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
             patch.object(
-                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
+                extractor, "_scroll_invitation_manager_down", new_callable=AsyncMock
             ),
             patch.object(
                 extractor, "_expand_invitation_note_toggles", new_callable=AsyncMock
@@ -3832,7 +3907,9 @@ class TestInvitationManagement:
             "invitations": [],
         }
 
-    async def test_extract_invitation_cards_returns_structured_payload(self, mock_page):
+    async def test_extract_received_invitation_cards_returns_structured_payload(
+        self, mock_page
+    ):
         extractor = LinkedInExtractor(mock_page)
         mock_page.evaluate = AsyncMock(
             return_value=[
@@ -3900,11 +3977,11 @@ class TestInvitationManagement:
             ]
         )
 
-        cards = await extractor._extract_invitation_cards(kind="sent", limit=10)
+        cards = await extractor._extract_invitation_cards(kind="received", limit=10)
 
         evaluate_args = mock_page.evaluate.await_args
         assert evaluate_args is not None
-        assert evaluate_args.args[1] == {"kind": "sent", "limit": 20}
+        assert evaluate_args.args[1] == {"kind": "received", "limit": 20}
         assert cards == [
             {
                 "type": "page_follow",
@@ -3958,6 +4035,83 @@ class TestInvitationManagement:
                 "message_url": None,
             },
         ]
+
+    async def test_extract_sent_invitation_cards_returns_recipient_payload(
+        self, mock_page
+    ):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "type": "connection_request",
+                    "invitation_age": "Sent 1 week ago",
+                    "recipient": {
+                        "name": "Laurent SORBIER",
+                        "url": "/in/laurent-sorbier/",
+                        "headline": "chargé d’affaires chez belectric",
+                    },
+                    "sender": {
+                        "name": "Ignored sender",
+                        "url": "/in/ignored/",
+                        "headline": "Ignored headline",
+                        "mutual_connections": 7,
+                    },
+                    "note": "Ignored note",
+                    "target": {"page": {"name": "Ignored", "url": "/company/x/"}},
+                    "message_url": "/messaging/compose/?recipient=ignored",
+                },
+                {
+                    "type": "connection_request",
+                    "invitation_age": "Sent 1 week ago",
+                    "recipient": {
+                        "name": "Laurent SORBIER",
+                        "url": "/in/laurent-sorbier/",
+                        "headline": "chargé d’affaires chez belectric",
+                    },
+                },
+                {
+                    "type": "connection_request",
+                    "text": "Hugues Jouffroy\nDirecteur Général Délégué aux Opérations\nSent 1 week ago\nWithdraw",
+                    "recipient": {
+                        "name": "Hugues Jouffroy",
+                        "url": "/in/hugues-jouffroy/",
+                        "headline": "Directeur Général Délégué aux Opérations",
+                    },
+                },
+                {"type": "page_follow", "recipient": {"name": "Ignored"}},
+                "bad row",
+            ]
+        )
+
+        cards = await extractor._extract_invitation_cards(kind="sent", limit=10)
+
+        evaluate_args = mock_page.evaluate.await_args
+        assert evaluate_args is not None
+        assert evaluate_args.args[1] == {"kind": "sent", "limit": 20}
+        assert cards == [
+            {
+                "type": "connection_request",
+                "invitation_age": "1w",
+                "recipient": {
+                    "name": "Laurent SORBIER",
+                    "url": "/in/laurent-sorbier/",
+                    "headline": "chargé d’affaires chez belectric",
+                },
+            },
+            {
+                "type": "connection_request",
+                "invitation_age": "1w",
+                "recipient": {
+                    "name": "Hugues Jouffroy",
+                    "url": "/in/hugues-jouffroy/",
+                    "headline": "Directeur Général Délégué aux Opérations",
+                },
+            },
+        ]
+        assert "sender" not in cards[0]
+        assert "target" not in cards[0]
+        assert "note" not in cards[0]
+        assert "message_url" not in cards[0]
 
     async def test_expand_invitation_note_toggles_runs_second_pass(self, mock_page):
         extractor = LinkedInExtractor(mock_page)

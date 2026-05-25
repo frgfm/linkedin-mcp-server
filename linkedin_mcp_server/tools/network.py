@@ -35,8 +35,9 @@ def register_network_tools(
         """
         List pending LinkedIn network invitations (received or sent).
 
-        Returns ``url`` and an ``invitations`` array with structured invitation
-        type, sender, target, note, age, and message link fields.
+        Returns ``url`` and an ``invitations`` array. Received invitations
+        include sender/target triage fields. Sent invitations include recipient
+        identity and headline fields.
         """
         try:
             extractor = extractor or await get_ready_extractor(

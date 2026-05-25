@@ -253,6 +253,7 @@ _INVITATION_CARDS_JS = r"""
   if (!root) return [];
 
   const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+  const ageUnits = 'min|mins|minute|minutes|h|hr|hrs|hour|hours|heure|heures|d|day|days|j|jour|jours|w|week|weeks|sem|semaine|semaines|m|mo|month|months|mois';
   const cardText = card => normalize(card.innerText || card.textContent);
   const linesFrom = el => {
     const text = el ? (el.innerText || el.textContent || '') : '';
@@ -269,12 +270,14 @@ _INVITATION_CARDS_JS = r"""
       return '';
     }
   };
+  const ageLineMatch = line => line.match(
+    new RegExp(`^(?:(?:sent|envoyé|envoyée)\\s+)?(?:il\\s+y\\s+a\\s+)?(\\d+)\\s*(${ageUnits})(?:\\s+ago)?$`, 'i')
+  );
   const ageFromLines = lines => {
-    const units = 'min|mins|minute|minutes|h|hr|hrs|hour|hours|heure|heures|d|day|days|j|jour|jours|w|week|weeks|sem|semaine|semaines|m|mo|month|months|mois';
     const exact = lines
-      .map(line => line.match(new RegExp(`^(\\d+)\\s*(${units})(?:\\s+ago)?$`, 'i')))
+      .map(ageLineMatch)
       .find(Boolean);
-    const found = exact || normalize(lines.join(' ')).match(new RegExp(`\\b(\\d+)\\s*(${units})(?:\\s+ago)?\\b`, 'i'));
+    const found = exact || normalize(lines.join(' ')).match(new RegExp(`\\b(\\d+)\\s*(${ageUnits})(?:\\s+ago)?\\b`, 'i'));
     if (!found) return null;
     const rawUnit = found[2].toLowerCase();
     const unit = rawUnit.startsWith('min')
@@ -333,6 +336,8 @@ _INVITATION_CARDS_JS = r"""
     const text = link?.text;
     if (!text) return null;
     const cleaned = text
+      .replace(/^profile photo of\s+/i, '')
+      .replace(/^photo de profil de\s+/i, '')
       .replace(/\s+follows you\b.*$/i, '')
       .replace(/\s+is inviting you\b.*$/i, '')
       .replace(/\s+invited you\b.*$/i, '')
@@ -355,7 +360,19 @@ _INVITATION_CARDS_JS = r"""
       if (senderName && line.startsWith(senderName)) continue;
       if (line === note) continue;
       if (buttonTexts.has(line)) continue;
-      if (/^(\d+)\s*(h|hr|hrs|hour|hours|heure|heures|d|day|days|j|jour|jours|w|week|weeks|sem|semaine|semaines|m|mo|month|months|mois)(?:\s+ago)?$/i.test(line)) continue;
+      if (ageLineMatch(line)) continue;
+      if (/\b(mutual|relations?\s+en\s+commun)\b/i.test(line)) continue;
+      if (/\b(follows you|invit|vous suit)\b/i.test(line)) continue;
+      return line;
+    }
+    return null;
+  };
+  const personNameFromLines = (lines, profileLink, buttonTexts) => {
+    const anchorName = senderNameFromProfileLink(profileLink);
+    if (anchorName) return anchorName;
+    for (const line of lines) {
+      if (buttonTexts.has(line)) continue;
+      if (ageLineMatch(line)) continue;
       if (/\b(mutual|relations?\s+en\s+commun)\b/i.test(line)) continue;
       if (/\b(follows you|invit|vous suit)\b/i.test(line)) continue;
       return line;
@@ -373,12 +390,13 @@ _INVITATION_CARDS_JS = r"""
   const identitySelector =
     'a[href*="/in/"], a[href*="/company/"], a[href*="/showcase/"], a[href*="/school/"], a[href*="/newsletters/"]';
   const actionControls = el => Array.from(
-    el.querySelectorAll('button, [role="button"]')
+    el.querySelectorAll('button, [role="button"], a[aria-label][href]')
   )
     .filter(visible)
+    .filter(button => !button.matches(identitySelector))
     .filter(button => button.getAttribute('data-testid') !== 'expandable-text-button')
     .filter(button => !button.closest('[data-testid="expandable-text-box"]'))
-    .filter(button => !button.closest('a[href]'))
+    .filter(button => button.matches('a[href]') || !button.closest('a[href]'))
     .filter(button => linesFrom(button).length > 0 || button.hasAttribute('aria-label'));
   const hasInvitationIdentity = el => !!el.querySelector(identitySelector);
   const cardForActionControl = button => {
@@ -400,7 +418,7 @@ _INVITATION_CARDS_JS = r"""
   };
   const outerInvitationCard = card => {
     if (!card) return null;
-    const outer = card.closest('li, article');
+    const outer = card.closest('[role="listitem"], li, article');
     if (
       outer &&
       root.contains(outer) &&
@@ -450,6 +468,24 @@ _INVITATION_CARDS_JS = r"""
     const pageLink = bestLink(link => /^\/(?:company|showcase)\/[^/?#]+\/?/.test(link.path));
     const newsletterLink = bestLink(link => /^\/newsletters\/[^/?#]+\/?/.test(link.path));
     const messageLink = links.find(link => link.path.includes('/messaging/'));
+    const text = cardText(card);
+
+    if (kind === 'sent') {
+      if (!profileLink) continue;
+      const recipientName = personNameFromLines(cardLines, profileLink, buttonTexts);
+      result.push({
+        type: 'connection_request',
+        invitation_age: ageFromLines(cardLines),
+        text,
+        recipient: {
+          name: recipientName,
+          url: profileLink.path,
+          headline: headlineFromLines(cardLines, recipientName, null, buttonTexts),
+        },
+      });
+      if (limit && result.length >= limit) break;
+      continue;
+    }
 
     const type = newsletterLink
       ? 'newsletter_subscription'
@@ -467,7 +503,6 @@ _INVITATION_CARDS_JS = r"""
     const senderName = type === 'newsletter_subscription'
       ? (senderLink?.text || null)
       : senderNameFromProfileLink(senderLink);
-    const text = cardText(card);
     result.push({
       type,
       invitation_age: ageFromLines(cardLines),
@@ -554,6 +589,7 @@ _INVITATION_CLICK_ACTION_JS = r"""
     if (foundUsername !== username) continue;
     profileUrl = `/in/${foundUsername}/`;
     card =
+      anchor.closest('[role="listitem"]') ||
       anchor.closest('li') ||
       anchor.closest('article') ||
       anchor.closest('[data-view-name]') ||
@@ -565,10 +601,14 @@ _INVITATION_CLICK_ACTION_JS = r"""
     return { found: false, clicked: false, reason: 'not_found' };
   }
 
-  const buttons = Array.from(card.querySelectorAll('button, [role="button"]'))
+  const buttons = Array.from(
+    card.querySelectorAll('button, [role="button"], a[aria-label][href]')
+  )
     .filter(visible)
+    .filter(button => !button.matches('a[href*="/in/"]'))
     .filter(button => button.getAttribute('data-testid') !== 'expandable-text-button')
-    .filter(button => !button.closest('[data-testid="expandable-text-box"]'));
+    .filter(button => !button.closest('[data-testid="expandable-text-box"]'))
+    .filter(button => button.matches('a[href]') || !button.closest('a[href]'));
   if (buttons.length === 0) {
     return {
       found: true,
@@ -815,9 +855,45 @@ def _invitation_entity(
     return {label_key: label, "url": url}
 
 
-def _normalize_structured_invitation(raw: Any) -> dict[str, Any] | None:
+def _normalize_sent_structured_invitation(raw: dict[str, Any]) -> dict[str, Any] | None:
+    invitation_type = _optional_text(raw.get("type"))
+    if invitation_type != "connection_request":
+        return None
+
+    raw_recipient_value = raw.get("recipient")
+    if isinstance(raw_recipient_value, dict):
+        raw_recipient: dict[str, Any] = raw_recipient_value
+    else:
+        raw_sender_value = raw.get("sender")
+        raw_recipient = raw_sender_value if isinstance(raw_sender_value, dict) else {}
+    recipient = {
+        "name": _optional_text(raw_recipient.get("name")),
+        "url": _optional_text(raw_recipient.get("url")),
+        "headline": _optional_text(raw_recipient.get("headline")),
+    }
+    if not (recipient["name"] or recipient["url"]):
+        return None
+
+    return {
+        "type": "connection_request",
+        "invitation_age": _normalize_invitation_age(
+            raw.get("invitation_age"),
+            raw.get("text"),
+        ),
+        "recipient": recipient,
+    }
+
+
+def _normalize_structured_invitation(
+    raw: Any,
+    *,
+    kind: Literal["received", "sent"] = "received",
+) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
+
+    if kind == "sent":
+        return _normalize_sent_structured_invitation(raw)
 
     invitation_type = _optional_text(raw.get("type"))
     if invitation_type not in {
@@ -885,6 +961,8 @@ def _normalize_structured_invitation(raw: Any) -> dict[str, Any] | None:
 def _invitation_identity_key(invitation: dict[str, Any]) -> tuple[str, str, str, str]:
     raw_sender = invitation.get("sender")
     sender: dict[str, Any] = raw_sender if isinstance(raw_sender, dict) else {}
+    raw_recipient = invitation.get("recipient")
+    recipient: dict[str, Any] = raw_recipient if isinstance(raw_recipient, dict) else {}
     raw_target = invitation.get("target")
     target: dict[str, Any] = raw_target if isinstance(raw_target, dict) else {}
     raw_page = target.get("page")
@@ -895,7 +973,7 @@ def _invitation_identity_key(invitation: dict[str, Any]) -> tuple[str, str, str,
     )
     return (
         str(invitation.get("type") or ""),
-        str(sender.get("url") or ""),
+        str(recipient.get("url") or sender.get("url") or ""),
         str(page.get("url") or ""),
         str(newsletter.get("url") or ""),
     )
@@ -4030,15 +4108,69 @@ class LinkedInExtractor:
         await detect_rate_limit(self._page)
         await self._wait_for_main_text(log_context=f"Invitations ({kind})")
         await handle_modal_close(self._page)
-
-        scrolls = max(1, (limit + 9) // 10)
-        await self._scroll_main_scrollable_region(
-            position="bottom", attempts=scrolls, pause_time=0.5
-        )
         await self._expand_invitation_note_toggles()
 
-        invitations = await self._extract_invitation_cards(kind=kind, limit=limit)
+        invitations: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str, str, str]] = set()
+        max_scrolls = max(0, (limit + 4) // 5 - 1)
+        for attempt in range(max_scrolls + 1):
+            for invitation in await self._extract_invitation_cards(
+                kind=kind,
+                limit=limit,
+            ):
+                key = _invitation_identity_key(invitation)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                invitations.append(invitation)
+                if len(invitations) >= limit:
+                    break
+
+            if len(invitations) >= limit or attempt >= max_scrolls:
+                break
+
+            moved = await self._scroll_invitation_manager_down()
+            if not moved:
+                break
+            await self._expand_invitation_note_toggles()
+
         return {"url": url, "invitations": invitations}
+
+    async def _scroll_invitation_manager_down(self) -> bool:
+        """Scroll one viewport in the invitation manager without skipping rows."""
+        try:
+            moved = await self._page.evaluate(
+                """() => {
+                    const main = document.querySelector('main');
+                    if (!main) return false;
+
+                    const isScrollable = element => {
+                        const style = window.getComputedStyle(element);
+                        return (
+                            (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+                            element.scrollHeight > element.clientHeight + 20
+                        );
+                    };
+
+                    const candidates = [main, ...main.querySelectorAll('*')].filter(isScrollable);
+                    const target = candidates.sort(
+                        (left, right) => right.scrollHeight - left.scrollHeight
+                    )[0] || main;
+                    const before = target.scrollTop || window.scrollY || 0;
+                    const step = Math.max(Math.floor((target.clientHeight || window.innerHeight) * 0.85), 320);
+                    if (target === main && !isScrollable(main)) {
+                        window.scrollBy(0, step);
+                        return window.scrollY > before;
+                    }
+                    target.scrollTop = Math.min(target.scrollTop + step, target.scrollHeight);
+                    return target.scrollTop > before;
+                }"""
+            )
+        except Exception:
+            logger.debug("Invitation manager scroll failed", exc_info=True)
+            return False
+        await asyncio.sleep(0.5)
+        return bool(moved)
 
     async def _expand_invitation_note_toggles(self) -> None:
         """Reveal truncated invitation notes using locale-independent test ids.
@@ -4084,7 +4216,7 @@ class LinkedInExtractor:
         cards: list[dict[str, Any]] = []
         seen_keys: set[tuple[str, str, str, str]] = set()
         for raw in raw_cards:
-            invitation = _normalize_structured_invitation(raw)
+            invitation = _normalize_structured_invitation(raw, kind=kind)
             if invitation:
                 key = _invitation_identity_key(invitation)
                 if key in seen_keys:
