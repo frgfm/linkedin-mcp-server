@@ -1320,7 +1320,12 @@ class TestConnectWithPerson:
                 extractor,
                 "_accept_incoming_invitation",
                 new_callable=AsyncMock,
-                return_value=True,
+                return_value={
+                    "status": "accepted",
+                    "message": "Incoming invitation accepted.",
+                    "linkedin_username": "testuser",
+                    "performed": True,
+                },
             ) as mock_accept,
         ):
             result = await extractor.connect_with_person("testuser")
@@ -1349,7 +1354,12 @@ class TestConnectWithPerson:
                 extractor,
                 "_accept_incoming_invitation",
                 new_callable=AsyncMock,
-                return_value=True,
+                return_value={
+                    "status": "accepted",
+                    "message": "Incoming invitation accepted.",
+                    "linkedin_username": "testuser",
+                    "performed": True,
+                },
             ),
         ):
             result = await extractor.connect_with_person("testuser")
@@ -3758,7 +3768,7 @@ class TestInvitationManagement:
                     "mutual_connections": 3,
                 },
                 "note": None,
-                "target": {"page": None, "newsletter": None},
+                "target": None,
                 "message_url": "/messaging/compose/?recipient=ayoub-chalabi",
             },
         ]
@@ -4014,7 +4024,7 @@ class TestInvitationManagement:
                     "mutual_connections": 3,
                 },
                 "note": None,
-                "target": {"page": None, "newsletter": None},
+                "target": None,
                 "message_url": "/messaging/compose/?recipient=ayoub-chalabi",
             },
             {

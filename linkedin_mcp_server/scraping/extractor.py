@@ -521,14 +521,16 @@ _INVITATION_CARDS_JS = r"""
           : null,
       },
       note,
-      target: {
-        page: type === 'page_follow'
-          ? { name: pageLink.text, url: pageLink.path }
-          : null,
-        newsletter: type === 'newsletter_subscription'
-          ? { title: newsletterLink.text, url: newsletterLink.path }
-          : null,
-      },
+      target: type === 'connection_request'
+        ? null
+        : {
+            page: type === 'page_follow'
+              ? { name: pageLink.text, url: pageLink.path }
+              : null,
+            newsletter: type === 'newsletter_subscription'
+              ? { title: newsletterLink.text, url: newsletterLink.path }
+              : null,
+          },
       message_url: type === 'connection_request' ? (messageLink?.path || null) : null,
     });
     if (limit && result.length >= limit) break;
@@ -915,12 +917,16 @@ def _normalize_structured_invitation(
     raw_target = raw.get("target") if isinstance(raw.get("target"), dict) else {}
     page = _invitation_entity(raw_target.get("page"), label_key="name")
     newsletter = _invitation_entity(raw_target.get("newsletter"), label_key="title")
-    target = {
-        "page": page if invitation_type == "page_follow" else None,
-        "newsletter": (
-            newsletter if invitation_type == "newsletter_subscription" else None
-        ),
-    }
+    target = (
+        None
+        if invitation_type == "connection_request"
+        else {
+            "page": page if invitation_type == "page_follow" else None,
+            "newsletter": (
+                newsletter if invitation_type == "newsletter_subscription" else None
+            ),
+        }
+    )
 
     has_identity = (
         (invitation_type == "connection_request" and (sender["name"] or sender["url"]))
