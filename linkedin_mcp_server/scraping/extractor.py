@@ -332,17 +332,21 @@ _INVITATION_CARDS_JS = r"""
   const isImageOnlyAnchor = anchor => {
     return !normalize(anchor.textContent) && !!anchor.querySelector('img[alt]');
   };
-  const senderNameFromProfileLink = link => {
-    const text = link?.text;
+  const profileNameFromText = text => {
     if (!text) return null;
-    const cleaned = text
+    const cleaned = normalize(text)
       .replace(/^profile photo of\s+/i, '')
       .replace(/^photo de profil de\s+/i, '')
+      .replace(/\s*(?:'s|’s)\s+profile\s+(?:photo|picture)$/i, '')
+      .replace(/\s+profile\s+(?:photo|picture)$/i, '')
       .replace(/\s+follows you\b.*$/i, '')
       .replace(/\s+is inviting you\b.*$/i, '')
       .replace(/\s+invited you\b.*$/i, '')
       .trim();
-    return cleaned || text;
+    return cleaned || null;
+  };
+  const senderNameFromProfileLink = link => {
+    return profileNameFromText(link?.text);
   };
   const noteText = (card, buttonTexts) => {
     const noteRoot = card.querySelector(
@@ -368,16 +372,15 @@ _INVITATION_CARDS_JS = r"""
     return null;
   };
   const personNameFromLines = (lines, profileLink, buttonTexts) => {
-    const anchorName = senderNameFromProfileLink(profileLink);
-    if (anchorName) return anchorName;
     for (const line of lines) {
       if (buttonTexts.has(line)) continue;
       if (ageLineMatch(line)) continue;
       if (/\b(mutual|relations?\s+en\s+commun)\b/i.test(line)) continue;
       if (/\b(follows you|invit|vous suit)\b/i.test(line)) continue;
-      return line;
+      const candidate = profileNameFromText(line);
+      if (candidate) return candidate;
     }
-    return null;
+    return senderNameFromProfileLink(profileLink);
   };
   const visible = el => {
     if (!el || !el.getClientRects) return false;

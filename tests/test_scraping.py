@@ -3675,6 +3675,8 @@ class TestInvitationManagement:
         assert "sent|envoyé|envoyée" in _INVITATION_CARDS_JS
         assert "a[aria-label][href]" in _INVITATION_CARDS_JS
         assert '[role="listitem"]' in _INVITATION_CARDS_JS
+        assert "profile\\s+(?:photo|picture)" in _INVITATION_CARDS_JS
+        assert "return senderNameFromProfileLink(profileLink);" in _INVITATION_CARDS_JS
 
     @pytest.mark.parametrize(
         ("text", "expected"),
