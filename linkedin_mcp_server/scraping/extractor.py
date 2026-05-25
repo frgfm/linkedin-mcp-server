@@ -2227,6 +2227,23 @@ class LinkedInExtractor:
         except PlaywrightTimeoutError:
             return False
 
+    async def _type_message_with_newlines(self, message: str) -> None:
+        """Type ``message`` into the focused compose box, preserving newlines.
+
+        ``page.keyboard.type`` maps a literal ``\\n`` to an Enter key press, and
+        LinkedIn's message composer treats Enter as submit (Shift+Enter is the
+        soft-newline). Typing a multi-paragraph string directly therefore
+        submits once per ``\\n``. This helper types each line individually and
+        emits ``Shift+Enter`` between lines so the full message lands as a
+        single send. ``\\r\\n`` is normalized to ``\\n`` first.
+        """
+        lines = message.replace("\r\n", "\n").split("\n")
+        for index, line in enumerate(lines):
+            if index > 0:
+                await self._page.keyboard.press("Shift+Enter")
+            if line:
+                await self._page.keyboard.type(line, delay=15)
+
     async def _dismiss_message_ui(self) -> None:
         """Best-effort dismissal for the profile messaging UI."""
         if not await self._locator_is_visible(_MESSAGING_CLOSE_SELECTOR, timeout=750):
@@ -3286,8 +3303,13 @@ class LinkedInExtractor:
         # patchright quirk: compose_box.click() and press_sequentially() use
         # actionability checks internally and hit the same wait_for timeout.
         # Instead: focus via page.evaluate() (no actionability check) and type
-        # via page.keyboard.type() which operates on the active element directly
+        # via page.keyboard which operates on the active element directly
         # and fires the real keydown/input/keyup events React needs to enable Send.
+        #
+        # Newlines are emitted as Shift+Enter (see _type_message_with_newlines):
+        # plain Enter submits LinkedIn's composer, so a literal "\n" inside
+        # keyboard.type() would split a multi-paragraph message into one send
+        # per line. See issue #441.
         #
         # DOM dependency: innerText extraction is not applicable here — we need
         # to call .focus() on the element reference, which requires querySelector.
@@ -3313,7 +3335,7 @@ class LinkedInExtractor:
                 recipient_selected=recipient_selected,
             )
         await asyncio.sleep(0.1)
-        await self._page.keyboard.type(message, delay=15)
+        await self._type_message_with_newlines(message)
         await asyncio.sleep(0.3)
 
         # patchright actionability also blocks send_button.click(). Use JS click
