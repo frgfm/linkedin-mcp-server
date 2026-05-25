@@ -36,6 +36,7 @@ from linkedin_mcp_server.scraping.link_metadata import (
     build_references,
     dedupe_references,
 )
+from linkedin_mcp_server.scraping.conversation import extract_conversation
 
 from .fields import COMPANY_SECTIONS, PERSON_SECTIONS
 
@@ -3066,6 +3067,7 @@ class LinkedInExtractor:
         linkedin_username: str | None = None,
         thread_id: str | None = None,
         index: int = 0,
+        max_scrolls: int = 3,
     ) -> dict[str, Any]:
         """Read a specific messaging conversation by thread ID or username.
 
@@ -3074,6 +3076,19 @@ class LinkedInExtractor:
         InMail. Ignored when ``thread_id`` is provided. Use
         ``search_conversations`` to enumerate thread IDs first if disambiguation
         by index is impractical.
+
+        ``max_scrolls`` caps how many times we scroll the message list back to
+        load older history. LinkedIn virtualizes the list, so the number of
+        returned messages grows with the scroll count; older history requires
+        higher values at the cost of latency.
+
+        Returns ``{url, sections: {messages, members}}``: ``messages`` is an
+        ordered list of ``{timestamp, status, sender, content}`` entries and
+        ``members`` is the participant list. Timestamp parsing and the
+        ``deleted`` status detection are en-US best-effort — BrowserManager
+        forces the browser locale to en-US; in other locales timestamps fall
+        through to raw concatenated text and deleted messages render with the
+        localized body text in ``content`` (status stays ``"sent"``).
 
         Side effect when looked up by username: resolution searches LinkedIn's
         messaging inbox for the participant's display name and click-visits
@@ -3099,24 +3114,19 @@ class LinkedInExtractor:
         await detect_rate_limit(self._page)
         await self._wait_for_main_text(log_context="Conversation")
         await handle_modal_close(self._page)
-        await self._scroll_main_scrollable_region(
-            position="top", attempts=3, pause_time=0.5
-        )
+        if max_scrolls > 0:
+            await self._scroll_main_scrollable_region(
+                position="top", attempts=max_scrolls, pause_time=0.5
+            )
 
-        raw_result = await self._extract_root_content(["main"])
-        raw = raw_result["text"]
-        cleaned = strip_linkedin_noise(raw) if raw else ""
-        references = (
-            build_references(raw_result["references"], "conversation")
-            if cleaned
-            else []
-        )
-        return self._single_section_result(
-            self._page.url,
-            "conversation",
-            cleaned,
-            references=references,
-        )
+        messages, members = await extract_conversation(self._page)
+        return {
+            "url": self._page.url,
+            "sections": {
+                "messages": messages,
+                "members": members,
+            },
+        }
 
     async def search_conversations(
         self, keywords: str, limit: int = 20

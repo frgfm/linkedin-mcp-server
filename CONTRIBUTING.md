@@ -60,9 +60,13 @@ for section_name, (suffix, is_overlay) in PERSON_SECTIONS.items():
 {"url": str, "sections": {name: raw_text}, "unknown_sections": [name, ...]}
 # search_jobs also returns:
 {"url": str, "sections": {name: raw_text}, "job_ids": [id, ...]}
+# get_conversation is the lone exception: sections is structured, not raw_text.
+# `sender` is an integer index into `members`; members[0].is_self is the auth user.
+# Member.url is optional — omitted on the self member when no /in/ anchor was observed.
+{"url": str, "sections": {"messages": [{timestamp, status, sender: int, content}, ...], "members": [{kind: "person", url?, name?, is_self: bool}, ...]}}
 ```
 
-`sections` remains the main readable payload. `references` is a compact supplement for entity/article traversal. LinkedIn references are emitted as relative paths to minimize token use.
+`sections` remains the main readable payload. `references` is a compact supplement for entity/article traversal. LinkedIn references are emitted as relative paths to minimize token use. `get_conversation` parses message-thread DOM into structured turns instead of emitting cluttered innerText — see [`scraping/conversation.py`](linkedin_mcp_server/scraping/conversation.py) (`extract_conversation`) for the en-US locale assumptions baked into timestamp and deleted-status detection.
 
 ## Checklist: Adding a New Section
 
