@@ -1,6 +1,7 @@
 """Tests for the LinkedInExtractor scraping engine."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
+from contextlib import ExitStack, contextmanager
 
 import pytest
 
@@ -3661,11 +3662,108 @@ class TestGetInbox:
         assert refs[0]["text"] == "Tony Chan"
 
 
+# ----------------------------------------------------------------------
+# Conversation test helpers.
+# ----------------------------------------------------------------------
+def _event(**kw):
+    """Build a JS-extractor event dict with null defaults.
+
+    Lets test cases name only the fields they care about; the JS-side
+    contract requires every key to be present (or null) per
+    ``scraping/conversation.py``.
+    """
+    return {
+        "day_heading": None,
+        "time_text": None,
+        "sender_url": None,
+        "sender_name": None,
+        "body_text": None,
+        "shared_url": None,
+        **kw,
+    }
+
+
+def _raw(events, viewer_urn=None):
+    """Wrap events into the JS-extractor result dict shape."""
+    out = {"events": events}
+    if viewer_urn is not None:
+        out["viewer_urn"] = viewer_urn
+    return out
+
+
+@contextmanager
+def _patched_extractor(
+    mock_page,
+    *,
+    extract_return=([], []),
+    thread_urls=None,
+    display_name=None,
+):
+    """Stand up a LinkedInExtractor with the standard get_conversation
+    patches applied. Yields ``(extractor, nav_mock, scroll_mock,
+    extract_mock)``.
+
+    Pass ``thread_urls`` and ``display_name`` to also patch the
+    username-resolution path.
+    """
+    extractor = LinkedInExtractor(mock_page)
+    mock_page.wait_for_selector = AsyncMock()
+    nav_mock = AsyncMock()
+    scroll_mock = AsyncMock()
+    extract_mock = AsyncMock(return_value=extract_return)
+    with ExitStack() as stack:
+        e = stack.enter_context
+        e(patch.object(extractor, "_navigate_to_page", nav_mock))
+        e(
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            )
+        )
+        e(
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            )
+        )
+        e(patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock))
+        e(patch.object(extractor, "_scroll_main_scrollable_region", scroll_mock))
+        e(
+            patch(
+                "linkedin_mcp_server.scraping.extractor.extract_conversation",
+                extract_mock,
+            )
+        )
+        if display_name is not None:
+            e(
+                patch.object(
+                    extractor,
+                    "_read_profile_display_name",
+                    new_callable=AsyncMock,
+                    return_value=display_name,
+                )
+            )
+        if thread_urls is not None:
+            e(
+                patch.object(
+                    extractor,
+                    "_resolve_conversation_thread_urls",
+                    new_callable=AsyncMock,
+                    return_value=thread_urls,
+                )
+            )
+        yield extractor, nav_mock, scroll_mock, extract_mock
+
+
+_JACKI_URLS = [
+    "https://www.linkedin.com/messaging/thread/2-newer/",
+    "https://www.linkedin.com/messaging/thread/2-older/",
+]
+
+
 class TestGetConversation:
     async def test_returns_structured_messages_by_thread_id(self, mock_page):
         """get_conversation returns sections.messages + sections.members."""
-        extractor = LinkedInExtractor(mock_page)
-        nav_mock = AsyncMock()
         sample_messages = [
             {
                 "timestamp": "2026-02-10T15:17:00",
@@ -3684,27 +3782,10 @@ class TestGetConversation:
             {"kind": "person", "url": "/in/alice/", "name": "Alice", "is_self": True},
             {"kind": "person", "url": "/in/bob/", "name": "Bob", "is_self": False},
         ]
-        with (
-            patch.object(extractor, "_navigate_to_page", nav_mock),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
-                new_callable=AsyncMock,
-            ),
-            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
-            patch.object(
-                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.extract_conversation",
-                new_callable=AsyncMock,
-                return_value=(sample_messages, sample_members),
-            ),
-        ):
-            result = await extractor.get_conversation(thread_id="abc123")
+        with _patched_extractor(
+            mock_page, extract_return=(sample_messages, sample_members)
+        ) as (ext, nav_mock, _scroll, _extract):
+            result = await ext.get_conversation(thread_id="abc123")
 
         nav_mock.assert_awaited_once_with(
             "https://www.linkedin.com/messaging/thread/abc123/"
@@ -3716,54 +3797,14 @@ class TestGetConversation:
 
     async def test_max_scrolls_zero_skips_scroll(self, mock_page):
         """max_scrolls=0 bypasses the back-scroll loop entirely."""
-        extractor = LinkedInExtractor(mock_page)
-        scroll_mock = AsyncMock()
-        with (
-            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
-                new_callable=AsyncMock,
-            ),
-            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
-            patch.object(extractor, "_scroll_main_scrollable_region", scroll_mock),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.extract_conversation",
-                new_callable=AsyncMock,
-                return_value=([], []),
-            ),
-        ):
-            await extractor.get_conversation(thread_id="abc123", max_scrolls=0)
-
+        with _patched_extractor(mock_page) as (ext, _nav, scroll_mock, _extract):
+            await ext.get_conversation(thread_id="abc123", max_scrolls=0)
         scroll_mock.assert_not_called()
 
     async def test_max_scrolls_threads_attempts(self, mock_page):
         """max_scrolls=N invokes the scroll helper with attempts=N."""
-        extractor = LinkedInExtractor(mock_page)
-        scroll_mock = AsyncMock()
-        with (
-            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
-                new_callable=AsyncMock,
-            ),
-            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
-            patch.object(extractor, "_scroll_main_scrollable_region", scroll_mock),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.extract_conversation",
-                new_callable=AsyncMock,
-                return_value=([], []),
-            ),
-        ):
-            await extractor.get_conversation(thread_id="abc123", max_scrolls=7)
-
+        with _patched_extractor(mock_page) as (ext, _nav, scroll_mock, _extract):
+            await ext.get_conversation(thread_id="abc123", max_scrolls=7)
         scroll_mock.assert_awaited_once()
         assert scroll_mock.await_args.kwargs["attempts"] == 7
 
@@ -3775,165 +3816,55 @@ class TestGetConversation:
 
     async def test_by_username_default_index_picks_first_thread(self, mock_page):
         """get_conversation by username opens the 0th matching thread by default."""
-        extractor = LinkedInExtractor(mock_page)
-        nav_mock = AsyncMock()
-        mock_page.wait_for_selector = AsyncMock()
-        with (
-            patch.object(extractor, "_navigate_to_page", nav_mock),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
-                new_callable=AsyncMock,
-            ),
-            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
-            patch.object(
-                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
-            ),
-            patch.object(
-                extractor,
-                "_read_profile_display_name",
-                new_callable=AsyncMock,
-                return_value="Jacki McMahan",
-            ),
-            patch.object(
-                extractor,
-                "_resolve_conversation_thread_urls",
-                new_callable=AsyncMock,
-                return_value=[
-                    "https://www.linkedin.com/messaging/thread/2-newer/",
-                    "https://www.linkedin.com/messaging/thread/2-older/",
-                ],
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.extract_conversation",
-                new_callable=AsyncMock,
-                return_value=([], []),
-            ),
-        ):
-            await extractor.get_conversation(linkedin_username="jacki-old")
-
-        target_calls = [
+        with _patched_extractor(
+            mock_page,
+            display_name="Jacki McMahan",
+            thread_urls=_JACKI_URLS,
+        ) as (ext, nav_mock, _scroll, _extract):
+            await ext.get_conversation(linkedin_username="jacki-old")
+        target = [
             c.args[0]
             for c in nav_mock.call_args_list
             if c.args and "/messaging/thread/" in c.args[0]
         ]
-        assert target_calls == ["https://www.linkedin.com/messaging/thread/2-newer/"]
+        assert target == ["https://www.linkedin.com/messaging/thread/2-newer/"]
 
     async def test_by_username_index_picks_specified_thread(self, mock_page):
         """get_conversation by username + index opens the i-th matching thread."""
-        extractor = LinkedInExtractor(mock_page)
-        nav_mock = AsyncMock()
-        mock_page.wait_for_selector = AsyncMock()
-        with (
-            patch.object(extractor, "_navigate_to_page", nav_mock),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
-                new_callable=AsyncMock,
-            ),
-            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
-            patch.object(
-                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
-            ),
-            patch.object(
-                extractor,
-                "_read_profile_display_name",
-                new_callable=AsyncMock,
-                return_value="Jacki McMahan",
-            ),
-            patch.object(
-                extractor,
-                "_resolve_conversation_thread_urls",
-                new_callable=AsyncMock,
-                return_value=[
-                    "https://www.linkedin.com/messaging/thread/2-newer/",
-                    "https://www.linkedin.com/messaging/thread/2-older/",
-                ],
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.extract_conversation",
-                new_callable=AsyncMock,
-                return_value=([], []),
-            ),
-        ):
-            await extractor.get_conversation(linkedin_username="jacki-old", index=1)
-
-        target_calls = [
+        with _patched_extractor(
+            mock_page,
+            display_name="Jacki McMahan",
+            thread_urls=_JACKI_URLS,
+        ) as (ext, nav_mock, _scroll, _extract):
+            await ext.get_conversation(linkedin_username="jacki-old", index=1)
+        target = [
             c.args[0]
             for c in nav_mock.call_args_list
             if c.args and "/messaging/thread/" in c.args[0]
         ]
-        assert target_calls == ["https://www.linkedin.com/messaging/thread/2-older/"]
+        assert target == ["https://www.linkedin.com/messaging/thread/2-older/"]
 
     async def test_by_username_index_out_of_range_raises(self, mock_page):
         """get_conversation raises when index exceeds the number of threads."""
-        extractor = LinkedInExtractor(mock_page)
-        mock_page.wait_for_selector = AsyncMock()
-        with (
-            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
-                new_callable=AsyncMock,
-            ),
-            patch.object(
-                extractor,
-                "_read_profile_display_name",
-                new_callable=AsyncMock,
-                return_value="Jacki McMahan",
-            ),
-            patch.object(
-                extractor,
-                "_resolve_conversation_thread_urls",
-                new_callable=AsyncMock,
-                return_value=[
-                    "https://www.linkedin.com/messaging/thread/2-only/",
-                ],
-            ),
-        ):
+        with _patched_extractor(
+            mock_page,
+            display_name="Jacki McMahan",
+            thread_urls=["https://www.linkedin.com/messaging/thread/2-only/"],
+        ) as (ext, *_):
             with pytest.raises(LinkedInScraperException, match="out of range"):
-                await extractor.get_conversation(linkedin_username="jacki-old", index=5)
+                await ext.get_conversation(linkedin_username="jacki-old", index=5)
 
     async def test_by_username_no_threads_raises_could_not_find(self, mock_page):
         """get_conversation raises 'Could not find a conversation' when none exist."""
-        extractor = LinkedInExtractor(mock_page)
-        mock_page.wait_for_selector = AsyncMock()
-        with (
-            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
-                new_callable=AsyncMock,
-            ),
-            patch.object(
-                extractor,
-                "_read_profile_display_name",
-                new_callable=AsyncMock,
-                return_value="Jacki McMahan",
-            ),
-            patch.object(
-                extractor,
-                "_resolve_conversation_thread_urls",
-                new_callable=AsyncMock,
-                return_value=[],
-            ),
-        ):
+        with _patched_extractor(
+            mock_page,
+            display_name="Jacki McMahan",
+            thread_urls=[],
+        ) as (ext, *_):
             with pytest.raises(
                 LinkedInScraperException, match="Could not find a conversation"
             ):
-                await extractor.get_conversation(linkedin_username="jacki-old")
+                await ext.get_conversation(linkedin_username="jacki-old")
 
 
 class TestConversationParserHelpers:
@@ -4080,32 +4011,29 @@ class TestConversationParserHelpers:
         assert content == "Ce message a été supprimé."
 
 
-
-
 class TestNormalizeConversationEvents:
     """Integration of the JS-side dump shape into Message/Member lists."""
 
     def test_normal_message_flow(self):
         """Two distinct senders, no viewer URN → no one is self, ordering
         follows first-appearance order in events."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Feb 10, 2024",
-                    "time_text": "3:17 PM",
-                    "sender_url": "https://www.linkedin.com/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "Hello there!",
-                },
-                {
-                    "day_heading": None,
-                    "time_text": "3:18 PM",
-                    "sender_url": "/in/bob/",
-                    "sender_name": "Bob",
-                    "body_text": "Hi Alice!",
-                },
-            ],
-        }
+        raw = _raw(
+            [
+                _event(
+                    day_heading="Feb 10, 2024",
+                    time_text="3:17 PM",
+                    sender_url="https://www.linkedin.com/in/alice/",
+                    sender_name="Alice",
+                    body_text="Hello there!",
+                ),
+                _event(
+                    time_text="3:18 PM",
+                    sender_url="/in/bob/",
+                    sender_name="Bob",
+                    body_text="Hi Alice!",
+                ),
+            ]
+        )
         messages, members = conversation_parser.normalize_conversation_events(raw)
         assert messages == [
             {
@@ -4127,17 +4055,17 @@ class TestNormalizeConversationEvents:
         ]
 
     def test_deleted_message_emits_none_content(self):
-        raw = {
-            "events": [
-                {
-                    "day_heading": "May 10",
-                    "time_text": "5:50 PM",
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "This message has been deleted.",
-                },
-            ],
-        }
+        raw = _raw(
+            [
+                _event(
+                    day_heading="May 10",
+                    time_text="5:50 PM",
+                    sender_url="/in/alice/",
+                    sender_name="Alice",
+                    body_text="This message has been deleted.",
+                ),
+            ]
+        )
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["status"] == "deleted"
         assert messages[0]["content"] is None
@@ -4146,90 +4074,75 @@ class TestNormalizeConversationEvents:
 
     def test_running_day_persists_across_events(self):
         """Subsequent events without their own day_heading inherit the prior."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Feb 10, 2024",
-                    "time_text": "3:17 PM",
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "first",
-                },
-                {
-                    "day_heading": None,
-                    "time_text": "3:18 PM",
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "second",
-                },
-                {
-                    "day_heading": "Feb 11, 2024",
-                    "time_text": "9:00 AM",
-                    "sender_url": "/in/bob/",
-                    "sender_name": "Bob",
-                    "body_text": "next day",
-                },
-            ],
-        }
+        raw = _raw(
+            [
+                _event(
+                    day_heading="Feb 10, 2024",
+                    time_text="3:17 PM",
+                    sender_url="/in/alice/",
+                    sender_name="Alice",
+                    body_text="first",
+                ),
+                _event(
+                    time_text="3:18 PM",
+                    sender_url="/in/alice/",
+                    sender_name="Alice",
+                    body_text="second",
+                ),
+                _event(
+                    day_heading="Feb 11, 2024",
+                    time_text="9:00 AM",
+                    sender_url="/in/bob/",
+                    sender_name="Bob",
+                    body_text="next day",
+                ),
+            ]
+        )
         messages, _ = conversation_parser.normalize_conversation_events(raw)
-        assert messages[0]["timestamp"] == "2024-02-10T15:17:00"
-        assert messages[1]["timestamp"] == "2024-02-10T15:18:00"
-        assert messages[2]["timestamp"] == "2024-02-11T09:00:00"
+        assert [m["timestamp"] for m in messages] == [
+            "2024-02-10T15:17:00",
+            "2024-02-10T15:18:00",
+            "2024-02-11T09:00:00",
+        ]
 
     def test_self_sender_sentinel(self):
         """An event without a resolvable sender URL maps to index 0 (self)
         when viewer URN is known."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Feb 10",
-                    "time_text": "3:17 PM",
-                    "sender_url": None,
-                    "sender_name": "You",
-                    "body_text": "hello",
-                },
+        raw = _raw(
+            [
+                _event(
+                    day_heading="Feb 10",
+                    time_text="3:17 PM",
+                    sender_name="You",
+                    body_text="hello",
+                )
             ],
-            "viewer_urn": "ACoAA_VIEWER",
-        }
+            viewer_urn="ACoAA_VIEWER",
+        )
         messages, members = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["sender"] == 0
         assert members[0]["is_self"] is True
 
-
     def test_time_text_inherited_across_same_minute_group(self):
         """Consecutive same-sender messages within a minute share one <time>.
-        Subsequent events inherit the prior clock value until a new day-heading
-        resets it. Reproduces the bug where 'First paragraph' / 'oh pinaise ca
-        marche' came back with timestamp='Today' (no clock)."""
-        raw = {
-            "events": [
-                # First event in group carries the <time>.
-                {
-                    "day_heading": "Feb 10, 2024",
-                    "time_text": "4:36 PM",
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "first",
-                },
-                # Subsequent events in the same group have no time_text.
-                {
-                    "day_heading": None,
-                    "time_text": None,
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "second",
-                },
-                {
-                    "day_heading": None,
-                    "time_text": None,
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "third",
-                },
-            ],
-        }
+        Subsequent events inherit the prior clock value until a new
+        day-heading resets it."""
+        raw = _raw(
+            [
+                _event(
+                    day_heading="Feb 10, 2024",
+                    time_text="4:36 PM",
+                    sender_url="/in/alice/",
+                    sender_name="Alice",
+                    body_text="first",
+                ),
+                _event(
+                    sender_url="/in/alice/", sender_name="Alice", body_text="second"
+                ),
+                _event(sender_url="/in/alice/", sender_name="Alice", body_text="third"),
+            ]
+        )
         messages, _ = conversation_parser.normalize_conversation_events(raw)
-        # All three messages share the same ISO timestamp from event 0's <time>.
         assert [m["timestamp"] for m in messages] == [
             "2024-02-10T16:36:00",
             "2024-02-10T16:36:00",
@@ -4239,27 +4152,25 @@ class TestNormalizeConversationEvents:
 
     def test_running_time_resets_on_new_day_heading(self):
         """Running time should not bleed across day boundaries."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Feb 10, 2024",
-                    "time_text": "4:36 PM",
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "day 1",
-                },
+        raw = _raw(
+            [
+                _event(
+                    day_heading="Feb 10, 2024",
+                    time_text="4:36 PM",
+                    sender_url="/in/alice/",
+                    sender_name="Alice",
+                    body_text="day 1",
+                ),
                 # New day, no time_text — should NOT inherit 4:36 PM.
-                {
-                    "day_heading": "Feb 11, 2024",
-                    "time_text": None,
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "day 2 no time",
-                },
-            ],
-        }
+                _event(
+                    day_heading="Feb 11, 2024",
+                    sender_url="/in/alice/",
+                    sender_name="Alice",
+                    body_text="day 2 no time",
+                ),
+            ]
+        )
         messages, _ = conversation_parser.normalize_conversation_events(raw)
-        # First message has full ISO timestamp.
         assert messages[0]["timestamp"] == "2024-02-10T16:36:00"
         # Second message has no clock — falls back to the raw day heading.
         assert messages[1]["timestamp"] == "Feb 11, 2024"
@@ -4267,18 +4178,17 @@ class TestNormalizeConversationEvents:
     def test_link_card_event_renders_url_as_content(self):
         """A message that is purely a shared link card (no <p> body) emits
         the card's permalink as content rather than being skipped."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Mar 19, 2026",
-                    "time_text": "5:22 PM",
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": None,
-                    "shared_url": "/feed/update/urn:li:activity:7440422212802826240/",
-                },
-            ],
-        }
+        raw = _raw(
+            [
+                _event(
+                    day_heading="Mar 19, 2026",
+                    time_text="5:22 PM",
+                    sender_url="/in/alice/",
+                    sender_name="Alice",
+                    shared_url="/feed/update/urn:li:activity:7440422212802826240/",
+                ),
+            ]
+        )
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert len(messages) == 1
         assert messages[0]["status"] == "sent"
@@ -4289,62 +4199,54 @@ class TestNormalizeConversationEvents:
 
     def test_link_card_absolute_url_normalized_to_relative(self):
         """Absolute LinkedIn URLs in a card href become relative paths."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Mar 19, 2026",
-                    "time_text": "5:22 PM",
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": None,
-                    "shared_url": "https://www.linkedin.com/jobs/view/4371001486?ref=foo",
-                },
-            ],
-        }
+        raw = _raw(
+            [
+                _event(
+                    day_heading="Mar 19, 2026",
+                    time_text="5:22 PM",
+                    sender_url="/in/alice/",
+                    sender_name="Alice",
+                    shared_url="https://www.linkedin.com/jobs/view/4371001486?ref=foo",
+                ),
+            ]
+        )
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["content"] == "/jobs/view/4371001486"
 
     def test_body_text_wins_over_shared_url(self):
         """When a comment-with-share has both text and a card URL, body wins."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Feb 16, 2026",
-                    "time_text": "9:01 AM",
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "Look at this!",
-                    "shared_url": "/feed/update/urn:li:activity:7428718265717190656/",
-                },
-            ],
-        }
+        raw = _raw(
+            [
+                _event(
+                    day_heading="Feb 16, 2026",
+                    time_text="9:01 AM",
+                    sender_url="/in/alice/",
+                    sender_name="Alice",
+                    body_text="Look at this!",
+                    shared_url="/feed/update/urn:li:activity:7428718265717190656/",
+                ),
+            ]
+        )
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["content"] == "Look at this!"
 
     def test_skips_event_without_body_unless_deleted(self):
         """Attachment-only / system events (no body_text, not a tombstone)
         are dropped per V1 scope. Their sender still surfaces as a member."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Feb 10, 2024",
-                    "time_text": "3:17 PM",
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "real message",
-                },
-                {
-                    # Image-only or similar: no text body, not deleted.
-                    "day_heading": None,
-                    "time_text": "3:18 PM",
-                    "sender_url": "/in/bob/",
-                    "sender_name": "Bob",
-                    "body_text": None,
-                },
-            ],
-        }
+        raw = _raw(
+            [
+                _event(
+                    day_heading="Feb 10, 2024",
+                    time_text="3:17 PM",
+                    sender_url="/in/alice/",
+                    sender_name="Alice",
+                    body_text="real message",
+                ),
+                # Image-only or similar: no text body, not deleted.
+                _event(time_text="3:18 PM", sender_url="/in/bob/", sender_name="Bob"),
+            ]
+        )
         messages, members = conversation_parser.normalize_conversation_events(raw)
-        # Only the real message survives.
         assert len(messages) == 1
         assert messages[0]["sender"] == 0  # Alice is at index 0 (no viewer URN)
         # Both Alice and Bob still appear as participants — we recorded
@@ -4354,29 +4256,27 @@ class TestNormalizeConversationEvents:
 
     def test_self_always_at_index_zero(self):
         """When viewer URN is known, the authenticated user is members[0]
-        regardless of order of appearance in events. Other participants
-        keep first-appearance order behind self."""
-        raw = {
-            "events": [
+        regardless of order of appearance in events."""
+        raw = _raw(
+            [
                 # Other person speaks first.
-                {
-                    "day_heading": "Feb 16, 2026",
-                    "time_text": "9:01 AM",
-                    "sender_url": "/in/ACoAA_OTHER/",
-                    "sender_name": "Other Person",
-                    "body_text": "hi",
-                },
+                _event(
+                    day_heading="Feb 16, 2026",
+                    time_text="9:01 AM",
+                    sender_url="/in/ACoAA_OTHER/",
+                    sender_name="Other Person",
+                    body_text="hi",
+                ),
                 # Viewer replies.
-                {
-                    "day_heading": None,
-                    "time_text": "9:02 AM",
-                    "sender_url": "https://www.linkedin.com/in/ACoAA_VIEWER/",
-                    "sender_name": "Me",
-                    "body_text": "hello back",
-                },
+                _event(
+                    time_text="9:02 AM",
+                    sender_url="https://www.linkedin.com/in/ACoAA_VIEWER/",
+                    sender_name="Me",
+                    body_text="hello back",
+                ),
             ],
-            "viewer_urn": "ACoAA_VIEWER",
-        }
+            viewer_urn="ACoAA_VIEWER",
+        )
         messages, members = conversation_parser.normalize_conversation_events(raw)
         # Self lives at index 0 even though "other" appears first in events.
         assert members[0]["is_self"] is True
@@ -4388,75 +4288,59 @@ class TestNormalizeConversationEvents:
 
     def test_self_synthesized_when_viewer_urn_unobserved(self):
         """If viewer URN is known but the viewer never appears as a sender
-        anchor (rare — happens when LinkedIn always omits the link), the
-        self member still occupies index 0 but carries NO url field. The
-        fsd_profile URN from data-event-urn is an internal identifier,
-        not a guaranteed valid vanity slug, so synthesizing /in/<URN>/
-        would emit a misleading URL."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Feb 16, 2026",
-                    "time_text": "9:01 AM",
-                    "sender_url": None,
-                    "sender_name": None,
-                    "body_text": "I sent this with no anchor",
-                },
-                {
-                    "day_heading": None,
-                    "time_text": "9:02 AM",
-                    "sender_url": "/in/ACoAA_OTHER/",
-                    "sender_name": "Other Person",
-                    "body_text": "reply",
-                },
+        anchor (rare), the self member still occupies index 0 but carries
+        NO url field. fsd_profile URN isn't a guaranteed vanity slug."""
+        raw = _raw(
+            [
+                _event(
+                    day_heading="Feb 16, 2026",
+                    time_text="9:01 AM",
+                    body_text="I sent this with no anchor",
+                ),
+                _event(
+                    time_text="9:02 AM",
+                    sender_url="/in/ACoAA_OTHER/",
+                    sender_name="Other Person",
+                    body_text="reply",
+                ),
             ],
-            "viewer_urn": "ACoAA_VIEWER",
-        }
+            viewer_urn="ACoAA_VIEWER",
+        )
         messages, members = conversation_parser.normalize_conversation_events(raw)
-        # Self has is_self True but NO url — we don't synthesize one
-        # from the viewer URN.
+        # Self has is_self True but NO url.
         assert members[0] == {"kind": "person", "is_self": True}
         assert "url" not in members[0]
-        # Other participant has the regular shape (url + is_self False).
         assert members[1]["is_self"] is False
         assert members[1]["url"] == "/in/ACoAA_OTHER/"
-        # Sender indices still work — self is at index 0, other at 1.
         assert [m["sender"] for m in messages] == [0, 1]
 
     def test_is_self_false_on_everyone_when_viewer_urn_absent(self):
-        """If JS couldn't determine the viewer URN (e.g. no events yet),
-        is_self is False everywhere — but the field is still always present."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Feb 16, 2026",
-                    "time_text": "9:01 AM",
-                    "sender_url": "/in/ACoAA_SOMEONE/",
-                    "sender_name": "Someone",
-                    "body_text": "hi",
-                },
-            ],
-            "viewer_urn": None,
-        }
+        """If JS couldn't determine the viewer URN, is_self is False
+        everywhere — but the field is still always present."""
+        raw = _raw(
+            [
+                _event(
+                    day_heading="Feb 16, 2026",
+                    time_text="9:01 AM",
+                    sender_url="/in/ACoAA_SOMEONE/",
+                    sender_name="Someone",
+                    body_text="hi",
+                ),
+            ]
+        )
         _, members = conversation_parser.normalize_conversation_events(raw)
-        # is_self present on every member, always False.
         assert all(m["is_self"] is False for m in members)
 
     def test_orphan_event_without_attribution_is_skipped(self):
         """An event with no sender_url AND no viewer URN can't be attributed
         and is dropped — consistent with V1 attachment-skip behavior."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Feb 10, 2024",
-                    "time_text": "3:17 PM",
-                    "sender_url": None,
-                    "sender_name": None,
-                    "body_text": "orphan",
-                },
-            ],
-            "viewer_urn": None,
-        }
+        raw = _raw(
+            [
+                _event(
+                    day_heading="Feb 10, 2024", time_text="3:17 PM", body_text="orphan"
+                ),
+            ]
+        )
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages == []
 
