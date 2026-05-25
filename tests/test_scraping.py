@@ -1318,15 +1318,15 @@ class TestConnectWithPerson:
             ),
             patch.object(
                 extractor,
-                "click_button_by_text",
+                "_accept_incoming_invitation",
                 new_callable=AsyncMock,
                 return_value=True,
-            ) as mock_click,
+            ) as mock_accept,
         ):
             result = await extractor.connect_with_person("testuser")
 
         assert result["status"] == "accepted"
-        mock_click.assert_awaited_once_with("Accept", scope="main")
+        mock_accept.assert_awaited_once_with("testuser")
 
     async def test_incoming_request_send_failed_when_no_first_degree(self, mock_page):
         """Accept clicked but profile never transitions to 1st-degree."""
@@ -1347,7 +1347,7 @@ class TestConnectWithPerson:
             ),
             patch.object(
                 extractor,
-                "click_button_by_text",
+                "_accept_incoming_invitation",
                 new_callable=AsyncMock,
                 return_value=True,
             ),
@@ -4126,218 +4126,6 @@ class TestInvitationManagement:
 
         assert mock_page.evaluate.await_count == 2
         mock_sleep.assert_awaited_once_with(0.5)
-
-    @pytest.mark.parametrize(
-        ("method_name", "confirm_kw", "expected_action", "expected_kind"),
-        [
-            ("accept_invitation", {"confirm_accept": False}, "accept", "received"),
-            ("reject_invitation", {"confirm_reject": False}, "reject", "received"),
-            ("withdraw_invitation", {"confirm_withdraw": False}, "withdraw", "sent"),
-        ],
-    )
-    async def test_invitation_actions_require_confirmation(
-        self,
-        mock_page,
-        method_name,
-        confirm_kw,
-        expected_action,
-        expected_kind,
-    ):
-        extractor = LinkedInExtractor(mock_page)
-        result = await getattr(extractor, method_name)("/in/alice/", **confirm_kw)
-
-        assert result["status"] == "confirmation_required"
-        assert result["action"] == expected_action
-        assert result["kind"] == expected_kind
-        assert result["linkedin_username"] == "alice"
-        mock_page.goto.assert_not_awaited()
-
-    @pytest.mark.parametrize(
-        ("method_name", "confirm_kw", "expected_status", "expected_action"),
-        [
-            ("accept_invitation", {"confirm_accept": True}, "accepted", "accept"),
-            ("reject_invitation", {"confirm_reject": True}, "rejected", "reject"),
-            (
-                "withdraw_invitation",
-                {"confirm_withdraw": True},
-                "withdrawn",
-                "withdraw",
-            ),
-        ],
-    )
-    async def test_invitation_action_success(
-        self,
-        mock_page,
-        method_name,
-        confirm_kw,
-        expected_status,
-        expected_action,
-    ):
-        extractor = LinkedInExtractor(mock_page)
-        with (
-            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
-                new_callable=AsyncMock,
-            ),
-            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
-            patch.object(
-                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
-            ),
-            patch.object(
-                extractor, "_expand_invitation_note_toggles", new_callable=AsyncMock
-            ),
-            patch.object(
-                extractor,
-                "_click_invitation_action",
-                new_callable=AsyncMock,
-                return_value={
-                    "found": True,
-                    "clicked": True,
-                    "profile_url": "/in/alice/",
-                    "text": "Annehmen Ablehnen",
-                },
-            ) as mock_click,
-            patch.object(
-                extractor,
-                "_dialog_is_open",
-                new_callable=AsyncMock,
-                return_value=False,
-            ),
-            patch.object(
-                extractor,
-                "_invitation_card_present",
-                new_callable=AsyncMock,
-                return_value=False,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
-        ):
-            result = await getattr(extractor, method_name)(
-                "https://www.linkedin.com/in/alice/",
-                **confirm_kw,
-            )
-
-        assert result["status"] == expected_status
-        assert result["performed"] is True
-        mock_click.assert_awaited_once_with(username="alice", action=expected_action)
-
-    async def test_withdraw_invitation_confirms_modal(self, mock_page):
-        extractor = LinkedInExtractor(mock_page)
-        with (
-            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
-                new_callable=AsyncMock,
-            ),
-            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
-            patch.object(
-                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
-            ),
-            patch.object(
-                extractor, "_expand_invitation_note_toggles", new_callable=AsyncMock
-            ),
-            patch.object(
-                extractor,
-                "_click_invitation_action",
-                new_callable=AsyncMock,
-                return_value={"found": True, "clicked": True},
-            ),
-            patch.object(
-                extractor, "_dialog_is_open", new_callable=AsyncMock, return_value=True
-            ),
-            patch.object(
-                extractor,
-                "_click_dialog_primary_button",
-                new_callable=AsyncMock,
-                return_value=True,
-            ) as mock_confirm,
-            patch.object(
-                extractor,
-                "_invitation_card_present",
-                new_callable=AsyncMock,
-                return_value=False,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
-        ):
-            result = await extractor.withdraw_invitation("alice", confirm_withdraw=True)
-
-        assert result["status"] == "withdrawn"
-        mock_confirm.assert_awaited_once()
-        mock_page.wait_for_selector.assert_awaited()
-
-    @pytest.mark.parametrize(
-        ("click_result", "card_present", "expected_status"),
-        [
-            ({"found": False, "clicked": False}, False, "not_found"),
-            ({"found": True, "clicked": False}, False, "action_unavailable"),
-            ({"found": True, "clicked": True}, True, "verification_failed"),
-        ],
-    )
-    async def test_invitation_action_failures(
-        self,
-        mock_page,
-        click_result,
-        card_present,
-        expected_status,
-    ):
-        extractor = LinkedInExtractor(mock_page)
-        with (
-            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
-                new_callable=AsyncMock,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
-                new_callable=AsyncMock,
-            ),
-            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
-            patch.object(
-                extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
-            ),
-            patch.object(
-                extractor, "_expand_invitation_note_toggles", new_callable=AsyncMock
-            ),
-            patch.object(
-                extractor,
-                "_click_invitation_action",
-                new_callable=AsyncMock,
-                return_value=click_result,
-            ),
-            patch.object(
-                extractor,
-                "_dialog_is_open",
-                new_callable=AsyncMock,
-                return_value=False,
-            ),
-            patch.object(
-                extractor,
-                "_invitation_card_present",
-                new_callable=AsyncMock,
-                return_value=card_present,
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
-        ):
-            result = await extractor.accept_invitation("alice", confirm_accept=True)
-
-        assert result["status"] == expected_status
 
 
 # ----------------------------------------------------------------------

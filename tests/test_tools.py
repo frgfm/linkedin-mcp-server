@@ -34,9 +34,6 @@ def _make_mock_extractor(scrape_result: dict) -> MagicMock:
     mock.search_conversations = AsyncMock(return_value=scrape_result)
     mock.send_message = AsyncMock(return_value=scrape_result)
     mock.get_pending_invitations = AsyncMock(return_value=scrape_result)
-    mock.accept_invitation = AsyncMock(return_value=scrape_result)
-    mock.reject_invitation = AsyncMock(return_value=scrape_result)
-    mock.withdraw_invitation = AsyncMock(return_value=scrape_result)
     mock.get_my_profile = AsyncMock(return_value=scrape_result)
     mock.search_companies = AsyncMock(return_value=scrape_result)
     mock.get_company_employees = AsyncMock(return_value=scrape_result)
@@ -1272,101 +1269,15 @@ class TestNetworkTools:
         with pytest.raises(ValidationError, match="limit"):
             await mcp.call_tool("get_pending_invitations", {"limit": 101})
 
-    async def test_accept_invitation_delegates(self, mock_context):
-        expected = {
-            "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/",
-            "status": "accepted",
-            "message": "Invitation accepted.",
-            "kind": "received",
-            "action": "accept",
-            "linkedin_username": "alice",
-            "profile_url": "/in/alice/",
-            "performed": True,
-        }
-        mock_extractor = _make_mock_extractor(expected)
-
+    async def test_invitation_action_tools_are_not_registered(self):
         from linkedin_mcp_server.tools.network import register_network_tools
 
         mcp = FastMCP("test")
         register_network_tools(mcp)
 
-        tool_fn = await get_tool_fn(mcp, "accept_invitation")
-        result = await tool_fn(
-            "alice",
-            True,
-            mock_context,
-            extractor=mock_extractor,
-        )
-
-        assert result["status"] == "accepted"
-        mock_extractor.accept_invitation.assert_awaited_once_with(
-            "alice",
-            confirm_accept=True,
-        )
-
-    async def test_reject_invitation_delegates(self, mock_context):
-        expected = {
-            "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/",
-            "status": "rejected",
-            "message": "Invitation rejected.",
-            "kind": "received",
-            "action": "reject",
-            "linkedin_username": "alice",
-            "profile_url": "/in/alice/",
-            "performed": True,
-        }
-        mock_extractor = _make_mock_extractor(expected)
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        tool_fn = await get_tool_fn(mcp, "reject_invitation")
-        result = await tool_fn(
-            "alice",
-            True,
-            mock_context,
-            extractor=mock_extractor,
-        )
-
-        assert result["status"] == "rejected"
-        mock_extractor.reject_invitation.assert_awaited_once_with(
-            "alice",
-            confirm_reject=True,
-        )
-
-    async def test_withdraw_invitation_delegates(self, mock_context):
-        expected = {
-            "url": "https://www.linkedin.com/mynetwork/invitation-manager/sent/",
-            "status": "withdrawn",
-            "message": "Invitation withdrawn.",
-            "kind": "sent",
-            "action": "withdraw",
-            "linkedin_username": "alice",
-            "profile_url": "/in/alice/",
-            "performed": True,
-        }
-        mock_extractor = _make_mock_extractor(expected)
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        tool_fn = await get_tool_fn(mcp, "withdraw_invitation")
-        result = await tool_fn(
-            "alice",
-            True,
-            mock_context,
-            extractor=mock_extractor,
-        )
-
-        assert result["status"] == "withdrawn"
-        mock_extractor.withdraw_invitation.assert_awaited_once_with(
-            "alice",
-            confirm_withdraw=True,
-        )
+        assert await mcp.get_tool("accept_invitation") is None
+        assert await mcp.get_tool("reject_invitation") is None
+        assert await mcp.get_tool("withdraw_invitation") is None
 
 
 class TestToolTimeouts:
@@ -1390,9 +1301,6 @@ class TestToolTimeouts:
             "search_conversations",
             "send_message",
             "get_pending_invitations",
-            "accept_invitation",
-            "reject_invitation",
-            "withdraw_invitation",
             "get_feed",
             "close_session",
         )
@@ -1425,9 +1333,6 @@ class TestToolTimeouts:
             "search_conversations",
             "send_message",
             "get_pending_invitations",
-            "accept_invitation",
-            "reject_invitation",
-            "withdraw_invitation",
             "get_feed",
             "close_session",
         )

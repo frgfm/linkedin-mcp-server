@@ -110,18 +110,6 @@
       "description": "List pending LinkedIn received invitations or sent connection requests as structured invitation records"
     },
     {
-      "name": "accept_invitation",
-      "description": "Accept a received LinkedIn network invitation with explicit confirmation"
-    },
-    {
-      "name": "reject_invitation",
-      "description": "Reject a received LinkedIn network invitation with explicit confirmation"
-    },
-    {
-      "name": "withdraw_invitation",
-      "description": "Withdraw a sent LinkedIn network invitation with explicit confirmation"
-    },
-    {
       "name": "get_feed",
       "description": "Get recent posts from the authenticated user's LinkedIn home feed"
     },

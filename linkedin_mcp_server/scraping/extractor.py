@@ -556,8 +556,8 @@ _INVITATION_CARD_PRESENT_JS = r"""
 }
 """
 
-_INVITATION_CLICK_ACTION_JS = r"""
-({ username, action }) => {
+_INVITATION_ACCEPT_ACTION_JS = r"""
+({ username }) => {
   const root = document.querySelector('main') || document.body;
   if (!root) {
     return { found: false, clicked: false, reason: 'no_root' };
@@ -623,18 +623,12 @@ _INVITATION_CLICK_ACTION_JS = r"""
     };
   }
 
-  const tokenSets = {
-    accept: ['accept', 'confirm'],
-    reject: ['ignore', 'reject', 'dismiss'],
-    withdraw: ['withdraw', 'cancel'],
-  };
-  const tokens = tokenSets[action] || [];
   let target = buttons.find(button => {
     const attrs = actionAttrs(button);
-    return tokens.some(token => attrs.includes(token));
+    return attrs.includes('accept') || attrs.includes('confirm');
   });
   if (!target) {
-    target = action === 'accept' ? buttons[buttons.length - 1] : buttons[0];
+    target = buttons[buttons.length - 1];
   }
 
   target.click();
@@ -692,24 +686,20 @@ def _connection_result(
     return result
 
 
-def _invitation_action_result(
+def _incoming_invitation_accept_result(
     url: str,
     status: str,
     message: str,
     *,
-    kind: Literal["received", "sent"],
-    action: Literal["accept", "reject", "withdraw"],
     linkedin_username: str,
     profile_url: str = "",
     performed: bool = False,
 ) -> dict[str, Any]:
-    """Build a structured response for an invitation action attempt."""
+    """Build the internal response for incoming-request acceptance."""
     result: dict[str, Any] = {
         "url": url,
         "status": status,
         "message": message,
-        "kind": kind,
-        "action": action,
         "linkedin_username": linkedin_username,
         "performed": performed,
     }
@@ -2396,10 +2386,7 @@ class LinkedInExtractor:
             )
 
         if state == "incoming_request":
-            action_result = await self.accept_invitation(
-                username,
-                confirm_accept=True,
-            )
+            action_result = await self._accept_incoming_invitation(username)
             if action_result["status"] != "accepted":
                 return _connection_result(
                     url,
@@ -4230,194 +4217,81 @@ class LinkedInExtractor:
                     break
         return cards
 
-    async def accept_invitation(
+    async def _accept_incoming_invitation(
         self,
         linkedin_username: str,
-        *,
-        confirm_accept: bool,
     ) -> dict[str, Any]:
-        """Accept a received invitation from the invitation manager."""
+        """Accept a received invitation from the invitation manager for connect flow."""
         username = _normalize_invitation_username(linkedin_username)
-        if not confirm_accept:
-            return _invitation_action_result(
-                _invitation_manager_url("received"),
-                "confirmation_required",
-                "Set confirm_accept=true to accept the invitation.",
-                kind="received",
-                action="accept",
-                linkedin_username=username,
-                profile_url=f"/in/{username}/" if username else "",
-            )
-        return await self._perform_invitation_action(
-            username,
-            kind="received",
-            action="accept",
-            success_status="accepted",
-            success_message="Invitation accepted.",
-        )
-
-    async def reject_invitation(
-        self,
-        linkedin_username: str,
-        *,
-        confirm_reject: bool,
-    ) -> dict[str, Any]:
-        """Reject a received invitation from the invitation manager."""
-        username = _normalize_invitation_username(linkedin_username)
-        if not confirm_reject:
-            return _invitation_action_result(
-                _invitation_manager_url("received"),
-                "confirmation_required",
-                "Set confirm_reject=true to reject the invitation.",
-                kind="received",
-                action="reject",
-                linkedin_username=username,
-                profile_url=f"/in/{username}/" if username else "",
-            )
-        return await self._perform_invitation_action(
-            username,
-            kind="received",
-            action="reject",
-            success_status="rejected",
-            success_message="Invitation rejected.",
-        )
-
-    async def withdraw_invitation(
-        self,
-        linkedin_username: str,
-        *,
-        confirm_withdraw: bool,
-    ) -> dict[str, Any]:
-        """Withdraw a sent invitation from the invitation manager."""
-        username = _normalize_invitation_username(linkedin_username)
-        if not confirm_withdraw:
-            return _invitation_action_result(
-                _invitation_manager_url("sent"),
-                "confirmation_required",
-                "Set confirm_withdraw=true to withdraw the invitation.",
-                kind="sent",
-                action="withdraw",
-                linkedin_username=username,
-                profile_url=f"/in/{username}/" if username else "",
-            )
-        return await self._perform_invitation_action(
-            username,
-            kind="sent",
-            action="withdraw",
-            success_status="withdrawn",
-            success_message="Invitation withdrawn.",
-        )
-
-    async def _perform_invitation_action(
-        self,
-        username: str,
-        *,
-        kind: Literal["received", "sent"],
-        action: Literal["accept", "reject", "withdraw"],
-        success_status: str,
-        success_message: str,
-    ) -> dict[str, Any]:
-        """Click an invitation-manager card action and verify the card disappears."""
-        url = _invitation_manager_url(kind)
+        url = _invitation_manager_url("received")
         profile_url = f"/in/{username}/" if username else ""
         if not username:
-            return _invitation_action_result(
+            return _incoming_invitation_accept_result(
                 url,
                 "not_found",
                 "LinkedIn username is required.",
-                kind=kind,
-                action=action,
                 linkedin_username=username,
                 profile_url=profile_url,
             )
 
         await self._navigate_to_page(url)
         await detect_rate_limit(self._page)
-        await self._wait_for_main_text(log_context=f"Invitations ({kind})")
+        await self._wait_for_main_text(log_context="Invitations (received)")
         await handle_modal_close(self._page)
         await self._scroll_main_scrollable_region(
             position="bottom", attempts=3, pause_time=0.5
         )
         await self._expand_invitation_note_toggles()
 
-        clicked = await self._click_invitation_action(username=username, action=action)
+        clicked = await self._click_incoming_invitation_accept(username=username)
         profile_url = str(clicked.get("profile_url") or profile_url)
         if not clicked.get("found"):
-            return _invitation_action_result(
+            return _incoming_invitation_accept_result(
                 url,
                 "not_found",
-                f"No {kind} invitation was found for {username}.",
-                kind=kind,
-                action=action,
+                f"No received invitation was found for {username}.",
                 linkedin_username=username,
                 profile_url=profile_url,
             )
         if not clicked.get("clicked"):
-            return _invitation_action_result(
+            return _incoming_invitation_accept_result(
                 url,
                 "action_unavailable",
-                f"LinkedIn did not expose a usable {action} action for {username}.",
-                kind=kind,
-                action=action,
+                f"LinkedIn did not expose a usable accept action for {username}.",
                 linkedin_username=username,
                 profile_url=profile_url,
             )
 
-        if action == "withdraw" and await self._dialog_is_open(timeout=1000):
-            confirmed = await self._click_dialog_primary_button()
-            if not confirmed:
-                await self._dismiss_dialog()
-                return _invitation_action_result(
-                    url,
-                    "action_unavailable",
-                    "LinkedIn opened a withdraw confirmation dialog, but the primary action was unavailable.",
-                    kind=kind,
-                    action=action,
-                    linkedin_username=username,
-                    profile_url=profile_url,
-                )
-            try:
-                await self._page.wait_for_selector(
-                    _DIALOG_SELECTOR, state="hidden", timeout=5000
-                )
-            except PlaywrightTimeoutError:
-                logger.debug("Invitation action dialog did not close after submit")
-
         await asyncio.sleep(0.75)
         if await self._invitation_card_present(username):
-            return _invitation_action_result(
+            return _incoming_invitation_accept_result(
                 url,
                 "verification_failed",
-                f"Clicked {action}, but the invitation card was still visible.",
-                kind=kind,
-                action=action,
+                "Clicked accept, but the invitation card was still visible.",
                 linkedin_username=username,
                 profile_url=profile_url,
                 performed=True,
             )
 
-        return _invitation_action_result(
+        return _incoming_invitation_accept_result(
             url,
-            success_status,
-            success_message,
-            kind=kind,
-            action=action,
+            "accepted",
+            "Invitation accepted.",
             linkedin_username=username,
             profile_url=profile_url,
             performed=True,
         )
 
-    async def _click_invitation_action(
+    async def _click_incoming_invitation_accept(
         self,
         *,
         username: str,
-        action: Literal["accept", "reject", "withdraw"],
     ) -> dict[str, Any]:
-        """Click a card action using URL identity plus data attrs or button position."""
+        """Click a received invitation accept action without localized text."""
         try:
             result = await self._page.evaluate(
-                _INVITATION_CLICK_ACTION_JS,
-                {"username": username, "action": action},
+                _INVITATION_ACCEPT_ACTION_JS,
+                {"username": username},
             )
         except Exception:
             logger.debug("Invitation action click failed", exc_info=True)
