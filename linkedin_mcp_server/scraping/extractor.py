@@ -270,6 +270,13 @@ _INVITATION_CARDS_JS = r"""
       return '';
     }
   };
+  const linkedInUrl = href => {
+    try {
+      return new URL(href, location.origin).toString();
+    } catch {
+      return '';
+    }
+  };
   const ageLineMatch = line => line.match(
     new RegExp(`^(?:(?:sent|envoyé|envoyée)\\s+)?(?:il\\s+y\\s+a\\s+)?(\\d+)\\s*(${ageUnits})(?:\\s+ago)?$`, 'i')
   );
@@ -459,6 +466,7 @@ _INVITATION_CARDS_JS = r"""
     const links = Array.from(card.querySelectorAll('a[href]')).map(link => ({
       anchor: link,
       path: linkedInPath(link.getAttribute('href') || link.href),
+      url: linkedInUrl(link.getAttribute('href') || link.href),
       text: bestAnchorText(link),
       image_only: isImageOnlyAnchor(link),
     }));
@@ -470,7 +478,7 @@ _INVITATION_CARDS_JS = r"""
     const organizationLink = bestLink(link => /^\/(?:company|showcase|school)\/[^/?#]+\/?/.test(link.path));
     const pageLink = bestLink(link => /^\/(?:company|showcase)\/[^/?#]+\/?/.test(link.path));
     const newsletterLink = bestLink(link => /^\/newsletters\/[^/?#]+\/?/.test(link.path));
-    const messageLink = links.find(link => link.path.includes('/messaging/'));
+    const messageLink = links.find(link => /^\/messaging\/compose\//.test(link.path));
     const text = cardText(card);
 
     if (kind === 'sent') {
@@ -531,7 +539,7 @@ _INVITATION_CARDS_JS = r"""
               ? { title: newsletterLink.text, url: newsletterLink.path }
               : null,
           },
-      message_url: type === 'connection_request' ? (messageLink?.path || null) : null,
+      message_url: type === 'connection_request' ? (messageLink?.url || null) : null,
     });
     if (limit && result.length >= limit) break;
   }
