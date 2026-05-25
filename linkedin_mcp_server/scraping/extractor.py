@@ -247,6 +247,178 @@ _OPEN_MORE_BUTTON_JS = (
 """
 )
 
+_INVITATION_CARDS_JS = r"""
+({ kind, limit }) => {
+  const root = document.querySelector('main') || document.body;
+  if (!root) return [];
+
+  const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+  const usernameFromHref = href => {
+    try {
+      const url = new URL(href, location.origin);
+      const match = url.pathname.match(/^\/in\/([^/?#]+)\/?/);
+      return match ? decodeURIComponent(match[1]) : '';
+    } catch {
+      return '';
+    }
+  };
+
+  const result = [];
+  const seen = new Set();
+  for (const anchor of root.querySelectorAll('a[href*="/in/"]')) {
+    const username = usernameFromHref(anchor.getAttribute('href') || anchor.href);
+    if (!username || seen.has(username)) continue;
+
+    const card =
+      anchor.closest('li') ||
+      anchor.closest('article') ||
+      anchor.closest('[data-view-name]') ||
+      anchor.closest('section') ||
+      anchor.parentElement;
+    if (!card || !root.contains(card)) continue;
+
+    seen.add(username);
+    result.push({
+      kind,
+      linkedin_username: username,
+      profile_url: `/in/${username}/`,
+      text: normalize(card.innerText || card.textContent),
+    });
+    if (limit && result.length >= limit) break;
+  }
+  return result;
+}
+"""
+
+_INVITATION_CARD_PRESENT_JS = r"""
+({ username }) => {
+  const root = document.querySelector('main') || document.body;
+  if (!root) return false;
+  const usernameFromHref = href => {
+    try {
+      const url = new URL(href, location.origin);
+      const match = url.pathname.match(/^\/in\/([^/?#]+)\/?/);
+      return match ? decodeURIComponent(match[1]) : '';
+    } catch {
+      return '';
+    }
+  };
+  return Array.from(root.querySelectorAll('a[href*="/in/"]')).some(anchor => {
+    return usernameFromHref(anchor.getAttribute('href') || anchor.href) === username;
+  });
+}
+"""
+
+_INVITATION_CLICK_ACTION_JS = r"""
+({ username, action }) => {
+  const root = document.querySelector('main') || document.body;
+  if (!root) {
+    return { found: false, clicked: false, reason: 'no_root' };
+  }
+
+  const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+  const usernameFromHref = href => {
+    try {
+      const url = new URL(href, location.origin);
+      const match = url.pathname.match(/^\/in\/([^/?#]+)\/?/);
+      return match ? decodeURIComponent(match[1]) : '';
+    } catch {
+      return '';
+    }
+  };
+  const visible = el => {
+    const rects = el.getClientRects ? el.getClientRects() : [];
+    return !el.disabled && rects.length > 0;
+  };
+  const actionAttrs = el => [
+    el.getAttribute('data-control-name'),
+    el.getAttribute('data-test-id'),
+    el.getAttribute('data-testid'),
+    el.getAttribute('data-view-name'),
+    el.getAttribute('id'),
+  ].filter(Boolean).join(' ').toLowerCase();
+
+  let card = null;
+  let profileUrl = '';
+  for (const anchor of root.querySelectorAll('a[href*="/in/"]')) {
+    const foundUsername = usernameFromHref(anchor.getAttribute('href') || anchor.href);
+    if (foundUsername !== username) continue;
+    profileUrl = `/in/${foundUsername}/`;
+    card =
+      anchor.closest('li') ||
+      anchor.closest('article') ||
+      anchor.closest('[data-view-name]') ||
+      anchor.closest('section') ||
+      anchor.parentElement;
+    break;
+  }
+  if (!card) {
+    return { found: false, clicked: false, reason: 'not_found' };
+  }
+
+  const buttons = Array.from(card.querySelectorAll('button, [role="button"]'))
+    .filter(visible)
+    .filter(button => button.getAttribute('data-testid') !== 'expandable-text-button')
+    .filter(button => !button.closest('[data-testid="expandable-text-box"]'));
+  if (buttons.length === 0) {
+    return {
+      found: true,
+      clicked: false,
+      reason: 'action_unavailable',
+      profile_url: profileUrl,
+      action_count: 0,
+      text: normalize(card.innerText || card.textContent),
+    };
+  }
+
+  const tokenSets = {
+    accept: ['accept', 'confirm'],
+    reject: ['ignore', 'reject', 'dismiss'],
+    withdraw: ['withdraw', 'cancel'],
+  };
+  const tokens = tokenSets[action] || [];
+  let target = buttons.find(button => {
+    const attrs = actionAttrs(button);
+    return tokens.some(token => attrs.includes(token));
+  });
+  if (!target) {
+    target = action === 'accept' ? buttons[buttons.length - 1] : buttons[0];
+  }
+
+  target.click();
+  return {
+    found: true,
+    clicked: true,
+    profile_url: profileUrl,
+    action_count: buttons.length,
+    text: normalize(card.innerText || card.textContent),
+  };
+}
+"""
+
+_EXPAND_INVITATION_NOTES_JS = r"""
+() => {
+  const buttons = Array.from(
+    document.querySelectorAll('[data-testid="expandable-text-button"]')
+  );
+  let clicked = 0;
+  for (const button of buttons) {
+    if (button.getAttribute('data-mcp-clicked') === '1') continue;
+    if (button.getAttribute('aria-expanded') === 'true') continue;
+
+    button.setAttribute('data-mcp-clicked', '1');
+    button.style.pointerEvents = 'auto';
+    button.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    }));
+    clicked += 1;
+  }
+  return clicked;
+}
+"""
+
 
 def _connection_result(
     url: str,
@@ -266,6 +438,55 @@ def _connection_result(
     if profile:
         result["profile"] = profile
     return result
+
+
+def _invitation_action_result(
+    url: str,
+    status: str,
+    message: str,
+    *,
+    kind: Literal["received", "sent"],
+    action: Literal["accept", "reject", "withdraw"],
+    linkedin_username: str,
+    profile_url: str = "",
+    performed: bool = False,
+) -> dict[str, Any]:
+    """Build a structured response for an invitation action attempt."""
+    result: dict[str, Any] = {
+        "url": url,
+        "status": status,
+        "message": message,
+        "kind": kind,
+        "action": action,
+        "linkedin_username": linkedin_username,
+        "performed": performed,
+    }
+    if profile_url:
+        result["profile_url"] = profile_url
+    return result
+
+
+def _normalize_invitation_username(value: str) -> str:
+    """Normalize a username, /in/ path, or LinkedIn URL to the vanity username."""
+    raw = value.strip()
+    if not raw:
+        return ""
+
+    path_or_username = raw
+    if "://" in raw:
+        parsed = urlparse(raw)
+        path_or_username = parsed.path
+    elif raw.startswith("/"):
+        path_or_username = urlparse(raw).path
+
+    match = re.search(r"(?:^|/)in/([^/?#]+)/?", path_or_username)
+    if match:
+        return match.group(1).strip("/")
+    return path_or_username.split("?", 1)[0].split("#", 1)[0].strip("/")
+
+
+def _invitation_manager_url(kind: Literal["received", "sent"]) -> str:
+    return f"https://www.linkedin.com/mynetwork/invitation-manager/{kind}/"
 
 
 def _normalize_csv(value: str, mapping: dict[str, str]) -> str:
@@ -1682,16 +1903,15 @@ class LinkedInExtractor:
             )
 
         if state == "incoming_request":
-            # TODO(locale): replace text-based Accept click with a
-            # structural identifier — needs a live probe against a real
-            # incoming-request profile (we have none to test against).
-            # Tracked as a documented escape-hatch per AGENTS.md.
-            clicked = await self.click_button_by_text("Accept", scope="main")
-            if not clicked:
+            action_result = await self.accept_invitation(
+                username,
+                confirm_accept=True,
+            )
+            if action_result["status"] != "accepted":
                 return _connection_result(
                     url,
                     "send_failed",
-                    "Could not find or click the Accept button.",
+                    f"Could not accept incoming invitation: {action_result['message']}",
                     profile=page_text,
                 )
             verified = await self.scrape_person(username, {"main_profile"})
@@ -3386,6 +3606,310 @@ class LinkedInExtractor:
             recipient_selected=recipient_selected,
             sent=True,
         )
+
+    async def get_pending_invitations(
+        self,
+        limit: int = 20,
+        kind: Literal["received", "sent"] = "received",
+    ) -> dict[str, Any]:
+        """List pending LinkedIn network invitations (received or sent)."""
+        url = _invitation_manager_url(kind)
+        await self._navigate_to_page(url)
+        await detect_rate_limit(self._page)
+        await self._wait_for_main_text(log_context=f"Invitations ({kind})")
+        await handle_modal_close(self._page)
+
+        scrolls = max(1, (limit + 9) // 10)
+        await self._scroll_main_scrollable_region(
+            position="bottom", attempts=scrolls, pause_time=0.5
+        )
+        await self._expand_invitation_note_toggles()
+
+        raw_result = await self._extract_root_content(["main"])
+        raw = raw_result["text"]
+        cleaned = strip_linkedin_noise(raw) if raw else ""
+        references: list[Reference] = (
+            build_references(raw_result["references"], "invitations")[:limit]
+            if cleaned
+            else []
+        )
+        invitations = await self._extract_invitation_cards(kind=kind, limit=limit)
+
+        result = self._single_section_result(
+            url,
+            "invitations",
+            cleaned,
+            references=references,
+        )
+        if invitations:
+            result["invitations"] = invitations
+        return result
+
+    async def _expand_invitation_note_toggles(self) -> None:
+        """Reveal truncated invitation notes using locale-independent test ids.
+
+        LinkedIn renders invite notes as ordinary text after the inline
+        expandable-text button is triggered. DOM access is unavoidable here:
+        innerText alone only exposes the truncated preview, while the button's
+        `data-testid` is stable across locales and avoids visible text matching.
+        """
+        for _ in range(2):
+            try:
+                clicked = await self._page.evaluate(_EXPAND_INVITATION_NOTES_JS)
+            except Exception:
+                logger.debug("Invitation note expansion failed", exc_info=True)
+                return
+            if not clicked:
+                return
+            await asyncio.sleep(0.5)
+
+    async def _extract_invitation_cards(
+        self,
+        *,
+        kind: Literal["received", "sent"],
+        limit: int,
+    ) -> list[dict[str, str]]:
+        """Extract compact invitation cards keyed by profile link.
+
+        DOM access is needed because the action tools must target a specific
+        invitation card; the stable anchor is the `/in/<username>/` URL, not
+        localized visible text.
+        """
+        try:
+            raw_cards = await self._page.evaluate(
+                _INVITATION_CARDS_JS,
+                {"kind": kind, "limit": limit},
+            )
+        except Exception:
+            logger.debug("Invitation card extraction failed", exc_info=True)
+            return []
+        if not isinstance(raw_cards, list):
+            return []
+
+        cards: list[dict[str, str]] = []
+        for raw in raw_cards[:limit]:
+            if not isinstance(raw, dict):
+                continue
+            username = str(raw.get("linkedin_username") or "").strip()
+            if not username:
+                continue
+            cards.append(
+                {
+                    "kind": kind,
+                    "linkedin_username": username,
+                    "profile_url": str(raw.get("profile_url") or f"/in/{username}/"),
+                    "text": str(raw.get("text") or "").strip(),
+                }
+            )
+        return cards
+
+    async def accept_invitation(
+        self,
+        linkedin_username: str,
+        *,
+        confirm_accept: bool,
+    ) -> dict[str, Any]:
+        """Accept a received invitation from the invitation manager."""
+        username = _normalize_invitation_username(linkedin_username)
+        if not confirm_accept:
+            return _invitation_action_result(
+                _invitation_manager_url("received"),
+                "confirmation_required",
+                "Set confirm_accept=true to accept the invitation.",
+                kind="received",
+                action="accept",
+                linkedin_username=username,
+                profile_url=f"/in/{username}/" if username else "",
+            )
+        return await self._perform_invitation_action(
+            username,
+            kind="received",
+            action="accept",
+            success_status="accepted",
+            success_message="Invitation accepted.",
+        )
+
+    async def reject_invitation(
+        self,
+        linkedin_username: str,
+        *,
+        confirm_reject: bool,
+    ) -> dict[str, Any]:
+        """Reject a received invitation from the invitation manager."""
+        username = _normalize_invitation_username(linkedin_username)
+        if not confirm_reject:
+            return _invitation_action_result(
+                _invitation_manager_url("received"),
+                "confirmation_required",
+                "Set confirm_reject=true to reject the invitation.",
+                kind="received",
+                action="reject",
+                linkedin_username=username,
+                profile_url=f"/in/{username}/" if username else "",
+            )
+        return await self._perform_invitation_action(
+            username,
+            kind="received",
+            action="reject",
+            success_status="rejected",
+            success_message="Invitation rejected.",
+        )
+
+    async def withdraw_invitation(
+        self,
+        linkedin_username: str,
+        *,
+        confirm_withdraw: bool,
+    ) -> dict[str, Any]:
+        """Withdraw a sent invitation from the invitation manager."""
+        username = _normalize_invitation_username(linkedin_username)
+        if not confirm_withdraw:
+            return _invitation_action_result(
+                _invitation_manager_url("sent"),
+                "confirmation_required",
+                "Set confirm_withdraw=true to withdraw the invitation.",
+                kind="sent",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=f"/in/{username}/" if username else "",
+            )
+        return await self._perform_invitation_action(
+            username,
+            kind="sent",
+            action="withdraw",
+            success_status="withdrawn",
+            success_message="Invitation withdrawn.",
+        )
+
+    async def _perform_invitation_action(
+        self,
+        username: str,
+        *,
+        kind: Literal["received", "sent"],
+        action: Literal["accept", "reject", "withdraw"],
+        success_status: str,
+        success_message: str,
+    ) -> dict[str, Any]:
+        """Click an invitation-manager card action and verify the card disappears."""
+        url = _invitation_manager_url(kind)
+        profile_url = f"/in/{username}/" if username else ""
+        if not username:
+            return _invitation_action_result(
+                url,
+                "not_found",
+                "LinkedIn username is required.",
+                kind=kind,
+                action=action,
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+
+        await self._navigate_to_page(url)
+        await detect_rate_limit(self._page)
+        await self._wait_for_main_text(log_context=f"Invitations ({kind})")
+        await handle_modal_close(self._page)
+        await self._scroll_main_scrollable_region(
+            position="bottom", attempts=3, pause_time=0.5
+        )
+        await self._expand_invitation_note_toggles()
+
+        clicked = await self._click_invitation_action(username=username, action=action)
+        profile_url = str(clicked.get("profile_url") or profile_url)
+        if not clicked.get("found"):
+            return _invitation_action_result(
+                url,
+                "not_found",
+                f"No {kind} invitation was found for {username}.",
+                kind=kind,
+                action=action,
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+        if not clicked.get("clicked"):
+            return _invitation_action_result(
+                url,
+                "action_unavailable",
+                f"LinkedIn did not expose a usable {action} action for {username}.",
+                kind=kind,
+                action=action,
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+
+        if action == "withdraw" and await self._dialog_is_open(timeout=1000):
+            confirmed = await self._click_dialog_primary_button()
+            if not confirmed:
+                await self._dismiss_dialog()
+                return _invitation_action_result(
+                    url,
+                    "action_unavailable",
+                    "LinkedIn opened a withdraw confirmation dialog, but the primary action was unavailable.",
+                    kind=kind,
+                    action=action,
+                    linkedin_username=username,
+                    profile_url=profile_url,
+                )
+            try:
+                await self._page.wait_for_selector(
+                    _DIALOG_SELECTOR, state="hidden", timeout=5000
+                )
+            except PlaywrightTimeoutError:
+                logger.debug("Invitation action dialog did not close after submit")
+
+        await asyncio.sleep(0.75)
+        if await self._invitation_card_present(username):
+            return _invitation_action_result(
+                url,
+                "verification_failed",
+                f"Clicked {action}, but the invitation card was still visible.",
+                kind=kind,
+                action=action,
+                linkedin_username=username,
+                profile_url=profile_url,
+                performed=True,
+            )
+
+        return _invitation_action_result(
+            url,
+            success_status,
+            success_message,
+            kind=kind,
+            action=action,
+            linkedin_username=username,
+            profile_url=profile_url,
+            performed=True,
+        )
+
+    async def _click_invitation_action(
+        self,
+        *,
+        username: str,
+        action: Literal["accept", "reject", "withdraw"],
+    ) -> dict[str, Any]:
+        """Click a card action using URL identity plus data attrs or button position."""
+        try:
+            result = await self._page.evaluate(
+                _INVITATION_CLICK_ACTION_JS,
+                {"username": username, "action": action},
+            )
+        except Exception:
+            logger.debug("Invitation action click failed", exc_info=True)
+            return {"found": False, "clicked": False}
+        return (
+            result if isinstance(result, dict) else {"found": False, "clicked": False}
+        )
+
+    async def _invitation_card_present(self, username: str) -> bool:
+        try:
+            return bool(
+                await self._page.evaluate(
+                    _INVITATION_CARD_PRESENT_JS,
+                    {"username": username},
+                )
+            )
+        except Exception:
+            logger.debug("Invitation card verification failed", exc_info=True)
+            return True
 
     async def _extract_root_content(
         self,

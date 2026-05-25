@@ -27,6 +27,10 @@ Through this LinkedIn MCP server, AI assistants like Claude can connect to your 
 | `get_conversation` | Read a messaging conversation as a structured list of messages plus participants, by username or thread ID | [#434](https://github.com/stickerdaniel/linkedin-mcp-server/issues/434) |
 | `search_conversations` | Search messages by keyword | working |
 | `send_message` | Send a message to a LinkedIn user (requires confirmation) | [#433](https://github.com/stickerdaniel/linkedin-mcp-server/issues/433) [#441](https://github.com/stickerdaniel/linkedin-mcp-server/issues/441) |
+| `get_pending_invitations` | List pending network invitations from `/mynetwork/invitation-manager/` (`received` or `sent`) | working |
+| `accept_invitation` | Accept a received network invitation (requires confirmation) | working |
+| `reject_invitation` | Reject a received network invitation (requires confirmation) | working |
+| `withdraw_invitation` | Withdraw a sent network invitation (requires confirmation) | working |
 | `get_company_profile` | Extract company information with explicit section selection (posts, jobs); about-section references may include a `company_urn` entry carrying the numeric id used by LinkedIn's people-search `currentCompany` URL facet | working |
 | `get_company_posts` | Get recent posts from a company's LinkedIn feed | working |
 | `search_companies` | Search for companies on LinkedIn by keywords | working |
@@ -36,6 +40,11 @@ Through this LinkedIn MCP server, AI assistants like Claude can connect to your 
 | `get_job_details` | Get detailed information about a specific job posting | working |
 | `get_feed` | Get recent posts from the authenticated user's home feed | working |
 | `close_session` | Close browser session and clean up resources | working |
+
+`get_pending_invitations` returns the standard `{url, sections}` payload with
+optional `references["invitations"]`. It may also include an `invitations` array
+with `kind`, `linkedin_username`, `profile_url`, and card `text` for follow-up
+triage actions without parsing raw page text.
 
 <br/>
 <br/>

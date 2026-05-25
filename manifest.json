@@ -106,6 +106,22 @@
       "description": "Send a message to a LinkedIn user with explicit confirmation and optional profile URN support"
     },
     {
+      "name": "get_pending_invitations",
+      "description": "List pending LinkedIn network invitations (received or sent) from /mynetwork/invitation-manager/"
+    },
+    {
+      "name": "accept_invitation",
+      "description": "Accept a received LinkedIn network invitation with explicit confirmation"
+    },
+    {
+      "name": "reject_invitation",
+      "description": "Reject a received LinkedIn network invitation with explicit confirmation"
+    },
+    {
+      "name": "withdraw_invitation",
+      "description": "Withdraw a sent LinkedIn network invitation with explicit confirmation"
+    },
+    {
       "name": "get_feed",
       "description": "Get recent posts from the authenticated user's LinkedIn home feed"
     },
