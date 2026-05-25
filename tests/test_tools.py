@@ -1149,10 +1149,17 @@ class TestNetworkTools:
             "sections": {"invitations": "Alice Smith\\nBob Jones"},
             "invitations": [
                 {
-                    "kind": "received",
-                    "linkedin_username": "alice",
-                    "profile_url": "/in/alice/",
-                    "text": "Alice Smith",
+                    "type": "connection_request",
+                    "invitation_age": "1h",
+                    "sender": {
+                        "name": "Alice Smith",
+                        "url": "/in/alice/",
+                        "headline": "Founder at Example",
+                        "mutual_connections": 2,
+                    },
+                    "note": None,
+                    "target": {"page": None, "newsletter": None},
+                    "message_url": "/messaging/compose/?recipient=alice",
                 }
             ],
         }
@@ -1167,7 +1174,8 @@ class TestNetworkTools:
         result = await tool_fn(mock_context, extractor=mock_extractor)
 
         assert result["sections"]["invitations"] == "Alice Smith\\nBob Jones"
-        assert result["invitations"][0]["linkedin_username"] == "alice"
+        assert result["invitations"][0]["type"] == "connection_request"
+        assert result["invitations"][0]["sender"]["url"] == "/in/alice/"
         mock_extractor.get_pending_invitations.assert_awaited_once_with(
             limit=20,
             kind="received",

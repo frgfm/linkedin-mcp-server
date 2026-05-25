@@ -43,8 +43,9 @@ Through this LinkedIn MCP server, AI assistants like Claude can connect to your 
 
 `get_pending_invitations` returns the standard `{url, sections}` payload with
 optional `references["invitations"]`. It may also include an `invitations` array
-with `kind`, `linkedin_username`, `profile_url`, and card `text` for follow-up
-triage actions without parsing raw page text.
+whose entries expose `type` (`connection_request`, `page_follow`, or
+`newsletter_subscription`), `invitation_age`, `sender`, optional `note`,
+`target`, and `message_url` for follow-up triage without parsing raw page text.
 
 <br/>
 <br/>

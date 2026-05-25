@@ -107,7 +107,7 @@
     },
     {
       "name": "get_pending_invitations",
-      "description": "List pending LinkedIn network invitations (received or sent) from /mynetwork/invitation-manager/"
+      "description": "List pending LinkedIn network invitations as structured connection, page, or newsletter requests"
     },
     {
       "name": "accept_invitation",

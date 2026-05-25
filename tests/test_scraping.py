@@ -3667,10 +3667,17 @@ class TestInvitationManagement:
         extractor = LinkedInExtractor(mock_page)
         invitations = [
             {
-                "kind": "received",
-                "linkedin_username": "alice",
-                "profile_url": "/in/alice/",
-                "text": "Alice Smith sent an invitation",
+                "type": "connection_request",
+                "invitation_age": "17h",
+                "sender": {
+                    "name": "Alice Smith",
+                    "url": "/in/alice/",
+                    "headline": "Founder at Example",
+                    "mutual_connections": 3,
+                },
+                "note": "Please connect",
+                "target": {"page": None, "newsletter": None},
+                "message_url": "/messaging/compose/?recipient=alice",
             }
         ]
         with (
@@ -3771,17 +3778,54 @@ class TestInvitationManagement:
         )
         assert result["sections"] == {}
 
-    async def test_extract_invitation_cards_filters_evaluate_payload(self, mock_page):
+    async def test_extract_invitation_cards_returns_structured_payload(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
         mock_page.evaluate = AsyncMock(
             return_value=[
                 {
-                    "kind": "sent",
-                    "linkedin_username": "alice",
-                    "profile_url": "/in/alice/",
-                    "text": "Non-English visible labels do not matter",
+                    "type": "connection_request",
+                    "invitation_age": " 2w ",
+                    "sender": {
+                        "name": "Alice Smith",
+                        "url": "/in/alice/",
+                        "headline": "Founder at Example",
+                        "mutual_connections": "7",
+                    },
+                    "note": "Please connect",
+                    "target": {"page": {"name": "Ignored", "url": "/company/x/"}},
+                    "message_url": "/messaging/compose/?recipient=alice",
                 },
-                {"linkedin_username": ""},
+                {
+                    "type": "page_follow",
+                    "invitation_age": "5d",
+                    "sender": {
+                        "name": "Bob Jones",
+                        "url": "/in/bob/",
+                        "headline": "Ignored headline",
+                        "mutual_connections": 0,
+                    },
+                    "note": "Ignored note",
+                    "target": {
+                        "page": {"name": "Example Co", "url": "/company/example/"}
+                    },
+                    "message_url": "/messaging/compose/?ignored=true",
+                },
+                {
+                    "type": "newsletter_subscription",
+                    "invitation_age": "1m",
+                    "sender": {
+                        "name": "Carol Lee",
+                        "url": "/in/carol/",
+                        "mutual_connections": 2,
+                    },
+                    "target": {
+                        "newsletter": {
+                            "title": "The Example Brief",
+                            "url": "/newsletters/the-example-brief-123/",
+                        }
+                    },
+                },
+                {"type": "connection_request", "sender": {}},
                 "bad row",
             ]
         )
@@ -3790,11 +3834,53 @@ class TestInvitationManagement:
 
         assert cards == [
             {
-                "kind": "sent",
-                "linkedin_username": "alice",
-                "profile_url": "/in/alice/",
-                "text": "Non-English visible labels do not matter",
-            }
+                "type": "connection_request",
+                "invitation_age": "2w",
+                "sender": {
+                    "name": "Alice Smith",
+                    "url": "/in/alice/",
+                    "headline": "Founder at Example",
+                    "mutual_connections": 7,
+                },
+                "note": "Please connect",
+                "target": {"page": None, "newsletter": None},
+                "message_url": "/messaging/compose/?recipient=alice",
+            },
+            {
+                "type": "page_follow",
+                "invitation_age": "5d",
+                "sender": {
+                    "name": "Bob Jones",
+                    "url": "/in/bob/",
+                    "headline": None,
+                    "mutual_connections": 0,
+                },
+                "note": None,
+                "target": {
+                    "page": {"name": "Example Co", "url": "/company/example/"},
+                    "newsletter": None,
+                },
+                "message_url": None,
+            },
+            {
+                "type": "newsletter_subscription",
+                "invitation_age": "1m",
+                "sender": {
+                    "name": "Carol Lee",
+                    "url": "/in/carol/",
+                    "headline": None,
+                    "mutual_connections": 2,
+                },
+                "note": None,
+                "target": {
+                    "page": None,
+                    "newsletter": {
+                        "title": "The Example Brief",
+                        "url": "/newsletters/the-example-brief-123/",
+                    },
+                },
+                "message_url": None,
+            },
         ]
 
     async def test_expand_invitation_note_toggles_runs_second_pass(self, mock_page):

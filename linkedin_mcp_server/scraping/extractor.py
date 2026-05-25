@@ -253,36 +253,130 @@ _INVITATION_CARDS_JS = r"""
   if (!root) return [];
 
   const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
-  const usernameFromHref = href => {
+  const linesFrom = el => {
+    const text = el ? (el.innerText || el.textContent || '') : '';
+    return text
+      .split('\n')
+      .map(normalize)
+      .filter(Boolean);
+  };
+  const linkedInPath = href => {
     try {
       const url = new URL(href, location.origin);
-      const match = url.pathname.match(/^\/in\/([^/?#]+)\/?/);
-      return match ? decodeURIComponent(match[1]) : '';
+      return `${url.pathname}${url.search}${url.hash}`;
     } catch {
       return '';
     }
   };
+  const ageFromLines = lines => {
+    const exact = lines
+      .map(line => line.match(/^(\d+)\s*(h|d|w|m|mo)$/i))
+      .find(Boolean);
+    const found = exact || normalize(lines.join(' ')).match(/\b(\d+)\s*(h|d|w|m|mo)\b/i);
+    if (!found) return null;
+    const unit = found[2].toLowerCase() === 'mo' ? 'm' : found[2].toLowerCase();
+    return `${found[1]}${unit}`;
+  };
+  const mutualCountFromText = text => {
+    const match = normalize(text).match(/(\d[\d,.\s]*)\s+mutual/i);
+    if (!match) return 0;
+    const count = Number.parseInt(match[1].replace(/[^\d]/g, ''), 10);
+    return Number.isFinite(count) ? count : 0;
+  };
+  const bestAnchorText = anchor => {
+    const firstLine = linesFrom(anchor)[0];
+    if (firstLine) return firstLine;
+    const imgAlt = anchor.querySelector('img[alt]')?.getAttribute('alt');
+    return normalize(imgAlt) || null;
+  };
+  const noteText = (card, buttonTexts) => {
+    const noteRoot = card.querySelector(
+      '[data-testid="expandable-text"], [data-testid="expandable-text-box"]'
+    );
+    if (!noteRoot) return null;
+    const note = linesFrom(noteRoot)
+      .filter(line => !buttonTexts.has(line))
+      .join('\n');
+    return note || null;
+  };
+  const headlineFromLines = (lines, senderName, note, buttonTexts) => {
+    for (const line of lines) {
+      if (line === senderName) continue;
+      if (line === note) continue;
+      if (buttonTexts.has(line)) continue;
+      if (/^(\d+)\s*(h|d|w|m|mo)$/i.test(line)) continue;
+      if (/\bmutual\b/i.test(line)) continue;
+      return line;
+    }
+    return null;
+  };
+  const cardForAnchor = anchor => {
+    const candidates = [
+      anchor.closest('li'),
+      anchor.closest('article'),
+      anchor.closest('[data-view-name]'),
+      anchor.closest('section'),
+      anchor.parentElement,
+    ];
+    return candidates.find(candidate => candidate && root.contains(candidate)) || null;
+  };
 
   const result = [];
-  const seen = new Set();
-  for (const anchor of root.querySelectorAll('a[href*="/in/"]')) {
-    const username = usernameFromHref(anchor.getAttribute('href') || anchor.href);
-    if (!username || seen.has(username)) continue;
+  const seen = new WeakSet();
+  const anchors = root.querySelectorAll(
+    'a[href*="/in/"], a[href*="/company/"], a[href*="/showcase/"], a[href*="/newsletters/"]'
+  );
+  for (const anchor of anchors) {
+    const card = cardForAnchor(anchor);
+    if (!card || seen.has(card)) continue;
+    seen.add(card);
 
-    const card =
-      anchor.closest('li') ||
-      anchor.closest('article') ||
-      anchor.closest('[data-view-name]') ||
-      anchor.closest('section') ||
-      anchor.parentElement;
-    if (!card || !root.contains(card)) continue;
+    const cardLines = linesFrom(card);
+    const buttonTexts = new Set(
+      Array.from(card.querySelectorAll('button, [role="button"]')).flatMap(linesFrom)
+    );
+    const links = Array.from(card.querySelectorAll('a[href]')).map(link => ({
+      anchor: link,
+      path: linkedInPath(link.getAttribute('href') || link.href),
+      text: bestAnchorText(link),
+    }));
+    const profileLink = links.find(link => /^\/in\/[^/?#]+\/?/.test(link.path));
+    const pageLink = links.find(link => /^\/(?:company|showcase)\/[^/?#]+\/?/.test(link.path));
+    const newsletterLink = links.find(link => /^\/newsletters\/[^/?#]+\/?/.test(link.path));
+    const messageLink = links.find(link => link.path.includes('/messaging/'));
 
-    seen.add(username);
+    const type = newsletterLink
+      ? 'newsletter_subscription'
+      : pageLink
+        ? 'page_follow'
+        : 'connection_request';
+    if (type === 'connection_request' && !profileLink) continue;
+    if (type === 'page_follow' && !pageLink) continue;
+    if (type === 'newsletter_subscription' && !newsletterLink) continue;
+
+    const note = type === 'connection_request' ? noteText(card, buttonTexts) : null;
+    const senderName = profileLink?.text || null;
     result.push({
-      kind,
-      linkedin_username: username,
-      profile_url: `/in/${username}/`,
-      text: normalize(card.innerText || card.textContent),
+      type,
+      invitation_age: ageFromLines(cardLines),
+      sender: {
+        name: senderName,
+        url: profileLink?.path || null,
+        headline: type === 'connection_request'
+          ? headlineFromLines(cardLines, senderName, note, buttonTexts)
+          : null,
+        mutual_connections: mutualCountFromText(card.innerText || card.textContent),
+      },
+      note,
+      target: {
+        page: type === 'page_follow'
+          ? { name: pageLink.text, url: pageLink.path }
+          : null,
+        newsletter: type === 'newsletter_subscription'
+          ? { title: newsletterLink.text, url: newsletterLink.path }
+          : null,
+      },
+      message_url: type === 'connection_request' ? (messageLink?.path || null) : null,
     });
     if (limit && result.length >= limit) break;
   }
@@ -487,6 +581,98 @@ def _normalize_invitation_username(value: str) -> str:
 
 def _invitation_manager_url(kind: Literal["received", "sent"]) -> str:
     return f"https://www.linkedin.com/mynetwork/invitation-manager/{kind}/"
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _coerce_non_negative_int(value: Any) -> int:
+    if isinstance(value, bool) or value is None:
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _invitation_entity(
+    value: Any, *, label_key: Literal["name", "title"]
+) -> dict[str, str | None] | None:
+    if not isinstance(value, dict):
+        return None
+    label = _optional_text(
+        value.get(label_key) or value.get("name") or value.get("title")
+    )
+    url = _optional_text(value.get("url"))
+    if not label and not url:
+        return None
+    return {label_key: label, "url": url}
+
+
+def _normalize_structured_invitation(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+
+    invitation_type = _optional_text(raw.get("type"))
+    if invitation_type not in {
+        "connection_request",
+        "page_follow",
+        "newsletter_subscription",
+    }:
+        return None
+
+    raw_sender = raw.get("sender") if isinstance(raw.get("sender"), dict) else {}
+    sender = {
+        "name": _optional_text(raw_sender.get("name")),
+        "url": _optional_text(raw_sender.get("url")),
+        "headline": (
+            _optional_text(raw_sender.get("headline"))
+            if invitation_type == "connection_request"
+            else None
+        ),
+        "mutual_connections": _coerce_non_negative_int(
+            raw_sender.get("mutual_connections")
+        ),
+    }
+
+    raw_target = raw.get("target") if isinstance(raw.get("target"), dict) else {}
+    page = _invitation_entity(raw_target.get("page"), label_key="name")
+    newsletter = _invitation_entity(raw_target.get("newsletter"), label_key="title")
+    target = {
+        "page": page if invitation_type == "page_follow" else None,
+        "newsletter": (
+            newsletter if invitation_type == "newsletter_subscription" else None
+        ),
+    }
+
+    has_identity = (
+        (invitation_type == "connection_request" and (sender["name"] or sender["url"]))
+        or (invitation_type == "page_follow" and page is not None)
+        or (invitation_type == "newsletter_subscription" and newsletter is not None)
+    )
+    if not has_identity:
+        return None
+
+    return {
+        "type": invitation_type,
+        "invitation_age": _optional_text(raw.get("invitation_age")),
+        "sender": sender,
+        "note": (
+            _optional_text(raw.get("note"))
+            if invitation_type == "connection_request"
+            else None
+        ),
+        "target": target,
+        "message_url": (
+            _optional_text(raw.get("message_url"))
+            if invitation_type == "connection_request"
+            else None
+        ),
+    }
 
 
 def _normalize_csv(value: str, mapping: dict[str, str]) -> str:
@@ -3668,12 +3854,12 @@ class LinkedInExtractor:
         *,
         kind: Literal["received", "sent"],
         limit: int,
-    ) -> list[dict[str, str]]:
-        """Extract compact invitation cards keyed by profile link.
+    ) -> list[dict[str, Any]]:
+        """Extract structured invitation cards from the invitation manager.
 
-        DOM access is needed because the action tools must target a specific
-        invitation card; the stable anchor is the `/in/<username>/` URL, not
-        localized visible text.
+        DOM access is needed because invitation type, notes, message links, and
+        page/newsletter targets are sibling elements inside each card. The
+        classifier uses LinkedIn URL shapes instead of localized button text.
         """
         try:
             raw_cards = await self._page.evaluate(
@@ -3686,21 +3872,11 @@ class LinkedInExtractor:
         if not isinstance(raw_cards, list):
             return []
 
-        cards: list[dict[str, str]] = []
+        cards: list[dict[str, Any]] = []
         for raw in raw_cards[:limit]:
-            if not isinstance(raw, dict):
-                continue
-            username = str(raw.get("linkedin_username") or "").strip()
-            if not username:
-                continue
-            cards.append(
-                {
-                    "kind": kind,
-                    "linkedin_username": username,
-                    "profile_url": str(raw.get("profile_url") or f"/in/{username}/"),
-                    "text": str(raw.get("text") or "").strip(),
-                }
-            )
+            invitation = _normalize_structured_invitation(raw)
+            if invitation:
+                cards.append(invitation)
         return cards
 
     async def accept_invitation(
