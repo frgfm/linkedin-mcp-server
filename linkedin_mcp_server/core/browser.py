@@ -31,6 +31,10 @@ _DEFAULT_USER_DATA_DIR = Path.home() / ".linkedin-mcp" / "profile"
 _PRIVATE_FILE_MODE = 0o600
 _CLEANUP_TIMEOUT_SECONDS = 10
 
+# Native Chromium setting: unlike request routing, this preserves HTTP cache
+# and avoids stalling every request in a Python handler.
+_DISABLE_IMAGES_ARG = "--blink-settings=imagesEnabled=false"
+
 
 async def _await_deferring_cancels(coro: Coroutine[Any, Any, bool]) -> bool:
     """Await *coro* to completion, holding back cancels until it finishes.
@@ -117,6 +121,12 @@ class BrowserManager:
 
             if self.user_agent:
                 context_options["user_agent"] = self.user_agent
+
+            if self.headless:
+                context_options["args"] = [
+                    *context_options.get("args", []),
+                    _DISABLE_IMAGES_ARG,
+                ]
 
             self._context = await self._playwright.chromium.launch_persistent_context(
                 self.user_data_dir,
