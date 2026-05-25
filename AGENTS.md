@@ -33,6 +33,8 @@ Optional additional keys:
 - `job_ids: [id, ...]` (search_jobs only)
 - `references["feed"]` (get_feed only) — every entry is `kind: "feed_post"`; non-post anchors (sidebar profiles, employer logos) are filtered. URLs may carry either `/feed/update/<urn>/` (DOM-anchor-derived) or `/posts/<slug>` (SDUI-derived) form; both are valid LinkedIn permalinks. Cap is 50 entries, matching `get_feed`'s `num_posts` ceiling.
 
+`get_conversation` is the lone exception to the `{section_name: raw_text}` shape: its `sections` payload is `{"messages": [{timestamp, status, sender, content}, ...], "members": [{kind: "person", url, name?}, ...]}`. `timestamp` is best-effort ISO 8601 reconstructed from LinkedIn's split day-heading + clock text (en-US only — LinkedIn does not expose `<time datetime>` for message events); `status` is one of `sent` / `read` / `delivered` / `deleted`, with only `sent` and `deleted` reliably emitted today (deleted detection is en-US text equality on the recalled-body marker); `sender` is `/in/<slug>/` or the literal `"self"` when LinkedIn omits the profile link. Quoted/replied parents are flattened into `content` prefixed with `"> "` per line.
+
 ## Verifying Bug Reports
 
 Always verify scraping bugs end-to-end against live LinkedIn, not just code analysis. Use `uv run`, not `uvx`, so the running process reflects your workspace. Use `uvx` only for packaged distribution verification. For live Docker investigations, refresh the source session first with `uv run -m linkedin_mcp_server --login` before testing each materially different approach. Assume a valid login profile already exists at `~/.linkedin-mcp/profile/`.

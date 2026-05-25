@@ -95,7 +95,7 @@
     },
     {
       "name": "get_conversation",
-      "description": "Read a specific messaging conversation by thread ID or LinkedIn username"
+      "description": "Read a messaging conversation as a structured list of messages plus participants, by thread ID or LinkedIn username"
     },
     {
       "name": "search_conversations",

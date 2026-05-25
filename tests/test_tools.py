@@ -689,7 +689,17 @@ class TestMessagingTools:
     async def test_get_conversation_success(self, mock_context):
         expected = {
             "url": "https://www.linkedin.com/messaging/thread/abc123/",
-            "sections": {"conversation": "Hello!\nHi there!"},
+            "sections": {
+                "messages": [
+                    {
+                        "timestamp": "2026-02-10T15:17:00",
+                        "status": "sent",
+                        "sender": "/in/alice/",
+                        "content": "Hello!",
+                    }
+                ],
+                "members": [{"kind": "person", "url": "/in/alice/", "name": "Alice"}],
+            },
         }
         mock_extractor = _make_mock_extractor(expected)
 
@@ -703,9 +713,13 @@ class TestMessagingTools:
             mock_context, linkedin_username="testuser", extractor=mock_extractor
         )
 
-        assert result["sections"]["conversation"] == "Hello!\nHi there!"
+        assert result["sections"]["messages"][0]["content"] == "Hello!"
+        assert result["sections"]["members"][0]["url"] == "/in/alice/"
         mock_extractor.get_conversation.assert_awaited_once_with(
-            linkedin_username="testuser", thread_id=None, index=0
+            linkedin_username="testuser",
+            thread_id=None,
+            index=0,
+            max_scrolls=3,
         )
 
     async def test_search_conversations_success(self, mock_context):

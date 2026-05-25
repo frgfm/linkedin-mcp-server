@@ -3661,10 +3661,28 @@ class TestGetInbox:
 
 
 class TestGetConversation:
-    async def test_returns_conversation_by_thread_id(self, mock_page):
-        """get_conversation with thread_id navigates directly to thread URL."""
+    async def test_returns_structured_messages_by_thread_id(self, mock_page):
+        """get_conversation returns sections.messages + sections.members."""
         extractor = LinkedInExtractor(mock_page)
         nav_mock = AsyncMock()
+        sample_messages = [
+            {
+                "timestamp": "2026-02-10T15:17:00",
+                "status": "sent",
+                "sender": "/in/alice/",
+                "content": "Hello!",
+            },
+            {
+                "timestamp": "2026-02-10T15:18:00",
+                "status": "deleted",
+                "sender": "/in/alice/",
+                "content": None,
+            },
+        ]
+        sample_members = [
+            {"kind": "person", "url": "/in/alice/", "name": "Alice"},
+            {"kind": "person", "url": "/in/bob/", "name": "Bob"},
+        ]
         with (
             patch.object(extractor, "_navigate_to_page", nav_mock),
             patch(
@@ -3681,17 +3699,9 @@ class TestGetConversation:
             ),
             patch.object(
                 extractor,
-                "_extract_root_content",
+                "_extract_conversation_messages",
                 new_callable=AsyncMock,
-                return_value={"text": "Hello!\nHi there!", "references": []},
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.strip_linkedin_noise",
-                return_value="Hello!\nHi there!",
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.build_references",
-                return_value=[],
+                return_value=(sample_messages, sample_members),
             ),
         ):
             result = await extractor.get_conversation(thread_id="abc123")
@@ -3699,7 +3709,65 @@ class TestGetConversation:
         nav_mock.assert_awaited_once_with(
             "https://www.linkedin.com/messaging/thread/abc123/"
         )
-        assert result["sections"]["conversation"] == "Hello!\nHi there!"
+        assert result["sections"]["messages"] == sample_messages
+        assert result["sections"]["members"] == sample_members
+        # Old single-string "conversation" key must not leak through.
+        assert "conversation" not in result["sections"]
+
+    async def test_max_scrolls_zero_skips_scroll(self, mock_page):
+        """max_scrolls=0 bypasses the back-scroll loop entirely."""
+        extractor = LinkedInExtractor(mock_page)
+        scroll_mock = AsyncMock()
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(extractor, "_scroll_main_scrollable_region", scroll_mock),
+            patch.object(
+                extractor,
+                "_extract_conversation_messages",
+                new_callable=AsyncMock,
+                return_value=([], []),
+            ),
+        ):
+            await extractor.get_conversation(thread_id="abc123", max_scrolls=0)
+
+        scroll_mock.assert_not_called()
+
+    async def test_max_scrolls_threads_attempts(self, mock_page):
+        """max_scrolls=N invokes the scroll helper with attempts=N."""
+        extractor = LinkedInExtractor(mock_page)
+        scroll_mock = AsyncMock()
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(extractor, "_scroll_main_scrollable_region", scroll_mock),
+            patch.object(
+                extractor,
+                "_extract_conversation_messages",
+                new_callable=AsyncMock,
+                return_value=([], []),
+            ),
+        ):
+            await extractor.get_conversation(thread_id="abc123", max_scrolls=7)
+
+        scroll_mock.assert_awaited_once()
+        assert scroll_mock.await_args.kwargs["attempts"] == 7
 
     async def test_raises_when_no_identifier(self, mock_page):
         """get_conversation raises LinkedInScraperException with no args."""
@@ -3743,17 +3811,9 @@ class TestGetConversation:
             ),
             patch.object(
                 extractor,
-                "_extract_root_content",
+                "_extract_conversation_messages",
                 new_callable=AsyncMock,
-                return_value={"text": "msg", "references": []},
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.strip_linkedin_noise",
-                return_value="msg",
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.build_references",
-                return_value=[],
+                return_value=([], []),
             ),
         ):
             await extractor.get_conversation(linkedin_username="jacki-old")
@@ -3801,17 +3861,9 @@ class TestGetConversation:
             ),
             patch.object(
                 extractor,
-                "_extract_root_content",
+                "_extract_conversation_messages",
                 new_callable=AsyncMock,
-                return_value={"text": "msg", "references": []},
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.strip_linkedin_noise",
-                return_value="msg",
-            ),
-            patch(
-                "linkedin_mcp_server.scraping.extractor.build_references",
-                return_value=[],
+                return_value=([], []),
             ),
         ):
             await extractor.get_conversation(linkedin_username="jacki-old", index=1)
@@ -3886,6 +3938,302 @@ class TestGetConversation:
                 LinkedInScraperException, match="Could not find a conversation"
             ):
                 await extractor.get_conversation(linkedin_username="jacki-old")
+
+
+class TestConversationParserHelpers:
+    """Unit tests for the conversation parser helpers (no browser needed).
+
+    Covers timestamp reconstruction, status classification, profile URL
+    normalization, and quoted-reply flattening — the en-US, locale-aware
+    pieces of the new ``get_conversation`` pipeline.
+    """
+
+    def test_normalize_profile_url_strips_origin_and_query(self):
+        assert (
+            LinkedInExtractor._normalize_profile_url(
+                "https://www.linkedin.com/in/ACoAA123/?miniProfileUrn=foo"
+            )
+            == "/in/ACoAA123/"
+        )
+
+    def test_normalize_profile_url_handles_relative(self):
+        assert (
+            LinkedInExtractor._normalize_profile_url("/in/alice/?bar=baz")
+            == "/in/alice/"
+        )
+
+    def test_normalize_profile_url_returns_none_for_non_profile(self):
+        assert LinkedInExtractor._normalize_profile_url("/jobs/view/42") is None
+        assert LinkedInExtractor._normalize_profile_url(None) is None
+
+    def test_parse_day_heading_month_day(self):
+        assert LinkedInExtractor._parse_day_heading("Feb 10") == (2, 10, None)
+
+    def test_parse_day_heading_with_explicit_year(self):
+        assert LinkedInExtractor._parse_day_heading("Feb 10, 2024") == (2, 10, 2024)
+
+    def test_parse_day_heading_uppercase_via_css_transform(self):
+        """innerText returns 'FEB 10' when LinkedIn applies CSS uppercase."""
+        assert LinkedInExtractor._parse_day_heading("FEB 10") == (2, 10, None)
+
+    def test_parse_day_heading_unknown_format_returns_none(self):
+        assert LinkedInExtractor._parse_day_heading("Yesterday") is None
+
+    def test_build_iso_timestamp_pm(self):
+        out = LinkedInExtractor._build_iso_timestamp("Feb 10", "3:17 PM", 2026)
+        assert out == "2026-02-10T15:17:00"
+
+    def test_build_iso_timestamp_am(self):
+        out = LinkedInExtractor._build_iso_timestamp("Feb 10", "9:05 AM", 2026)
+        assert out == "2026-02-10T09:05:00"
+
+    def test_build_iso_timestamp_midnight(self):
+        out = LinkedInExtractor._build_iso_timestamp("Feb 10", "12:30 AM", 2026)
+        assert out == "2026-02-10T00:30:00"
+
+    def test_build_iso_timestamp_noon(self):
+        out = LinkedInExtractor._build_iso_timestamp("Feb 10", "12:30 PM", 2026)
+        assert out == "2026-02-10T12:30:00"
+
+    def test_build_iso_timestamp_falls_back_when_unparseable(self):
+        """When format is unrecognized, return the raw concatenation."""
+        out = LinkedInExtractor._build_iso_timestamp("Yesterday", "3:17 PM", 2026)
+        assert "3:17 PM" in out
+
+    def test_classify_status_deleted_en_us(self):
+        status, content = LinkedInExtractor._classify_status(
+            "This message has been deleted."
+        )
+        assert status == "deleted"
+        assert content is None
+
+    def test_classify_status_normal_message(self):
+        status, content = LinkedInExtractor._classify_status("Hello, world!")
+        assert status == "sent"
+        assert content == "Hello, world!"
+
+    def test_classify_status_other_locale_falls_through_to_sent(self):
+        """Non-en-US deleted markers fall through to 'sent' (documented)."""
+        status, content = LinkedInExtractor._classify_status(
+            "Ce message a été supprimé."
+        )
+        assert status == "sent"
+        assert content == "Ce message a été supprimé."
+
+    def test_compose_content_no_quote(self):
+        assert LinkedInExtractor._compose_content("hi", None) == "hi"
+
+    def test_compose_content_with_quote_prefixes_lines(self):
+        out = LinkedInExtractor._compose_content("Sure!", "Alice: yo\nAre you in?")
+        assert out == "> Alice: yo\n> Are you in?\nSure!"
+
+    def test_compose_content_deleted_passthrough_none(self):
+        assert LinkedInExtractor._compose_content(None, "anything") is None
+
+
+class TestNormalizeConversationEvents:
+    """Integration of the JS-side dump shape into Message/Member lists."""
+
+    def _make_extractor(self):
+        return LinkedInExtractor(MagicMock())
+
+    def test_normal_message_flow(self):
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Feb 10, 2024",
+                    "time_text": "3:17 PM",
+                    "sender_url": "https://www.linkedin.com/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "Hello there!",
+                    "quoted_text": None,
+                },
+                {
+                    "day_heading": None,
+                    "time_text": "3:18 PM",
+                    "sender_url": "/in/bob/",
+                    "sender_name": "Bob",
+                    "body_text": "Hi Alice!",
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [],
+        }
+        extractor = self._make_extractor()
+        messages, members = extractor._normalize_conversation_events(raw)
+        assert messages == [
+            {
+                "timestamp": "2024-02-10T15:17:00",
+                "status": "sent",
+                "sender": "/in/alice/",
+                "content": "Hello there!",
+            },
+            {
+                "timestamp": "2024-02-10T15:18:00",
+                "status": "sent",
+                "sender": "/in/bob/",
+                "content": "Hi Alice!",
+            },
+        ]
+        # Members derived from observed senders.
+        urls = {m["url"] for m in members}
+        assert urls == {"/in/alice/", "/in/bob/"}
+
+    def test_deleted_message_emits_none_content(self):
+        raw = {
+            "events": [
+                {
+                    "day_heading": "May 10",
+                    "time_text": "5:50 PM",
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "This message has been deleted.",
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [],
+        }
+        extractor = self._make_extractor()
+        messages, _ = extractor._normalize_conversation_events(raw)
+        assert messages[0]["status"] == "deleted"
+        assert messages[0]["content"] is None
+
+    def test_running_day_persists_across_events(self):
+        """Subsequent events without their own day_heading inherit the prior."""
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Feb 10, 2024",
+                    "time_text": "3:17 PM",
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "first",
+                    "quoted_text": None,
+                },
+                {
+                    "day_heading": None,
+                    "time_text": "3:18 PM",
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "second",
+                    "quoted_text": None,
+                },
+                {
+                    "day_heading": "Feb 11, 2024",
+                    "time_text": "9:00 AM",
+                    "sender_url": "/in/bob/",
+                    "sender_name": "Bob",
+                    "body_text": "next day",
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [],
+        }
+        extractor = self._make_extractor()
+        messages, _ = extractor._normalize_conversation_events(raw)
+        assert messages[0]["timestamp"] == "2024-02-10T15:17:00"
+        assert messages[1]["timestamp"] == "2024-02-10T15:18:00"
+        assert messages[2]["timestamp"] == "2024-02-11T09:00:00"
+
+    def test_self_sender_sentinel(self):
+        """An event without a resolvable sender URL is emitted as 'self'."""
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Feb 10",
+                    "time_text": "3:17 PM",
+                    "sender_url": None,
+                    "sender_name": "You",
+                    "body_text": "hello",
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [],
+        }
+        extractor = self._make_extractor()
+        messages, _ = extractor._normalize_conversation_events(raw)
+        assert messages[0]["sender"] == "self"
+
+    def test_quoted_reply_flattened_into_content(self):
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Feb 10",
+                    "time_text": "3:17 PM",
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "Sure, sending it now.",
+                    "quoted_text": "Bob: did you get the link?",
+                },
+            ],
+            "header_profiles": [],
+        }
+        extractor = self._make_extractor()
+        messages, _ = extractor._normalize_conversation_events(raw)
+        assert (
+            messages[0]["content"]
+            == "> Bob: did you get the link?\nSure, sending it now."
+        )
+
+    def test_skips_event_without_body_unless_deleted(self):
+        """Attachment-only / system events (no body_text, not a tombstone)
+        are dropped per V1 scope. Their sender still surfaces as a member."""
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Feb 10, 2024",
+                    "time_text": "3:17 PM",
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "real message",
+                    "quoted_text": None,
+                },
+                {
+                    # Image-only or similar: no text body, not deleted.
+                    "day_heading": None,
+                    "time_text": "3:18 PM",
+                    "sender_url": "/in/bob/",
+                    "sender_name": "Bob",
+                    "body_text": None,
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [],
+        }
+        extractor = self._make_extractor()
+        messages, members = extractor._normalize_conversation_events(raw)
+        # Only the real message survives.
+        assert len(messages) == 1
+        assert messages[0]["sender"] == "/in/alice/"
+        # Both Alice and Bob still appear as participants — we recorded
+        # Bob's name from the dropped event before skipping it.
+        urls = {m["url"]: m.get("name") for m in members}
+        assert urls == {"/in/alice/": "Alice", "/in/bob/": "Bob"}
+
+    def test_header_profile_adds_silent_participant(self):
+        """A participant who hasn't sent a visible message still appears via header."""
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Feb 10",
+                    "time_text": "3:17 PM",
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "hi",
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [
+                {
+                    "url": "https://www.linkedin.com/in/bob/",
+                    "name": "Bob",
+                },
+            ],
+        }
+        extractor = self._make_extractor()
+        _, members = extractor._normalize_conversation_events(raw)
+        urls = {m["url"]: m.get("name") for m in members}
+        assert urls == {"/in/alice/": "Alice", "/in/bob/": "Bob"}
 
 
 class TestStripSelectConversationPrefix:

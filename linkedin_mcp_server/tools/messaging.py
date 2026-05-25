@@ -84,10 +84,11 @@ def register_messaging_tools(
         linkedin_username: str | None = None,
         thread_id: str | None = None,
         index: Annotated[int, Field(ge=0)] = 0,
+        max_scrolls: Annotated[int, Field(ge=0, le=20)] = 3,
         extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
-        Read a specific messaging conversation.
+        Read a specific messaging conversation as a structured list of messages.
 
         Provide either linkedin_username or thread_id to identify the conversation.
 
@@ -106,9 +107,18 @@ def register_messaging_tools(
                 participant has multiple threads (e.g. an organic 1-on-1 plus
                 an InMail). Ignored when thread_id is provided. To enumerate
                 thread IDs first, call search_conversations.
+            max_scrolls: How many times to scroll the message list back to
+                load older history (0-20, default 3). LinkedIn virtualizes
+                the list, so message count grows with scroll count; raise
+                this value to retrieve older history at the cost of latency.
 
         Returns:
-            Dict with url, sections (conversation -> raw text), and optional references.
+            Dict with url and a sections payload of the form
+            ``{"messages": [...], "members": [...]}``. Each message is
+            ``{timestamp, status, sender, content}``; status is one of
+            ``sent`` / ``read`` / ``delivered`` / ``deleted`` (only
+            ``sent`` and ``deleted`` are reliably emitted today). Timestamp
+            and deleted-status parsing are en-US best-effort.
         """
         if not linkedin_username and not thread_id:
             raise_tool_error(
@@ -123,10 +133,11 @@ def register_messaging_tools(
                 ctx, tool_name="get_conversation"
             )
             logger.info(
-                "Fetching conversation: username=%s, thread_id=%s, index=%d",
+                "Fetching conversation: username=%s, thread_id=%s, index=%d, max_scrolls=%d",
                 linkedin_username,
                 thread_id,
                 index,
+                max_scrolls,
             )
 
             await ctx.report_progress(
@@ -137,6 +148,7 @@ def register_messaging_tools(
                 linkedin_username=linkedin_username,
                 thread_id=thread_id,
                 index=index,
+                max_scrolls=max_scrolls,
             )
 
             await ctx.report_progress(progress=100, total=100, message="Complete")

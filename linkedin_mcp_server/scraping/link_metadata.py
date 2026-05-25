@@ -43,6 +43,39 @@ class RawReference(TypedDict, total=False):
     in_footer: bool
 
 
+MessageStatus = Literal["sent", "read", "delivered", "deleted"]
+
+
+class Message(TypedDict):
+    """One message event in a conversation thread.
+
+    ``sender`` is the participant URL path (``/in/<slug>/``) when LinkedIn
+    renders a profile anchor for the author, or the sentinel ``"self"`` when
+    the authenticated user appears without a profile link (typical for
+    their own messages in certain UI states).
+
+    ``content`` is ``None`` for deleted messages. Quoted/replied parents are
+    flattened into the same string, prefixed with ``"> "`` per line.
+
+    ``timestamp`` is best-effort ISO 8601 reconstructed from the in-thread
+    day heading + per-message clock time. LinkedIn does not expose
+    ``<time datetime>`` for message events as of 2026-05.
+    """
+
+    timestamp: Required[str]
+    status: Required[MessageStatus]
+    sender: Required[str]
+    content: Required[str | None]
+
+
+class Member(TypedDict):
+    """One participant in a conversation thread."""
+
+    kind: Required[Literal["person"]]
+    url: Required[str]
+    name: NotRequired[str]
+
+
 _GENERIC_LABELS = {
     "show all",
     "follow",

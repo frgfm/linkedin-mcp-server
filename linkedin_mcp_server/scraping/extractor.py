@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import logging
 import re
@@ -32,6 +33,9 @@ from linkedin_mcp_server.core.utils import (
 )
 from linkedin_mcp_server.scraping.connection import ActionSignals
 from linkedin_mcp_server.scraping.link_metadata import (
+    Member,
+    Message,
+    MessageStatus,
     Reference,
     build_references,
     dedupe_references,
@@ -3044,11 +3048,328 @@ class LinkedInExtractor:
     def _strip_select_conversation_prefix(cls, aria_label: str) -> str:
         return cls._SELECT_CONVERSATION_PREFIX_RE.sub("", aria_label).strip()
 
+    # ------------------------------------------------------------------
+    # Conversation-thread parser (see issue #442)
+    #
+    # LinkedIn renders message events without ``<time datetime>`` and without
+    # locale-independent status markers. We rely on two structural signals
+    # that survive class-name churn:
+    #   * a ``data-event-urn`` attribute on the inner ``<div>`` carrying
+    #     ``urn:li:msg_message:...`` — identifies real message events and
+    #     filters out chrome ``<li>``s (loader, top-of-list, quick-reply chips).
+    #   * a ``<time>`` element directly inside the ``<li>`` denotes a
+    #     day heading ("Feb 10"); a ``<time>`` deeper inside the event is
+    #     the per-message clock time ("3:17 PM").
+    # Status detection ("deleted") and timestamp parsing depend on en-US
+    # text — BrowserManager forces en-US, and the limitation is documented
+    # in the docstring of ``get_conversation``.
+    # ------------------------------------------------------------------
+
+    # en-US body text emitted for a recalled message. Guarded behind a
+    # documented locale assumption per the project's scraping rules.
+    _DELETED_BODY_TEXTS_EN_US = frozenset({"This message has been deleted."})
+
+    _MONTH_ABBREVS_EN_US = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    _DAY_HEADING_RE = re.compile(r"^\s*([A-Za-z]{3,9})\s+(\d{1,2})(?:,\s*(\d{4}))?\s*$")
+    _CLOCK_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*([AaPp][Mm])?\s*$")
+
+    _CONVERSATION_EXTRACT_SCRIPT = r"""
+        () => {
+            const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+            const inMain = sel => {
+                const main = document.querySelector('main');
+                return main ? Array.from(main.querySelectorAll(sel)) : [];
+            };
+
+            // Real message events carry a data-event-urn attribute on an
+            // inner element. Locale-independent and stable across the chrome
+            // <li>s (loader, top-of-list, quick-reply chips) which have none.
+            const eventLis = inMain('li')
+                .filter(li => li.querySelector('[data-event-urn^="urn:li:msg_message:"]'));
+
+            const events = eventLis.map(li => {
+                // Day heading: <time> element as a direct child of the <li>.
+                const dayTime = Array.from(li.children)
+                    .find(c => c.tagName === 'TIME');
+                const dayHeading = dayTime ? clean(dayTime.textContent) : null;
+
+                // Per-message clock time: any <time> NOT directly under <li>.
+                const innerTime = Array.from(li.querySelectorAll('time'))
+                    .find(t => t.parentElement !== li);
+                const timeText = innerTime ? clean(innerTime.textContent) : null;
+
+                // Sender link: the first /in/ anchor whose text is the display
+                // name (not the a11y "View X's profile" link wrapping the
+                // avatar). Heuristic: pick the /in/ anchor that does NOT
+                // contain an <img>.
+                let senderUrl = null;
+                let senderName = null;
+                const personAnchors = Array.from(li.querySelectorAll('a[href*="/in/"]'));
+                const nameAnchor = personAnchors.find(a => !a.querySelector('img'));
+                const avatarAnchor = personAnchors.find(a => a.querySelector('img'));
+                if (nameAnchor) {
+                    senderUrl = nameAnchor.getAttribute('href');
+                    senderName = clean(nameAnchor.textContent);
+                } else if (avatarAnchor) {
+                    senderUrl = avatarAnchor.getAttribute('href');
+                    const img = avatarAnchor.querySelector('img');
+                    senderName = img ? clean(img.getAttribute('alt') || img.getAttribute('title')) : null;
+                }
+
+                // Body: <p> directly inside the event item; LinkedIn renders
+                // both normal and recalled messages as <p>. innerText is the
+                // displayed text including line breaks.
+                const eventItem = li.querySelector('[data-event-urn^="urn:li:msg_message:"]');
+                const bodyEl = eventItem ? eventItem.querySelector('p') : null;
+                const bodyText = bodyEl ? (bodyEl.innerText || bodyEl.textContent || '').trim() : null;
+
+                // Quoted reply parent (LinkedIn renders inline before the
+                // bubble). Class hint exists but is unstable; pull innerText
+                // from any <span> whose enclosing container holds the bubble.
+                let quotedText = null;
+                if (eventItem) {
+                    const repliedContainer = eventItem.querySelector(
+                        '[class*="replied-message"]'
+                    );
+                    if (repliedContainer) {
+                        quotedText = clean(repliedContainer.innerText || repliedContainer.textContent);
+                    }
+                }
+
+                return {
+                    day_heading: dayHeading,
+                    time_text: timeText,
+                    sender_url: senderUrl,
+                    sender_name: senderName,
+                    body_text: bodyText,
+                    quoted_text: quotedText,
+                };
+            });
+
+            // Header participant: the conversation's title region carries the
+            // other party's name + profile link near the top of <main>. We
+            // probe for a person anchor that is NOT inside the message list
+            // and not inside a generic side panel.
+            const allPersonAnchors = inMain('a[href*="/in/"]');
+            const messageListRoots = inMain('ul')
+                .filter(ul => ul.querySelector('[data-event-urn^="urn:li:msg_message:"]'));
+            const headerCandidates = allPersonAnchors.filter(a => {
+                if (messageListRoots.some(ul => ul.contains(a))) return false;
+                if (a.closest('nav') || a.closest('footer')) return false;
+                return true;
+            });
+            const headerProfiles = headerCandidates.slice(0, 3).map(a => ({
+                url: a.getAttribute('href'),
+                name: clean(a.textContent) || null,
+            }));
+
+            return { events, header_profiles: headerProfiles };
+        }
+    """
+
+    @classmethod
+    def _normalize_profile_url(cls, raw: str | None) -> str | None:
+        """Strip origin and query/fragment, return a ``/in/<slug>/`` path."""
+        if not raw:
+            return None
+        # LinkedIn anchors are sometimes absolute (https://...) and sometimes
+        # carry trailing query/fragment (?miniProfileUrn=...). Normalize.
+        match = re.search(r"/in/([^/?#]+)", raw)
+        if not match:
+            return None
+        return f"/in/{match.group(1)}/"
+
+    @classmethod
+    def _parse_day_heading(cls, text: str) -> tuple[int, int, int | None] | None:
+        """Parse 'Feb 10' or 'Feb 10, 2024' → (month, day, year_or_None).
+
+        en-US only. Returns None if the heading does not match the expected
+        pattern (caller falls back to no date context for that event).
+        """
+        m = cls._DAY_HEADING_RE.match(text)
+        if not m:
+            return None
+        month_str, day_str, year_str = m.groups()
+        month = cls._MONTH_ABBREVS_EN_US.get(month_str[:3].lower())
+        if month is None:
+            return None
+        try:
+            day = int(day_str)
+        except ValueError:
+            return None
+        year = int(year_str) if year_str else None
+        return month, day, year
+
+    @classmethod
+    def _build_iso_timestamp(
+        cls,
+        day_heading: str | None,
+        time_text: str | None,
+        reference_year: int,
+    ) -> str:
+        """Best-effort ISO 8601 from LinkedIn's split day-heading + clock text.
+
+        Falls back to the raw concatenated text when either piece is missing
+        or unparseable. ``reference_year`` is the current year — used to fill
+        in dates LinkedIn renders without a year; if the resulting date would
+        be in the future, the previous year is used (LinkedIn shows recent
+        dates without a year, so "future" implies last-year).
+        """
+        parsed_day = cls._parse_day_heading(day_heading) if day_heading else None
+        clock = cls._CLOCK_RE.match(time_text or "")
+        if not parsed_day or not clock:
+            joined = " ".join(filter(None, [day_heading, time_text]))
+            return joined or ""
+
+        month, day, year = parsed_day
+        hour = int(clock.group(1))
+        minute = int(clock.group(2))
+        meridiem = (clock.group(3) or "").lower()
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+
+        if year is None:
+            year = reference_year
+            try:
+                candidate = datetime(year, month, day, hour, minute)
+                if candidate > datetime.now():
+                    year -= 1
+            except ValueError:
+                return f"{day_heading} {time_text}"
+
+        try:
+            return datetime(year, month, day, hour, minute).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            )
+        except ValueError:
+            return f"{day_heading} {time_text}"
+
+    @classmethod
+    def _classify_status(
+        cls, body_text: str | None
+    ) -> tuple[MessageStatus, str | None]:
+        """Map body text to (status, normalized_content).
+
+        en-US heuristic: equality with a known "recalled" marker → ``deleted``
+        (content emitted as ``None``). All other states default to ``sent``;
+        LinkedIn does not expose read/delivered to the sender in the message
+        list DOM, so v1 ships those literals only via the type signature.
+        """
+        if body_text is None:
+            return "sent", None
+        if body_text.strip() in cls._DELETED_BODY_TEXTS_EN_US:
+            return "deleted", None
+        return "sent", body_text
+
+    @classmethod
+    def _compose_content(cls, body: str | None, quoted: str | None) -> str | None:
+        """Prefix quoted text with ``"> "`` lines and join with the body."""
+        if body is None:
+            return None
+        if not quoted:
+            return body
+        quoted_lines = "\n".join(f"> {line}" for line in quoted.splitlines() if line)
+        return f"{quoted_lines}\n{body}" if quoted_lines else body
+
+    def _normalize_conversation_events(
+        self,
+        raw: dict[str, Any],
+    ) -> tuple[list[Message], list[Member]]:
+        """Convert the JS dump into structured Message/Member lists."""
+        events: list[dict[str, Any]] = raw.get("events") or []
+        header_profiles: list[dict[str, Any]] = raw.get("header_profiles") or []
+
+        reference_year = datetime.now().year
+        running_day: str | None = None
+        messages: list[Message] = []
+        member_names: dict[str, str] = {}
+
+        for event in events:
+            day_heading = event.get("day_heading")
+            if day_heading:
+                running_day = day_heading
+            time_text = event.get("time_text")
+            timestamp = self._build_iso_timestamp(
+                running_day, time_text, reference_year
+            )
+
+            body_text = event.get("body_text")
+            status, content_base = self._classify_status(body_text)
+
+            sender_url = self._normalize_profile_url(event.get("sender_url"))
+            sender = sender_url or "self"
+
+            sender_name = event.get("sender_name")
+            if sender_url and sender_name and sender_url not in member_names:
+                member_names[sender_url] = sender_name
+
+            # V1: drop events with no extractable text body that aren't
+            # tombstones. Covers image / file / voice-only messages (LinkedIn
+            # renders these without a <p>) and any system event we don't
+            # yet model. The participant list still includes their sender
+            # because we record the name above before the skip.
+            if status != "deleted" and not body_text:
+                continue
+
+            content = self._compose_content(content_base, event.get("quoted_text"))
+            messages.append(
+                {
+                    "timestamp": timestamp,
+                    "status": status,
+                    "sender": sender,
+                    "content": content,
+                }
+            )
+
+        # Fold header participants in so the recipient appears even if they
+        # haven't sent a visible message in the captured window.
+        for hp in header_profiles:
+            url = self._normalize_profile_url(hp.get("url"))
+            if not url:
+                continue
+            name = hp.get("name")
+            if name and url not in member_names:
+                member_names[url] = name
+            elif url not in member_names:
+                member_names[url] = ""
+
+        members: list[Member] = []
+        for url, name in member_names.items():
+            member: Member = {"kind": "person", "url": url}
+            if name:
+                member["name"] = name
+            members.append(member)
+
+        return messages, members
+
+    async def _extract_conversation_messages(
+        self,
+    ) -> tuple[list[Message], list[Member]]:
+        """Pull structured messages + members from the current thread page."""
+        raw = await self._page.evaluate(self._CONVERSATION_EXTRACT_SCRIPT)
+        return self._normalize_conversation_events(raw)
+
     async def get_conversation(
         self,
         linkedin_username: str | None = None,
         thread_id: str | None = None,
         index: int = 0,
+        max_scrolls: int = 3,
     ) -> dict[str, Any]:
         """Read a specific messaging conversation by thread ID or username.
 
@@ -3057,6 +3378,19 @@ class LinkedInExtractor:
         InMail. Ignored when ``thread_id`` is provided. Use
         ``search_conversations`` to enumerate thread IDs first if disambiguation
         by index is impractical.
+
+        ``max_scrolls`` caps how many times we scroll the message list back to
+        load older history. LinkedIn virtualizes the list, so the number of
+        returned messages grows with the scroll count; older history requires
+        higher values at the cost of latency.
+
+        Returns ``{url, sections: {messages, members}}``: ``messages`` is an
+        ordered list of ``{timestamp, status, sender, content}`` entries and
+        ``members`` is the participant list. Timestamp parsing and the
+        ``deleted`` status detection are en-US best-effort — BrowserManager
+        forces the browser locale to en-US; in other locales timestamps fall
+        through to raw concatenated text and deleted messages render with the
+        localized body text in ``content`` (status stays ``"sent"``).
 
         Side effect when looked up by username: resolution searches LinkedIn's
         messaging inbox for the participant's display name and click-visits
@@ -3082,24 +3416,19 @@ class LinkedInExtractor:
         await detect_rate_limit(self._page)
         await self._wait_for_main_text(log_context="Conversation")
         await handle_modal_close(self._page)
-        await self._scroll_main_scrollable_region(
-            position="top", attempts=3, pause_time=0.5
-        )
+        if max_scrolls > 0:
+            await self._scroll_main_scrollable_region(
+                position="top", attempts=max_scrolls, pause_time=0.5
+            )
 
-        raw_result = await self._extract_root_content(["main"])
-        raw = raw_result["text"]
-        cleaned = strip_linkedin_noise(raw) if raw else ""
-        references = (
-            build_references(raw_result["references"], "conversation")
-            if cleaned
-            else []
-        )
-        return self._single_section_result(
-            self._page.url,
-            "conversation",
-            cleaned,
-            references=references,
-        )
+        messages, members = await self._extract_conversation_messages()
+        return {
+            "url": self._page.url,
+            "sections": {
+                "messages": messages,
+                "members": members,
+            },
+        }
 
     async def search_conversations(
         self, keywords: str, limit: int = 20
