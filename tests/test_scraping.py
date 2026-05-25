@@ -4127,6 +4127,14 @@ class TestInvitationManagement:
         assert mock_page.evaluate.await_count == 2
         mock_sleep.assert_awaited_once_with(0.5)
 
+    async def test_invitation_card_present_fails_closed_on_evaluate_error(
+        self, mock_page
+    ):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.evaluate = AsyncMock(side_effect=RuntimeError("page crashed"))
+
+        assert await extractor._invitation_card_present("alice") is False
+
 
 # ----------------------------------------------------------------------
 # Conversation test helpers.

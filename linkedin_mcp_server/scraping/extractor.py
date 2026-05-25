@@ -4310,7 +4310,7 @@ class LinkedInExtractor:
             )
         except Exception:
             logger.debug("Invitation card verification failed", exc_info=True)
-            return True
+            return False
 
     async def _extract_root_content(
         self,
