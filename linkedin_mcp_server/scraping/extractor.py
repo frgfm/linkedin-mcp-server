@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import logging
 import re
@@ -3084,7 +3084,21 @@ class LinkedInExtractor:
         "dec": 12,
     }
     _DAY_HEADING_RE = re.compile(r"^\s*([A-Za-z]{3,9})\s+(\d{1,2})(?:,\s*(\d{4}))?\s*$")
+    # en-US "Today" / "Yesterday" relative-day headings. Resolved against
+    # ``datetime.now()`` in the normalizer; documented in the en-US locale
+    # caveats alongside the deleted-status marker.
+    _TODAY_HEADING_RE = re.compile(r"^\s*today\s*$", re.IGNORECASE)
+    _YESTERDAY_HEADING_RE = re.compile(r"^\s*yesterday\s*$", re.IGNORECASE)
     _CLOCK_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*([AaPp][Mm])?\s*$")
+
+    # Anchors LinkedIn renders inside a shared-post / shared-job card embedded
+    # in a message. When a participant shares a link the message has no <p>
+    # body — only the card — so we surface this URL as the message content.
+    # Match relative or absolute LinkedIn URLs; emit as a relative path.
+    _SHARED_LINK_RE = re.compile(
+        r"^(?:https?://[^/]*linkedin\.com)?(/(?:feed/update/[^/?#]+/?|posts/[^/?#]+/?|jobs/view/\d+/?|pulse/[^/?#]+/?))",
+        re.IGNORECASE,
+    )
 
     _CONVERSATION_EXTRACT_SCRIPT = r"""
         () => {
@@ -3149,6 +3163,19 @@ class LinkedInExtractor:
                     }
                 }
 
+                // Shared-post / shared-job card: any anchor inside the event
+                // whose href matches a content-permalink pattern (feed update,
+                // posts slug, job posting, pulse article). We surface only
+                // the first match — LinkedIn's card embeds repeat the link
+                // across the title, image, and CTA.
+                let sharedUrl = null;
+                if (eventItem) {
+                    const cardAnchor = Array.from(eventItem.querySelectorAll('a[href]'))
+                        .map(a => a.getAttribute('href') || '')
+                        .find(h => /\/(?:feed\/update|posts|jobs\/view|pulse)\//i.test(h));
+                    if (cardAnchor) sharedUrl = cardAnchor;
+                }
+
                 return {
                     day_heading: dayHeading,
                     time_text: timeText,
@@ -3156,6 +3183,7 @@ class LinkedInExtractor:
                     sender_name: senderName,
                     body_text: bodyText,
                     quoted_text: quotedText,
+                    shared_url: sharedUrl,
                 };
             });
 
@@ -3193,12 +3221,22 @@ class LinkedInExtractor:
         return f"/in/{match.group(1)}/"
 
     @classmethod
-    def _parse_day_heading(cls, text: str) -> tuple[int, int, int | None] | None:
-        """Parse 'Feb 10' or 'Feb 10, 2024' → (month, day, year_or_None).
+    def _parse_day_heading(
+        cls, text: str, today: datetime | None = None
+    ) -> tuple[int, int, int | None] | None:
+        """Parse 'Feb 10' / 'Feb 10, 2024' / 'Today' / 'Yesterday' → (month, day, year_or_None).
 
-        en-US only. Returns None if the heading does not match the expected
-        pattern (caller falls back to no date context for that event).
+        en-US only. ``today`` is injectable for deterministic tests; defaults
+        to ``datetime.now()`` when ``Today``/``Yesterday`` is encountered.
+        Returns None if the heading does not match the expected pattern
+        (caller falls back to no date context for that event).
         """
+        if cls._TODAY_HEADING_RE.match(text):
+            anchor = today or datetime.now()
+            return anchor.month, anchor.day, anchor.year
+        if cls._YESTERDAY_HEADING_RE.match(text):
+            anchor = (today or datetime.now()) - timedelta(days=1)
+            return anchor.month, anchor.day, anchor.year
         m = cls._DAY_HEADING_RE.match(text)
         if not m:
             return None
@@ -3286,6 +3324,19 @@ class LinkedInExtractor:
         quoted_lines = "\n".join(f"> {line}" for line in quoted.splitlines() if line)
         return f"{quoted_lines}\n{body}" if quoted_lines else body
 
+    @classmethod
+    def _normalize_shared_url(cls, raw: str | None) -> str | None:
+        """Normalize a link-card href to a LinkedIn relative path.
+
+        Strips origin and query/fragment so the emitted URL matches the
+        relative form used elsewhere in the codebase (``references``
+        entries, ``feed`` permalinks).
+        """
+        if not raw:
+            return None
+        m = cls._SHARED_LINK_RE.match(raw)
+        return m.group(1) if m else None
+
     def _normalize_conversation_events(
         self,
         raw: dict[str, Any],
@@ -3296,6 +3347,11 @@ class LinkedInExtractor:
 
         reference_year = datetime.now().year
         running_day: str | None = None
+        # Per-minute message groups share a single rendered <time>; subsequent
+        # events in the group emit no time_text of their own. Inherit the last
+        # observed clock value within a day, and reset whenever a new
+        # day-heading lands so we never bleed times across day boundaries.
+        running_time: str | None = None
         messages: list[Message] = []
         member_names: dict[str, str] = {}
 
@@ -3303,12 +3359,16 @@ class LinkedInExtractor:
             day_heading = event.get("day_heading")
             if day_heading:
                 running_day = day_heading
-            time_text = event.get("time_text")
+                running_time = None
+            time_text = event.get("time_text") or running_time
+            if event.get("time_text"):
+                running_time = event["time_text"]
             timestamp = self._build_iso_timestamp(
                 running_day, time_text, reference_year
             )
 
             body_text = event.get("body_text")
+            shared_url = self._normalize_shared_url(event.get("shared_url"))
             status, content_base = self._classify_status(body_text)
 
             sender_url = self._normalize_profile_url(event.get("sender_url"))
@@ -3319,14 +3379,21 @@ class LinkedInExtractor:
                 member_names[sender_url] = sender_name
 
             # V1: drop events with no extractable text body that aren't
-            # tombstones. Covers image / file / voice-only messages (LinkedIn
-            # renders these without a <p>) and any system event we don't
-            # yet model. The participant list still includes their sender
+            # tombstones AND don't carry a shared link card. Covers
+            # image / file / voice-only messages (LinkedIn renders these
+            # without a <p> or a card) and any system event we don't yet
+            # model. The participant list still includes their sender
             # because we record the name above before the skip.
-            if status != "deleted" and not body_text:
+            if status != "deleted" and not body_text and not shared_url:
                 continue
 
-            content = self._compose_content(content_base, event.get("quoted_text"))
+            # Link-card-only message: surface the shared LinkedIn URL as the
+            # message content so the LLM can resolve it via get_feed /
+            # get_job_details / etc. without an extra DOM round-trip.
+            if not body_text and shared_url and status != "deleted":
+                content = shared_url
+            else:
+                content = self._compose_content(content_base, event.get("quoted_text"))
             messages.append(
                 {
                     "timestamp": timestamp,

@@ -3976,8 +3976,71 @@ class TestConversationParserHelpers:
         """innerText returns 'FEB 10' when LinkedIn applies CSS uppercase."""
         assert LinkedInExtractor._parse_day_heading("FEB 10") == (2, 10, None)
 
+    def test_parse_day_heading_today_resolves_to_anchor(self):
+        from datetime import datetime as _dt
+
+        today = _dt(2026, 5, 25, 18, 0, 0)
+        assert LinkedInExtractor._parse_day_heading("Today", today=today) == (
+            5,
+            25,
+            2026,
+        )
+
+    def test_parse_day_heading_yesterday_resolves_to_anchor_minus_one(self):
+        from datetime import datetime as _dt
+
+        today = _dt(2026, 5, 25, 18, 0, 0)
+        assert LinkedInExtractor._parse_day_heading("Yesterday", today=today) == (
+            5,
+            24,
+            2026,
+        )
+
+    def test_parse_day_heading_yesterday_crosses_month(self):
+        from datetime import datetime as _dt
+
+        today = _dt(2026, 3, 1, 0, 30, 0)
+        # March 1 - 1 day → Feb 28 (2026 is not a leap year)
+        assert LinkedInExtractor._parse_day_heading("Yesterday", today=today) == (
+            2,
+            28,
+            2026,
+        )
+
+    def test_parse_day_heading_today_case_insensitive(self):
+        from datetime import datetime as _dt
+
+        today = _dt(2026, 5, 25)
+        assert LinkedInExtractor._parse_day_heading("TODAY", today=today) == (
+            5,
+            25,
+            2026,
+        )
+
     def test_parse_day_heading_unknown_format_returns_none(self):
-        assert LinkedInExtractor._parse_day_heading("Yesterday") is None
+        assert LinkedInExtractor._parse_day_heading("Whenever") is None
+
+    def test_normalize_shared_url_feed_update(self):
+        out = LinkedInExtractor._normalize_shared_url(
+            "/feed/update/urn:li:activity:7440422212802826240/"
+        )
+        assert out == "/feed/update/urn:li:activity:7440422212802826240/"
+
+    def test_normalize_shared_url_absolute_strips_origin(self):
+        out = LinkedInExtractor._normalize_shared_url(
+            "https://www.linkedin.com/jobs/view/4371001486"
+        )
+        assert out == "/jobs/view/4371001486"
+
+    def test_normalize_shared_url_posts_slug(self):
+        out = LinkedInExtractor._normalize_shared_url("/posts/some-slug-abc123")
+        assert out == "/posts/some-slug-abc123"
+
+    def test_normalize_shared_url_rejects_non_content(self):
+        # Profile and company links aren't shared-card permalinks.
+        assert LinkedInExtractor._normalize_shared_url("/in/someone/") is None
+        assert LinkedInExtractor._normalize_shared_url("/company/foo/") is None
+        assert LinkedInExtractor._normalize_shared_url(None) is None
 
     def test_build_iso_timestamp_pm(self):
         out = LinkedInExtractor._build_iso_timestamp("Feb 10", "3:17 PM", 2026)
@@ -3997,7 +4060,7 @@ class TestConversationParserHelpers:
 
     def test_build_iso_timestamp_falls_back_when_unparseable(self):
         """When format is unrecognized, return the raw concatenation."""
-        out = LinkedInExtractor._build_iso_timestamp("Yesterday", "3:17 PM", 2026)
+        out = LinkedInExtractor._build_iso_timestamp("Whenever", "3:17 PM", 2026)
         assert "3:17 PM" in out
 
     def test_classify_status_deleted_en_us(self):
@@ -4174,6 +4237,149 @@ class TestNormalizeConversationEvents:
             messages[0]["content"]
             == "> Bob: did you get the link?\nSure, sending it now."
         )
+
+    def test_time_text_inherited_across_same_minute_group(self):
+        """Consecutive same-sender messages within a minute share one <time>.
+        Subsequent events inherit the prior clock value until a new day-heading
+        resets it. Reproduces the bug where 'First paragraph' / 'oh pinaise ca
+        marche' came back with timestamp='Today' (no clock)."""
+        raw = {
+            "events": [
+                # First event in group carries the <time>.
+                {
+                    "day_heading": "Feb 10, 2024",
+                    "time_text": "4:36 PM",
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "first",
+                    "quoted_text": None,
+                },
+                # Subsequent events in the same group have no time_text.
+                {
+                    "day_heading": None,
+                    "time_text": None,
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "second",
+                    "quoted_text": None,
+                },
+                {
+                    "day_heading": None,
+                    "time_text": None,
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "third",
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [],
+        }
+        extractor = self._make_extractor()
+        messages, _ = extractor._normalize_conversation_events(raw)
+        # All three messages share the same ISO timestamp from event 0's <time>.
+        assert [m["timestamp"] for m in messages] == [
+            "2024-02-10T16:36:00",
+            "2024-02-10T16:36:00",
+            "2024-02-10T16:36:00",
+        ]
+        assert [m["content"] for m in messages] == ["first", "second", "third"]
+
+    def test_running_time_resets_on_new_day_heading(self):
+        """Running time should not bleed across day boundaries."""
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Feb 10, 2024",
+                    "time_text": "4:36 PM",
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "day 1",
+                    "quoted_text": None,
+                },
+                # New day, no time_text — should NOT inherit 4:36 PM.
+                {
+                    "day_heading": "Feb 11, 2024",
+                    "time_text": None,
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "day 2 no time",
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [],
+        }
+        extractor = self._make_extractor()
+        messages, _ = extractor._normalize_conversation_events(raw)
+        # First message has full ISO timestamp.
+        assert messages[0]["timestamp"] == "2024-02-10T16:36:00"
+        # Second message has no clock — falls back to the raw day heading.
+        assert messages[1]["timestamp"] == "Feb 11, 2024"
+
+    def test_link_card_event_renders_url_as_content(self):
+        """A message that is purely a shared link card (no <p> body) emits
+        the card's permalink as content rather than being skipped."""
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Mar 19, 2026",
+                    "time_text": "5:22 PM",
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": None,
+                    "quoted_text": None,
+                    "shared_url": "/feed/update/urn:li:activity:7440422212802826240/",
+                },
+            ],
+            "header_profiles": [],
+        }
+        extractor = self._make_extractor()
+        messages, _ = extractor._normalize_conversation_events(raw)
+        assert len(messages) == 1
+        assert messages[0]["status"] == "sent"
+        assert (
+            messages[0]["content"]
+            == "/feed/update/urn:li:activity:7440422212802826240/"
+        )
+
+    def test_link_card_absolute_url_normalized_to_relative(self):
+        """Absolute LinkedIn URLs in a card href become relative paths."""
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Mar 19, 2026",
+                    "time_text": "5:22 PM",
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": None,
+                    "quoted_text": None,
+                    "shared_url": "https://www.linkedin.com/jobs/view/4371001486?ref=foo",
+                },
+            ],
+            "header_profiles": [],
+        }
+        extractor = self._make_extractor()
+        messages, _ = extractor._normalize_conversation_events(raw)
+        assert messages[0]["content"] == "/jobs/view/4371001486"
+
+    def test_body_text_wins_over_shared_url(self):
+        """When a comment-with-share has both text and a card URL, body wins."""
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Feb 16, 2026",
+                    "time_text": "9:01 AM",
+                    "sender_url": "/in/alice/",
+                    "sender_name": "Alice",
+                    "body_text": "Look at this!",
+                    "quoted_text": None,
+                    "shared_url": "/feed/update/urn:li:activity:7428718265717190656/",
+                },
+            ],
+            "header_profiles": [],
+        }
+        extractor = self._make_extractor()
+        messages, _ = extractor._normalize_conversation_events(raw)
+        assert messages[0]["content"] == "Look at this!"
 
     def test_skips_event_without_body_unless_deleted(self):
         """Attachment-only / system events (no body_text, not a tombstone)
