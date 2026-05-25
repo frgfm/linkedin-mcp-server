@@ -21,6 +21,7 @@ from linkedin_mcp_server.scraping.extractor import (
     _truncate_linkedin_noise,
     strip_linkedin_noise,
 )
+from linkedin_mcp_server.scraping import conversation as conversation_parser
 from linkedin_mcp_server.scraping.link_metadata import Reference
 
 
@@ -3697,9 +3698,8 @@ class TestGetConversation:
             patch.object(
                 extractor, "_scroll_main_scrollable_region", new_callable=AsyncMock
             ),
-            patch.object(
-                extractor,
-                "_extract_conversation_messages",
+            patch(
+                "linkedin_mcp_server.scraping.extractor.extract_conversation",
                 new_callable=AsyncMock,
                 return_value=(sample_messages, sample_members),
             ),
@@ -3730,9 +3730,8 @@ class TestGetConversation:
             ),
             patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
             patch.object(extractor, "_scroll_main_scrollable_region", scroll_mock),
-            patch.object(
-                extractor,
-                "_extract_conversation_messages",
+            patch(
+                "linkedin_mcp_server.scraping.extractor.extract_conversation",
                 new_callable=AsyncMock,
                 return_value=([], []),
             ),
@@ -3757,9 +3756,8 @@ class TestGetConversation:
             ),
             patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
             patch.object(extractor, "_scroll_main_scrollable_region", scroll_mock),
-            patch.object(
-                extractor,
-                "_extract_conversation_messages",
+            patch(
+                "linkedin_mcp_server.scraping.extractor.extract_conversation",
                 new_callable=AsyncMock,
                 return_value=([], []),
             ),
@@ -3809,9 +3807,8 @@ class TestGetConversation:
                     "https://www.linkedin.com/messaging/thread/2-older/",
                 ],
             ),
-            patch.object(
-                extractor,
-                "_extract_conversation_messages",
+            patch(
+                "linkedin_mcp_server.scraping.extractor.extract_conversation",
                 new_callable=AsyncMock,
                 return_value=([], []),
             ),
@@ -3859,9 +3856,8 @@ class TestGetConversation:
                     "https://www.linkedin.com/messaging/thread/2-older/",
                 ],
             ),
-            patch.object(
-                extractor,
-                "_extract_conversation_messages",
+            patch(
+                "linkedin_mcp_server.scraping.extractor.extract_conversation",
                 new_callable=AsyncMock,
                 return_value=([], []),
             ),
@@ -3950,7 +3946,7 @@ class TestConversationParserHelpers:
 
     def test_normalize_profile_url_strips_origin_and_query(self):
         assert (
-            LinkedInExtractor._normalize_profile_url(
+            conversation_parser.normalize_profile_url(
                 "https://www.linkedin.com/in/ACoAA123/?miniProfileUrn=foo"
             )
             == "/in/ACoAA123/"
@@ -3958,29 +3954,29 @@ class TestConversationParserHelpers:
 
     def test_normalize_profile_url_handles_relative(self):
         assert (
-            LinkedInExtractor._normalize_profile_url("/in/alice/?bar=baz")
+            conversation_parser.normalize_profile_url("/in/alice/?bar=baz")
             == "/in/alice/"
         )
 
     def test_normalize_profile_url_returns_none_for_non_profile(self):
-        assert LinkedInExtractor._normalize_profile_url("/jobs/view/42") is None
-        assert LinkedInExtractor._normalize_profile_url(None) is None
+        assert conversation_parser.normalize_profile_url("/jobs/view/42") is None
+        assert conversation_parser.normalize_profile_url(None) is None
 
     def test_parse_day_heading_month_day(self):
-        assert LinkedInExtractor._parse_day_heading("Feb 10") == (2, 10, None)
+        assert conversation_parser.parse_day_heading("Feb 10") == (2, 10, None)
 
     def test_parse_day_heading_with_explicit_year(self):
-        assert LinkedInExtractor._parse_day_heading("Feb 10, 2024") == (2, 10, 2024)
+        assert conversation_parser.parse_day_heading("Feb 10, 2024") == (2, 10, 2024)
 
     def test_parse_day_heading_uppercase_via_css_transform(self):
         """innerText returns 'FEB 10' when LinkedIn applies CSS uppercase."""
-        assert LinkedInExtractor._parse_day_heading("FEB 10") == (2, 10, None)
+        assert conversation_parser.parse_day_heading("FEB 10") == (2, 10, None)
 
     def test_parse_day_heading_today_resolves_to_anchor(self):
         from datetime import datetime as _dt
 
         today = _dt(2026, 5, 25, 18, 0, 0)
-        assert LinkedInExtractor._parse_day_heading("Today", today=today) == (
+        assert conversation_parser.parse_day_heading("Today", today=today) == (
             5,
             25,
             2026,
@@ -3990,7 +3986,7 @@ class TestConversationParserHelpers:
         from datetime import datetime as _dt
 
         today = _dt(2026, 5, 25, 18, 0, 0)
-        assert LinkedInExtractor._parse_day_heading("Yesterday", today=today) == (
+        assert conversation_parser.parse_day_heading("Yesterday", today=today) == (
             5,
             24,
             2026,
@@ -4001,7 +3997,7 @@ class TestConversationParserHelpers:
 
         today = _dt(2026, 3, 1, 0, 30, 0)
         # March 1 - 1 day → Feb 28 (2026 is not a leap year)
-        assert LinkedInExtractor._parse_day_heading("Yesterday", today=today) == (
+        assert conversation_parser.parse_day_heading("Yesterday", today=today) == (
             2,
             28,
             2026,
@@ -4011,94 +4007,91 @@ class TestConversationParserHelpers:
         from datetime import datetime as _dt
 
         today = _dt(2026, 5, 25)
-        assert LinkedInExtractor._parse_day_heading("TODAY", today=today) == (
+        assert conversation_parser.parse_day_heading("TODAY", today=today) == (
             5,
             25,
             2026,
         )
 
     def test_parse_day_heading_unknown_format_returns_none(self):
-        assert LinkedInExtractor._parse_day_heading("Whenever") is None
+        assert conversation_parser.parse_day_heading("Whenever") is None
 
     def test_normalize_shared_url_feed_update(self):
-        out = LinkedInExtractor._normalize_shared_url(
+        out = conversation_parser.normalize_shared_url(
             "/feed/update/urn:li:activity:7440422212802826240/"
         )
         assert out == "/feed/update/urn:li:activity:7440422212802826240/"
 
     def test_normalize_shared_url_absolute_strips_origin(self):
-        out = LinkedInExtractor._normalize_shared_url(
+        out = conversation_parser.normalize_shared_url(
             "https://www.linkedin.com/jobs/view/4371001486"
         )
         assert out == "/jobs/view/4371001486"
 
     def test_normalize_shared_url_posts_slug(self):
-        out = LinkedInExtractor._normalize_shared_url("/posts/some-slug-abc123")
+        out = conversation_parser.normalize_shared_url("/posts/some-slug-abc123")
         assert out == "/posts/some-slug-abc123"
 
     def test_normalize_shared_url_rejects_non_content(self):
         # Profile and company links aren't shared-card permalinks.
-        assert LinkedInExtractor._normalize_shared_url("/in/someone/") is None
-        assert LinkedInExtractor._normalize_shared_url("/company/foo/") is None
-        assert LinkedInExtractor._normalize_shared_url(None) is None
+        assert conversation_parser.normalize_shared_url("/in/someone/") is None
+        assert conversation_parser.normalize_shared_url("/company/foo/") is None
+        assert conversation_parser.normalize_shared_url(None) is None
 
     def test_build_iso_timestamp_pm(self):
-        out = LinkedInExtractor._build_iso_timestamp("Feb 10", "3:17 PM", 2026)
+        out = conversation_parser.build_iso_timestamp("Feb 10", "3:17 PM", 2026)
         assert out == "2026-02-10T15:17:00"
 
     def test_build_iso_timestamp_am(self):
-        out = LinkedInExtractor._build_iso_timestamp("Feb 10", "9:05 AM", 2026)
+        out = conversation_parser.build_iso_timestamp("Feb 10", "9:05 AM", 2026)
         assert out == "2026-02-10T09:05:00"
 
     def test_build_iso_timestamp_midnight(self):
-        out = LinkedInExtractor._build_iso_timestamp("Feb 10", "12:30 AM", 2026)
+        out = conversation_parser.build_iso_timestamp("Feb 10", "12:30 AM", 2026)
         assert out == "2026-02-10T00:30:00"
 
     def test_build_iso_timestamp_noon(self):
-        out = LinkedInExtractor._build_iso_timestamp("Feb 10", "12:30 PM", 2026)
+        out = conversation_parser.build_iso_timestamp("Feb 10", "12:30 PM", 2026)
         assert out == "2026-02-10T12:30:00"
 
     def test_build_iso_timestamp_falls_back_when_unparseable(self):
         """When format is unrecognized, return the raw concatenation."""
-        out = LinkedInExtractor._build_iso_timestamp("Whenever", "3:17 PM", 2026)
+        out = conversation_parser.build_iso_timestamp("Whenever", "3:17 PM", 2026)
         assert "3:17 PM" in out
 
     def test_classify_status_deleted_en_us(self):
-        status, content = LinkedInExtractor._classify_status(
+        status, content = conversation_parser.classify_status(
             "This message has been deleted."
         )
         assert status == "deleted"
         assert content is None
 
     def test_classify_status_normal_message(self):
-        status, content = LinkedInExtractor._classify_status("Hello, world!")
+        status, content = conversation_parser.classify_status("Hello, world!")
         assert status == "sent"
         assert content == "Hello, world!"
 
     def test_classify_status_other_locale_falls_through_to_sent(self):
         """Non-en-US deleted markers fall through to 'sent' (documented)."""
-        status, content = LinkedInExtractor._classify_status(
+        status, content = conversation_parser.classify_status(
             "Ce message a été supprimé."
         )
         assert status == "sent"
         assert content == "Ce message a été supprimé."
 
     def test_compose_content_no_quote(self):
-        assert LinkedInExtractor._compose_content("hi", None) == "hi"
+        assert conversation_parser.compose_content("hi", None) == "hi"
 
     def test_compose_content_with_quote_prefixes_lines(self):
-        out = LinkedInExtractor._compose_content("Sure!", "Alice: yo\nAre you in?")
+        out = conversation_parser.compose_content("Sure!", "Alice: yo\nAre you in?")
         assert out == "> Alice: yo\n> Are you in?\nSure!"
 
     def test_compose_content_deleted_passthrough_none(self):
-        assert LinkedInExtractor._compose_content(None, "anything") is None
+        assert conversation_parser.compose_content(None, "anything") is None
 
 
 class TestNormalizeConversationEvents:
     """Integration of the JS-side dump shape into Message/Member lists."""
-
-    def _make_extractor(self):
-        return LinkedInExtractor(MagicMock())
 
     def test_normal_message_flow(self):
         """Two distinct senders, no viewer URN → no one is self, ordering
@@ -4124,8 +4117,7 @@ class TestNormalizeConversationEvents:
             ],
             "header_profiles": [],
         }
-        extractor = self._make_extractor()
-        messages, members = extractor._normalize_conversation_events(raw)
+        messages, members = conversation_parser.normalize_conversation_events(raw)
         assert messages == [
             {
                 "timestamp": "2024-02-10T15:17:00",
@@ -4159,8 +4151,7 @@ class TestNormalizeConversationEvents:
             ],
             "header_profiles": [],
         }
-        extractor = self._make_extractor()
-        messages, _ = extractor._normalize_conversation_events(raw)
+        messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["status"] == "deleted"
         assert messages[0]["content"] is None
         # Sender index still set on tombstones — points at the original author.
@@ -4197,8 +4188,7 @@ class TestNormalizeConversationEvents:
             ],
             "header_profiles": [],
         }
-        extractor = self._make_extractor()
-        messages, _ = extractor._normalize_conversation_events(raw)
+        messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["timestamp"] == "2024-02-10T15:17:00"
         assert messages[1]["timestamp"] == "2024-02-10T15:18:00"
         assert messages[2]["timestamp"] == "2024-02-11T09:00:00"
@@ -4220,8 +4210,7 @@ class TestNormalizeConversationEvents:
             "header_profiles": [],
             "viewer_urn": "ACoAA_VIEWER",
         }
-        extractor = self._make_extractor()
-        messages, members = extractor._normalize_conversation_events(raw)
+        messages, members = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["sender"] == 0
         assert members[0]["is_self"] is True
 
@@ -4239,8 +4228,7 @@ class TestNormalizeConversationEvents:
             ],
             "header_profiles": [],
         }
-        extractor = self._make_extractor()
-        messages, _ = extractor._normalize_conversation_events(raw)
+        messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert (
             messages[0]["content"]
             == "> Bob: did you get the link?\nSure, sending it now."
@@ -4282,8 +4270,7 @@ class TestNormalizeConversationEvents:
             ],
             "header_profiles": [],
         }
-        extractor = self._make_extractor()
-        messages, _ = extractor._normalize_conversation_events(raw)
+        messages, _ = conversation_parser.normalize_conversation_events(raw)
         # All three messages share the same ISO timestamp from event 0's <time>.
         assert [m["timestamp"] for m in messages] == [
             "2024-02-10T16:36:00",
@@ -4316,8 +4303,7 @@ class TestNormalizeConversationEvents:
             ],
             "header_profiles": [],
         }
-        extractor = self._make_extractor()
-        messages, _ = extractor._normalize_conversation_events(raw)
+        messages, _ = conversation_parser.normalize_conversation_events(raw)
         # First message has full ISO timestamp.
         assert messages[0]["timestamp"] == "2024-02-10T16:36:00"
         # Second message has no clock — falls back to the raw day heading.
@@ -4340,8 +4326,7 @@ class TestNormalizeConversationEvents:
             ],
             "header_profiles": [],
         }
-        extractor = self._make_extractor()
-        messages, _ = extractor._normalize_conversation_events(raw)
+        messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert len(messages) == 1
         assert messages[0]["status"] == "sent"
         assert (
@@ -4365,8 +4350,7 @@ class TestNormalizeConversationEvents:
             ],
             "header_profiles": [],
         }
-        extractor = self._make_extractor()
-        messages, _ = extractor._normalize_conversation_events(raw)
+        messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["content"] == "/jobs/view/4371001486"
 
     def test_body_text_wins_over_shared_url(self):
@@ -4385,8 +4369,7 @@ class TestNormalizeConversationEvents:
             ],
             "header_profiles": [],
         }
-        extractor = self._make_extractor()
-        messages, _ = extractor._normalize_conversation_events(raw)
+        messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["content"] == "Look at this!"
 
     def test_skips_event_without_body_unless_deleted(self):
@@ -4414,8 +4397,7 @@ class TestNormalizeConversationEvents:
             ],
             "header_profiles": [],
         }
-        extractor = self._make_extractor()
-        messages, members = extractor._normalize_conversation_events(raw)
+        messages, members = conversation_parser.normalize_conversation_events(raw)
         # Only the real message survives.
         assert len(messages) == 1
         assert messages[0]["sender"] == 0  # Alice is at index 0 (no viewer URN)
@@ -4452,8 +4434,7 @@ class TestNormalizeConversationEvents:
             "header_profiles": [],
             "viewer_urn": "ACoAA_VIEWER",
         }
-        extractor = self._make_extractor()
-        messages, members = extractor._normalize_conversation_events(raw)
+        messages, members = conversation_parser.normalize_conversation_events(raw)
         # Self lives at index 0 even though "other" appears first in events.
         assert members[0]["is_self"] is True
         assert members[0]["url"] == "/in/ACoAA_VIEWER/"
@@ -4491,8 +4472,7 @@ class TestNormalizeConversationEvents:
             "header_profiles": [],
             "viewer_urn": "ACoAA_VIEWER",
         }
-        extractor = self._make_extractor()
-        messages, members = extractor._normalize_conversation_events(raw)
+        messages, members = conversation_parser.normalize_conversation_events(raw)
         # Self has is_self True but NO url — we don't synthesize one
         # from the viewer URN.
         assert members[0] == {"kind": "person", "is_self": True}
@@ -4520,8 +4500,7 @@ class TestNormalizeConversationEvents:
             "header_profiles": [],
             "viewer_urn": None,
         }
-        extractor = self._make_extractor()
-        _, members = extractor._normalize_conversation_events(raw)
+        _, members = conversation_parser.normalize_conversation_events(raw)
         # is_self present on every member, always False.
         assert all(m["is_self"] is False for m in members)
 
@@ -4542,8 +4521,7 @@ class TestNormalizeConversationEvents:
             "header_profiles": [],
             "viewer_urn": None,
         }
-        extractor = self._make_extractor()
-        messages, _ = extractor._normalize_conversation_events(raw)
+        messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages == []
 
     def test_header_profile_adds_silent_participant(self):
@@ -4566,8 +4544,7 @@ class TestNormalizeConversationEvents:
                 },
             ],
         }
-        extractor = self._make_extractor()
-        _, members = extractor._normalize_conversation_events(raw)
+        _, members = conversation_parser.normalize_conversation_events(raw)
         urls = {m["url"]: m.get("name") for m in members}
         assert urls == {"/in/alice/": "Alice", "/in/bob/": "Bob"}
 
