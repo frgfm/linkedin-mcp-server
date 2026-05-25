@@ -125,19 +125,6 @@ _EXTRACT_SCRIPT = r"""
             const bodyEl = eventItem ? eventItem.querySelector('p') : null;
             const bodyText = bodyEl ? (bodyEl.innerText || bodyEl.textContent || '').trim() : null;
 
-            // Quoted reply parent (LinkedIn renders inline before the
-            // bubble). Class hint exists but is unstable; pull innerText
-            // from any <span> whose enclosing container holds the bubble.
-            let quotedText = null;
-            if (eventItem) {
-                const repliedContainer = eventItem.querySelector(
-                    '[class*="replied-message"]'
-                );
-                if (repliedContainer) {
-                    quotedText = clean(repliedContainer.innerText || repliedContainer.textContent);
-                }
-            }
-
             // Shared-post / shared-job card: any anchor inside the event
             // whose href matches a content-permalink pattern (feed update,
             // posts slug, job posting, pulse article). We surface only
@@ -157,27 +144,9 @@ _EXTRACT_SCRIPT = r"""
                 sender_url: senderUrl,
                 sender_name: senderName,
                 body_text: bodyText,
-                quoted_text: quotedText,
                 shared_url: sharedUrl,
             };
         });
-
-        // Header participant: the conversation's title region carries the
-        // other party's name + profile link near the top of <main>. We
-        // probe for a person anchor that is NOT inside the message list
-        // and not inside a generic side panel.
-        const allPersonAnchors = inMain('a[href*="/in/"]');
-        const messageListRoots = inMain('ul')
-            .filter(ul => ul.querySelector('[data-event-urn^="urn:li:msg_message:"]'));
-        const headerCandidates = allPersonAnchors.filter(a => {
-            if (messageListRoots.some(ul => ul.contains(a))) return false;
-            if (a.closest('nav') || a.closest('footer')) return false;
-            return true;
-        });
-        const headerProfiles = headerCandidates.slice(0, 3).map(a => ({
-            url: a.getAttribute('href'),
-            name: clean(a.textContent) || null,
-        }));
 
         // Viewer URN: every event item's data-event-urn carries the
         // authenticated user's fsd_profile URN as its first tuple
@@ -195,7 +164,7 @@ _EXTRACT_SCRIPT = r"""
             if (m) viewerUrn = m[1];
         }
 
-        return { events, header_profiles: headerProfiles, viewer_urn: viewerUrn };
+        return { events, viewer_urn: viewerUrn };
     }
 """
 
@@ -303,16 +272,6 @@ def classify_status(
     return "sent", body_text
 
 
-def compose_content(body: str | None, quoted: str | None) -> str | None:
-    """Prefix quoted text with ``"> "`` lines and join with the body."""
-    if body is None:
-        return None
-    if not quoted:
-        return body
-    quoted_lines = "\n".join(f"> {line}" for line in quoted.splitlines() if line)
-    return f"{quoted_lines}\n{body}" if quoted_lines else body
-
-
 def normalize_shared_url(raw: str | None) -> str | None:
     """Normalize a link-card href to a LinkedIn relative path.
 
@@ -339,13 +298,18 @@ def normalize_conversation_events(
     Member list (self always at index 0 when detectable).
     """
     events: list[dict[str, Any]] = raw.get("events") or []
-    header_profiles: list[dict[str, Any]] = raw.get("header_profiles") or []
     viewer_urn: str | None = raw.get("viewer_urn") or None
 
     # ------------------------------------------------------------
     # Pass 1: collect distinct participants and their display names.
     # ------------------------------------------------------------
     # Dict insertion order is the natural "first appearance" order.
+    # Members are derived only from senders observed in events — a
+    # silent participant (recipient who hasn't sent a visible message
+    # yet) won't appear. The header-profiles scan that previously
+    # tried to surface them relied on a broad "/in/ anchors outside
+    # the message list" heuristic that picks up sidebar entries; see
+    # PR review #4 for the rationale on dropping it.
     candidate_members: dict[str, str | None] = {}
 
     def _record_member(url: str | None, name: str | None) -> None:
@@ -361,11 +325,6 @@ def normalize_conversation_events(
         _record_member(
             normalize_profile_url(event.get("sender_url")),
             event.get("sender_name"),
-        )
-    for hp in header_profiles:
-        _record_member(
-            normalize_profile_url(hp.get("url")),
-            hp.get("name"),
         )
 
     # Resolve the self entry. Prefer an existing url whose path
@@ -464,7 +423,7 @@ def normalize_conversation_events(
         if not body_text and shared_url and status != "deleted":
             content = shared_url
         else:
-            content = compose_content(content_base, event.get("quoted_text"))
+            content = content_base
         messages.append(
             {
                 "timestamp": timestamp,

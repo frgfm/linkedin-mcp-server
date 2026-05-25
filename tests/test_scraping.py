@@ -4079,15 +4079,7 @@ class TestConversationParserHelpers:
         assert status == "sent"
         assert content == "Ce message a été supprimé."
 
-    def test_compose_content_no_quote(self):
-        assert conversation_parser.compose_content("hi", None) == "hi"
 
-    def test_compose_content_with_quote_prefixes_lines(self):
-        out = conversation_parser.compose_content("Sure!", "Alice: yo\nAre you in?")
-        assert out == "> Alice: yo\n> Are you in?\nSure!"
-
-    def test_compose_content_deleted_passthrough_none(self):
-        assert conversation_parser.compose_content(None, "anything") is None
 
 
 class TestNormalizeConversationEvents:
@@ -4104,7 +4096,6 @@ class TestNormalizeConversationEvents:
                     "sender_url": "https://www.linkedin.com/in/alice/",
                     "sender_name": "Alice",
                     "body_text": "Hello there!",
-                    "quoted_text": None,
                 },
                 {
                     "day_heading": None,
@@ -4112,10 +4103,8 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/bob/",
                     "sender_name": "Bob",
                     "body_text": "Hi Alice!",
-                    "quoted_text": None,
                 },
             ],
-            "header_profiles": [],
         }
         messages, members = conversation_parser.normalize_conversation_events(raw)
         assert messages == [
@@ -4146,10 +4135,8 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/alice/",
                     "sender_name": "Alice",
                     "body_text": "This message has been deleted.",
-                    "quoted_text": None,
                 },
             ],
-            "header_profiles": [],
         }
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["status"] == "deleted"
@@ -4167,7 +4154,6 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/alice/",
                     "sender_name": "Alice",
                     "body_text": "first",
-                    "quoted_text": None,
                 },
                 {
                     "day_heading": None,
@@ -4175,7 +4161,6 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/alice/",
                     "sender_name": "Alice",
                     "body_text": "second",
-                    "quoted_text": None,
                 },
                 {
                     "day_heading": "Feb 11, 2024",
@@ -4183,10 +4168,8 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/bob/",
                     "sender_name": "Bob",
                     "body_text": "next day",
-                    "quoted_text": None,
                 },
             ],
-            "header_profiles": [],
         }
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["timestamp"] == "2024-02-10T15:17:00"
@@ -4204,35 +4187,14 @@ class TestNormalizeConversationEvents:
                     "sender_url": None,
                     "sender_name": "You",
                     "body_text": "hello",
-                    "quoted_text": None,
                 },
             ],
-            "header_profiles": [],
             "viewer_urn": "ACoAA_VIEWER",
         }
         messages, members = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["sender"] == 0
         assert members[0]["is_self"] is True
 
-    def test_quoted_reply_flattened_into_content(self):
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Feb 10",
-                    "time_text": "3:17 PM",
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "Sure, sending it now.",
-                    "quoted_text": "Bob: did you get the link?",
-                },
-            ],
-            "header_profiles": [],
-        }
-        messages, _ = conversation_parser.normalize_conversation_events(raw)
-        assert (
-            messages[0]["content"]
-            == "> Bob: did you get the link?\nSure, sending it now."
-        )
 
     def test_time_text_inherited_across_same_minute_group(self):
         """Consecutive same-sender messages within a minute share one <time>.
@@ -4248,7 +4210,6 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/alice/",
                     "sender_name": "Alice",
                     "body_text": "first",
-                    "quoted_text": None,
                 },
                 # Subsequent events in the same group have no time_text.
                 {
@@ -4257,7 +4218,6 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/alice/",
                     "sender_name": "Alice",
                     "body_text": "second",
-                    "quoted_text": None,
                 },
                 {
                     "day_heading": None,
@@ -4265,10 +4225,8 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/alice/",
                     "sender_name": "Alice",
                     "body_text": "third",
-                    "quoted_text": None,
                 },
             ],
-            "header_profiles": [],
         }
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         # All three messages share the same ISO timestamp from event 0's <time>.
@@ -4289,7 +4247,6 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/alice/",
                     "sender_name": "Alice",
                     "body_text": "day 1",
-                    "quoted_text": None,
                 },
                 # New day, no time_text — should NOT inherit 4:36 PM.
                 {
@@ -4298,10 +4255,8 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/alice/",
                     "sender_name": "Alice",
                     "body_text": "day 2 no time",
-                    "quoted_text": None,
                 },
             ],
-            "header_profiles": [],
         }
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         # First message has full ISO timestamp.
@@ -4320,11 +4275,9 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/alice/",
                     "sender_name": "Alice",
                     "body_text": None,
-                    "quoted_text": None,
                     "shared_url": "/feed/update/urn:li:activity:7440422212802826240/",
                 },
             ],
-            "header_profiles": [],
         }
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert len(messages) == 1
@@ -4344,11 +4297,9 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/alice/",
                     "sender_name": "Alice",
                     "body_text": None,
-                    "quoted_text": None,
                     "shared_url": "https://www.linkedin.com/jobs/view/4371001486?ref=foo",
                 },
             ],
-            "header_profiles": [],
         }
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["content"] == "/jobs/view/4371001486"
@@ -4363,11 +4314,9 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/alice/",
                     "sender_name": "Alice",
                     "body_text": "Look at this!",
-                    "quoted_text": None,
                     "shared_url": "/feed/update/urn:li:activity:7428718265717190656/",
                 },
             ],
-            "header_profiles": [],
         }
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages[0]["content"] == "Look at this!"
@@ -4383,7 +4332,6 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/alice/",
                     "sender_name": "Alice",
                     "body_text": "real message",
-                    "quoted_text": None,
                 },
                 {
                     # Image-only or similar: no text body, not deleted.
@@ -4392,10 +4340,8 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/bob/",
                     "sender_name": "Bob",
                     "body_text": None,
-                    "quoted_text": None,
                 },
             ],
-            "header_profiles": [],
         }
         messages, members = conversation_parser.normalize_conversation_events(raw)
         # Only the real message survives.
@@ -4419,7 +4365,6 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/ACoAA_OTHER/",
                     "sender_name": "Other Person",
                     "body_text": "hi",
-                    "quoted_text": None,
                 },
                 # Viewer replies.
                 {
@@ -4428,10 +4373,8 @@ class TestNormalizeConversationEvents:
                     "sender_url": "https://www.linkedin.com/in/ACoAA_VIEWER/",
                     "sender_name": "Me",
                     "body_text": "hello back",
-                    "quoted_text": None,
                 },
             ],
-            "header_profiles": [],
             "viewer_urn": "ACoAA_VIEWER",
         }
         messages, members = conversation_parser.normalize_conversation_events(raw)
@@ -4458,7 +4401,6 @@ class TestNormalizeConversationEvents:
                     "sender_url": None,
                     "sender_name": None,
                     "body_text": "I sent this with no anchor",
-                    "quoted_text": None,
                 },
                 {
                     "day_heading": None,
@@ -4466,10 +4408,8 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/ACoAA_OTHER/",
                     "sender_name": "Other Person",
                     "body_text": "reply",
-                    "quoted_text": None,
                 },
             ],
-            "header_profiles": [],
             "viewer_urn": "ACoAA_VIEWER",
         }
         messages, members = conversation_parser.normalize_conversation_events(raw)
@@ -4494,10 +4434,8 @@ class TestNormalizeConversationEvents:
                     "sender_url": "/in/ACoAA_SOMEONE/",
                     "sender_name": "Someone",
                     "body_text": "hi",
-                    "quoted_text": None,
                 },
             ],
-            "header_profiles": [],
             "viewer_urn": None,
         }
         _, members = conversation_parser.normalize_conversation_events(raw)
@@ -4515,38 +4453,12 @@ class TestNormalizeConversationEvents:
                     "sender_url": None,
                     "sender_name": None,
                     "body_text": "orphan",
-                    "quoted_text": None,
                 },
             ],
-            "header_profiles": [],
             "viewer_urn": None,
         }
         messages, _ = conversation_parser.normalize_conversation_events(raw)
         assert messages == []
-
-    def test_header_profile_adds_silent_participant(self):
-        """A participant who hasn't sent a visible message still appears via header."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Feb 10",
-                    "time_text": "3:17 PM",
-                    "sender_url": "/in/alice/",
-                    "sender_name": "Alice",
-                    "body_text": "hi",
-                    "quoted_text": None,
-                },
-            ],
-            "header_profiles": [
-                {
-                    "url": "https://www.linkedin.com/in/bob/",
-                    "name": "Bob",
-                },
-            ],
-        }
-        _, members = conversation_parser.normalize_conversation_events(raw)
-        urls = {m["url"]: m.get("name") for m in members}
-        assert urls == {"/in/alice/": "Alice", "/in/bob/": "Bob"}
 
 
 class TestStripSelectConversationPrefix:
