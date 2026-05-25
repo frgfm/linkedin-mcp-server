@@ -49,10 +49,11 @@ MessageStatus = Literal["sent", "read", "delivered", "deleted"]
 class Message(TypedDict):
     """One message event in a conversation thread.
 
-    ``sender`` is the participant URL path (``/in/<slug>/``) when LinkedIn
-    renders a profile anchor for the author, or the sentinel ``"self"`` when
-    the authenticated user appears without a profile link (typical for
-    their own messages in certain UI states).
+    ``sender`` is a 0-based index into the conversation's ``members`` list.
+    The authenticated user is always at index 0 when their viewer URN is
+    detectable (which is true for any thread containing at least one
+    message event); other participants follow in the order they first
+    appear in the thread.
 
     ``content`` is ``None`` for deleted messages. Quoted/replied parents are
     flattened into the same string, prefixed with ``"> "`` per line.
@@ -64,23 +65,27 @@ class Message(TypedDict):
 
     timestamp: Required[str]
     status: Required[MessageStatus]
-    sender: Required[str]
+    sender: Required[int]
     content: Required[str | None]
 
 
 class Member(TypedDict):
     """One participant in a conversation thread.
 
-    ``is_self`` is present (and ``True``) on exactly one member when the
-    authenticated user is a participant; omitted on everyone else. Inferred
-    from the viewer URN embedded in every ``data-event-urn`` attribute
-    LinkedIn renders on message events.
+    ``is_self`` is always set; ``True`` for the authenticated user (when
+    detectable from the viewer URN embedded in every ``data-event-urn``)
+    and ``False`` for every other participant. When the viewer URN cannot
+    be determined ``is_self`` is ``False`` on every member.
+
+    Member order is significant: index 0 is the authenticated user when
+    detectable; remaining members follow first-appearance order in the
+    thread. Message ``sender`` fields are integer indices into this list.
     """
 
     kind: Required[Literal["person"]]
     url: Required[str]
     name: NotRequired[str]
-    is_self: NotRequired[bool]
+    is_self: Required[bool]
 
 
 _GENERIC_LABELS = {

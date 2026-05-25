@@ -3357,17 +3357,77 @@ class LinkedInExtractor:
         self,
         raw: dict[str, Any],
     ) -> tuple[list[Message], list[Member]]:
-        """Convert the JS dump into structured Message/Member lists."""
+        """Convert the JS dump into structured Message/Member lists.
+
+        Two-pass algorithm. The first pass walks the events to collect
+        every distinct participant (url → display name) and identifies
+        the authenticated user via the viewer URN embedded in
+        ``data-event-urn``. The second pass emits the Message list with
+        each ``sender`` field as the integer index into the ordered
+        Member list (self always at index 0 when detectable).
+        """
         events: list[dict[str, Any]] = raw.get("events") or []
         header_profiles: list[dict[str, Any]] = raw.get("header_profiles") or []
-        # Viewer URN, harvested in JS from the first event's data-event-urn.
-        # Whenever a message's sender URL contains this URN we rewrite the
-        # sender field to "self" — covers both the modern "no profile anchor"
-        # path (LinkedIn omits the link, JS returns sender_url=None → "self")
-        # and the older / deleted-message path where LinkedIn does render the
-        # viewer's own profile anchor.
         viewer_urn: str | None = raw.get("viewer_urn") or None
 
+        # ------------------------------------------------------------
+        # Pass 1: collect distinct participants and their display names.
+        # ------------------------------------------------------------
+        # Dict insertion order is the natural "first appearance" order.
+        candidate_members: dict[str, str | None] = {}
+
+        def _record_member(url: str | None, name: str | None) -> None:
+            if not url:
+                return
+            existing = candidate_members.get(url)
+            if url not in candidate_members:
+                candidate_members[url] = name or None
+            elif existing is None and name:
+                candidate_members[url] = name
+
+        for event in events:
+            _record_member(
+                self._normalize_profile_url(event.get("sender_url")),
+                event.get("sender_name"),
+            )
+        for hp in header_profiles:
+            _record_member(
+                self._normalize_profile_url(hp.get("url")),
+                hp.get("name"),
+            )
+
+        # Resolve the self URL. Prefer an existing entry whose path
+        # contains the viewer URN; otherwise synthesize one so the
+        # authenticated user always sits at members[0] when detectable.
+        self_url: str | None = None
+        if viewer_urn:
+            self_url = next((u for u in candidate_members if viewer_urn in u), None)
+            if not self_url:
+                self_url = f"/in/{viewer_urn}/"
+                candidate_members.setdefault(self_url, None)
+
+        ordered_urls: list[str] = []
+        if self_url:
+            ordered_urls.append(self_url)
+        ordered_urls.extend(u for u in candidate_members if u != self_url)
+
+        members: list[Member] = []
+        for url in ordered_urls:
+            member: Member = {
+                "kind": "person",
+                "url": url,
+                "is_self": url == self_url,
+            }
+            name = candidate_members.get(url)
+            if name:
+                member["name"] = name
+            members.append(member)
+
+        url_to_index: dict[str, int] = {url: i for i, url in enumerate(ordered_urls)}
+
+        # ------------------------------------------------------------
+        # Pass 2: emit messages with integer sender indices.
+        # ------------------------------------------------------------
         reference_year = datetime.now().year
         running_day: str | None = None
         # Per-minute message groups share a single rendered <time>; subsequent
@@ -3376,7 +3436,6 @@ class LinkedInExtractor:
         # day-heading lands so we never bleed times across day boundaries.
         running_time: str | None = None
         messages: list[Message] = []
-        member_names: dict[str, str] = {}
 
         for event in events:
             day_heading = event.get("day_heading")
@@ -3394,28 +3453,35 @@ class LinkedInExtractor:
             shared_url = self._normalize_shared_url(event.get("shared_url"))
             status, content_base = self._classify_status(body_text)
 
-            sender_url = self._normalize_profile_url(event.get("sender_url"))
-            if sender_url and viewer_urn and viewer_urn in sender_url:
-                sender = "self"
+            # Resolve sender to an integer member index. Three signals
+            # cover every case:
+            #   1. anchor whose URL contains viewer URN  → self (idx 0)
+            #   2. anchor whose URL is in the members map → that index
+            #   3. no anchor at all                       → self (idx 0)
+            # Events that can't be attributed (no anchor + no viewer URN)
+            # fall through and are skipped — consistent with the V1
+            # attachment-skip behavior.
+            raw_sender_url = self._normalize_profile_url(event.get("sender_url"))
+            sender_idx: int | None
+            if raw_sender_url and viewer_urn and viewer_urn in raw_sender_url:
+                sender_idx = url_to_index.get(self_url) if self_url else None
+            elif raw_sender_url:
+                sender_idx = url_to_index.get(raw_sender_url)
+            elif self_url:
+                sender_idx = url_to_index.get(self_url)
             else:
-                sender = sender_url or "self"
+                sender_idx = None
 
-            sender_name = event.get("sender_name")
-            if sender_url and sender_name and sender_url not in member_names:
-                member_names[sender_url] = sender_name
+            if sender_idx is None:
+                continue
 
-            # V1: drop events with no extractable text body that aren't
+            # Drop events with no extractable text body that aren't
             # tombstones AND don't carry a shared link card. Covers
-            # image / file / voice-only messages (LinkedIn renders these
-            # without a <p> or a card) and any system event we don't yet
-            # model. The participant list still includes their sender
-            # because we record the name above before the skip.
+            # image / file / voice-only messages and any system event
+            # we don't yet model in V1.
             if status != "deleted" and not body_text and not shared_url:
                 continue
 
-            # Link-card-only message: surface the shared LinkedIn URL as the
-            # message content so the LLM can resolve it via get_feed /
-            # get_job_details / etc. without an extra DOM round-trip.
             if not body_text and shared_url and status != "deleted":
                 content = shared_url
             else:
@@ -3424,31 +3490,10 @@ class LinkedInExtractor:
                 {
                     "timestamp": timestamp,
                     "status": status,
-                    "sender": sender,
+                    "sender": sender_idx,
                     "content": content,
                 }
             )
-
-        # Fold header participants in so the recipient appears even if they
-        # haven't sent a visible message in the captured window.
-        for hp in header_profiles:
-            url = self._normalize_profile_url(hp.get("url"))
-            if not url:
-                continue
-            name = hp.get("name")
-            if name and url not in member_names:
-                member_names[url] = name
-            elif url not in member_names:
-                member_names[url] = ""
-
-        members: list[Member] = []
-        for url, name in member_names.items():
-            member: Member = {"kind": "person", "url": url}
-            if name:
-                member["name"] = name
-            if viewer_urn and viewer_urn in url:
-                member["is_self"] = True
-            members.append(member)
 
         return messages, members
 

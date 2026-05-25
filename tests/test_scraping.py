@@ -3669,19 +3669,19 @@ class TestGetConversation:
             {
                 "timestamp": "2026-02-10T15:17:00",
                 "status": "sent",
-                "sender": "/in/alice/",
+                "sender": 0,
                 "content": "Hello!",
             },
             {
                 "timestamp": "2026-02-10T15:18:00",
                 "status": "deleted",
-                "sender": "/in/alice/",
+                "sender": 0,
                 "content": None,
             },
         ]
         sample_members = [
-            {"kind": "person", "url": "/in/alice/", "name": "Alice"},
-            {"kind": "person", "url": "/in/bob/", "name": "Bob"},
+            {"kind": "person", "url": "/in/alice/", "name": "Alice", "is_self": True},
+            {"kind": "person", "url": "/in/bob/", "name": "Bob", "is_self": False},
         ]
         with (
             patch.object(extractor, "_navigate_to_page", nav_mock),
@@ -4101,6 +4101,8 @@ class TestNormalizeConversationEvents:
         return LinkedInExtractor(MagicMock())
 
     def test_normal_message_flow(self):
+        """Two distinct senders, no viewer URN → no one is self, ordering
+        follows first-appearance order in events."""
         raw = {
             "events": [
                 {
@@ -4128,19 +4130,20 @@ class TestNormalizeConversationEvents:
             {
                 "timestamp": "2024-02-10T15:17:00",
                 "status": "sent",
-                "sender": "/in/alice/",
+                "sender": 0,
                 "content": "Hello there!",
             },
             {
                 "timestamp": "2024-02-10T15:18:00",
                 "status": "sent",
-                "sender": "/in/bob/",
+                "sender": 1,
                 "content": "Hi Alice!",
             },
         ]
-        # Members derived from observed senders.
-        urls = {m["url"] for m in members}
-        assert urls == {"/in/alice/", "/in/bob/"}
+        assert members == [
+            {"kind": "person", "url": "/in/alice/", "name": "Alice", "is_self": False},
+            {"kind": "person", "url": "/in/bob/", "name": "Bob", "is_self": False},
+        ]
 
     def test_deleted_message_emits_none_content(self):
         raw = {
@@ -4160,6 +4163,8 @@ class TestNormalizeConversationEvents:
         messages, _ = extractor._normalize_conversation_events(raw)
         assert messages[0]["status"] == "deleted"
         assert messages[0]["content"] is None
+        # Sender index still set on tombstones — points at the original author.
+        assert isinstance(messages[0]["sender"], int)
 
     def test_running_day_persists_across_events(self):
         """Subsequent events without their own day_heading inherit the prior."""
@@ -4199,7 +4204,8 @@ class TestNormalizeConversationEvents:
         assert messages[2]["timestamp"] == "2024-02-11T09:00:00"
 
     def test_self_sender_sentinel(self):
-        """An event without a resolvable sender URL is emitted as 'self'."""
+        """An event without a resolvable sender URL maps to index 0 (self)
+        when viewer URN is known."""
         raw = {
             "events": [
                 {
@@ -4212,10 +4218,12 @@ class TestNormalizeConversationEvents:
                 },
             ],
             "header_profiles": [],
+            "viewer_urn": "ACoAA_VIEWER",
         }
         extractor = self._make_extractor()
-        messages, _ = extractor._normalize_conversation_events(raw)
-        assert messages[0]["sender"] == "self"
+        messages, members = extractor._normalize_conversation_events(raw)
+        assert messages[0]["sender"] == 0
+        assert members[0]["is_self"] is True
 
     def test_quoted_reply_flattened_into_content(self):
         raw = {
@@ -4410,83 +4418,90 @@ class TestNormalizeConversationEvents:
         messages, members = extractor._normalize_conversation_events(raw)
         # Only the real message survives.
         assert len(messages) == 1
-        assert messages[0]["sender"] == "/in/alice/"
+        assert messages[0]["sender"] == 0  # Alice is at index 0 (no viewer URN)
         # Both Alice and Bob still appear as participants — we recorded
         # Bob's name from the dropped event before skipping it.
         urls = {m["url"]: m.get("name") for m in members}
         assert urls == {"/in/alice/": "Alice", "/in/bob/": "Bob"}
 
-    def test_self_rewrite_when_sender_url_matches_viewer_urn(self):
-        """When LinkedIn renders the viewer's own profile anchor (older
-        messages, deleted tombstones), the normalizer rewrites the sender
-        field to 'self' so downstream consumers don't have to recognize the
-        viewer's URN themselves."""
+    def test_self_always_at_index_zero(self):
+        """When viewer URN is known, the authenticated user is members[0]
+        regardless of order of appearance in events. Other participants
+        keep first-appearance order behind self."""
         raw = {
             "events": [
-                # Viewer's own message — LinkedIn renders the profile link.
+                # Other person speaks first.
                 {
                     "day_heading": "Feb 16, 2026",
                     "time_text": "9:01 AM",
-                    "sender_url": "https://www.linkedin.com/in/ACoAA_VIEWER_URN/",
-                    "sender_name": "Me Myself",
-                    "body_text": "I sent this",
-                    "quoted_text": None,
-                },
-                # Other participant — profile link does NOT contain viewer URN.
-                {
-                    "day_heading": None,
-                    "time_text": "9:02 AM",
-                    "sender_url": "/in/ACoAA_OTHER_URN/",
+                    "sender_url": "/in/ACoAA_OTHER/",
                     "sender_name": "Other Person",
-                    "body_text": "And I sent this",
-                    "quoted_text": None,
-                },
-            ],
-            "header_profiles": [],
-            "viewer_urn": "ACoAA_VIEWER_URN",
-        }
-        extractor = self._make_extractor()
-        messages, members = extractor._normalize_conversation_events(raw)
-        assert messages[0]["sender"] == "self"
-        assert messages[1]["sender"] == "/in/ACoAA_OTHER_URN/"
-        flag = {m["url"]: m.get("is_self", False) for m in members}
-        assert flag == {
-            "/in/ACoAA_VIEWER_URN/": True,
-            "/in/ACoAA_OTHER_URN/": False,
-        }
-
-    def test_self_member_url_still_present_in_members(self):
-        """Even though the sender field becomes 'self', the viewer's profile
-        URL must still appear in members (with name + is_self) so consumers
-        can resolve it via get_my_profile."""
-        raw = {
-            "events": [
-                {
-                    "day_heading": "Feb 16, 2026",
-                    "time_text": "9:01 AM",
-                    "sender_url": "/in/ACoAA_VIEWER_URN/",
-                    "sender_name": "Authenticated User",
                     "body_text": "hi",
                     "quoted_text": None,
                 },
+                # Viewer replies.
+                {
+                    "day_heading": None,
+                    "time_text": "9:02 AM",
+                    "sender_url": "https://www.linkedin.com/in/ACoAA_VIEWER/",
+                    "sender_name": "Me",
+                    "body_text": "hello back",
+                    "quoted_text": None,
+                },
             ],
             "header_profiles": [],
-            "viewer_urn": "ACoAA_VIEWER_URN",
+            "viewer_urn": "ACoAA_VIEWER",
         }
         extractor = self._make_extractor()
-        _, members = extractor._normalize_conversation_events(raw)
-        assert members == [
-            {
-                "kind": "person",
-                "url": "/in/ACoAA_VIEWER_URN/",
-                "name": "Authenticated User",
-                "is_self": True,
-            },
-        ]
+        messages, members = extractor._normalize_conversation_events(raw)
+        # Self lives at index 0 even though "other" appears first in events.
+        assert members[0]["is_self"] is True
+        assert members[0]["url"] == "/in/ACoAA_VIEWER/"
+        assert members[1]["is_self"] is False
+        assert members[1]["url"] == "/in/ACoAA_OTHER/"
+        # Sender indices reference the ordered list: 0 for self, 1 for other.
+        assert [m["sender"] for m in messages] == [1, 0]
 
-    def test_is_self_omitted_when_viewer_urn_absent(self):
-        """If JS couldn't determine the viewer URN (no events yet), no member
-        is flagged as self — backwards-compatible silent fallback."""
+    def test_self_synthesized_when_viewer_urn_unobserved(self):
+        """If viewer URN is known but the viewer never appears as a sender
+        anchor (rare — happens when LinkedIn always omits the link), still
+        synthesize a self member at index 0 from the viewer URN."""
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Feb 16, 2026",
+                    "time_text": "9:01 AM",
+                    "sender_url": None,
+                    "sender_name": None,
+                    "body_text": "I sent this with no anchor",
+                    "quoted_text": None,
+                },
+                {
+                    "day_heading": None,
+                    "time_text": "9:02 AM",
+                    "sender_url": "/in/ACoAA_OTHER/",
+                    "sender_name": "Other Person",
+                    "body_text": "reply",
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [],
+            "viewer_urn": "ACoAA_VIEWER",
+        }
+        extractor = self._make_extractor()
+        messages, members = extractor._normalize_conversation_events(raw)
+        # Self synthesized from viewer URN — no name available.
+        assert members[0] == {
+            "kind": "person",
+            "url": "/in/ACoAA_VIEWER/",
+            "is_self": True,
+        }
+        assert members[1]["is_self"] is False
+        assert [m["sender"] for m in messages] == [0, 1]
+
+    def test_is_self_false_on_everyone_when_viewer_urn_absent(self):
+        """If JS couldn't determine the viewer URN (e.g. no events yet),
+        is_self is False everywhere — but the field is still always present."""
         raw = {
             "events": [
                 {
@@ -4503,7 +4518,29 @@ class TestNormalizeConversationEvents:
         }
         extractor = self._make_extractor()
         _, members = extractor._normalize_conversation_events(raw)
-        assert all("is_self" not in m for m in members)
+        # is_self present on every member, always False.
+        assert all(m["is_self"] is False for m in members)
+
+    def test_orphan_event_without_attribution_is_skipped(self):
+        """An event with no sender_url AND no viewer URN can't be attributed
+        and is dropped — consistent with V1 attachment-skip behavior."""
+        raw = {
+            "events": [
+                {
+                    "day_heading": "Feb 10, 2024",
+                    "time_text": "3:17 PM",
+                    "sender_url": None,
+                    "sender_name": None,
+                    "body_text": "orphan",
+                    "quoted_text": None,
+                },
+            ],
+            "header_profiles": [],
+            "viewer_urn": None,
+        }
+        extractor = self._make_extractor()
+        messages, _ = extractor._normalize_conversation_events(raw)
+        assert messages == []
 
     def test_header_profile_adds_silent_participant(self):
         """A participant who hasn't sent a visible message still appears via header."""

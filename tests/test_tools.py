@@ -694,11 +694,18 @@ class TestMessagingTools:
                     {
                         "timestamp": "2026-02-10T15:17:00",
                         "status": "sent",
-                        "sender": "/in/alice/",
+                        "sender": 0,
                         "content": "Hello!",
                     }
                 ],
-                "members": [{"kind": "person", "url": "/in/alice/", "name": "Alice"}],
+                "members": [
+                    {
+                        "kind": "person",
+                        "url": "/in/alice/",
+                        "name": "Alice",
+                        "is_self": True,
+                    },
+                ],
             },
         }
         mock_extractor = _make_mock_extractor(expected)
