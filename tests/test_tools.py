@@ -1151,7 +1151,7 @@ class TestNetworkTools:
                     "type": "page_follow",
                     "invitation_age": "1h",
                     "sender": {
-                        "name": "juanmanuelperez",
+                        "name": "Juan Manuel M. Pérez",
                         "url": "/in/juanmanuelperez/",
                         "headline": None,
                         "mutual_connections": None,

@@ -270,24 +270,25 @@ _INVITATION_CARDS_JS = r"""
     }
   };
   const ageFromLines = lines => {
+    const units = 'h|hr|hrs|hour|hours|heure|heures|d|day|days|j|jour|jours|w|week|weeks|sem|semaine|semaines|m|mo|month|months|mois';
     const exact = lines
-      .map(line => line.match(/^(\d+)\s*(h|hr|hrs|hour|hours|d|day|days|w|week|weeks|m|mo|month|months)(?:\s+ago)?$/i))
+      .map(line => line.match(new RegExp(`^(\\d+)\\s*(${units})(?:\\s+ago)?$`, 'i')))
       .find(Boolean);
-    const found = exact || normalize(lines.join(' ')).match(/\b(\d+)\s*(h|hr|hrs|hour|hours|d|day|days|w|week|weeks|m|mo|month|months)(?:\s+ago)?\b/i);
+    const found = exact || normalize(lines.join(' ')).match(new RegExp(`\\b(\\d+)\\s*(${units})(?:\\s+ago)?\\b`, 'i'));
     if (!found) return null;
     const rawUnit = found[2].toLowerCase();
     const unit = rawUnit.startsWith('h')
       ? 'h'
-      : rawUnit.startsWith('d')
+      : rawUnit.startsWith('d') || rawUnit.startsWith('j')
         ? 'd'
-        : rawUnit.startsWith('w')
+        : rawUnit.startsWith('w') || rawUnit.startsWith('sem')
           ? 'w'
           : 'm';
     return `${found[1]}${unit}`;
   };
   const mutualCountFromText = text => {
     const normalized = normalize(text);
-    if (!/\bmutual\b/i.test(normalized)) return 0;
+    if (!/\b(mutual|relations?\s+en\s+commun)\b/i.test(normalized)) return 0;
     const otherMatch = normalized.match(
       /(\d[\d,.\s]*)\s+other(?:s)?(?:\s+mutual)?/i
     );
@@ -300,13 +301,41 @@ _INVITATION_CARDS_JS = r"""
       const count = Number.parseInt(countMatch[1].replace(/[^\d]/g, ''), 10);
       return Number.isFinite(count) ? count : 0;
     }
+    const frenchOtherMatch = normalized.match(
+      /\bet\s+(\d[\d,.\s]*)\s+relations?\s+en\s+commun/i
+    );
+    if (frenchOtherMatch) {
+      const count = Number.parseInt(frenchOtherMatch[1].replace(/[^\d]/g, ''), 10);
+      return Number.isFinite(count) ? count + 1 : 1;
+    }
+    const frenchCountMatch = normalized.match(
+      /(\d[\d,.\s]*)\s+relations?\s+en\s+commun/i
+    );
+    if (frenchCountMatch) {
+      const count = Number.parseInt(frenchCountMatch[1].replace(/[^\d]/g, ''), 10);
+      return Number.isFinite(count) ? count : 0;
+    }
+    if (/\brelations?\s+en\s+commun\b/i.test(normalized)) return 1;
     return 1;
   };
   const bestAnchorText = anchor => {
-    const firstLine = linesFrom(anchor)[0];
-    if (firstLine) return firstLine;
+    const directText = normalize(anchor.textContent);
+    if (directText) return directText;
     const imgAlt = anchor.querySelector('img[alt]')?.getAttribute('alt');
     return normalize(imgAlt) || null;
+  };
+  const isImageOnlyAnchor = anchor => {
+    return !normalize(anchor.textContent) && !!anchor.querySelector('img[alt]');
+  };
+  const senderNameFromProfileLink = link => {
+    const text = link?.text;
+    if (!text) return null;
+    const cleaned = text
+      .replace(/\s+follows you\b.*$/i, '')
+      .replace(/\s+is inviting you\b.*$/i, '')
+      .replace(/\s+invited you\b.*$/i, '')
+      .trim();
+    return cleaned || text;
   };
   const noteText = (card, buttonTexts) => {
     const noteRoot = card.querySelector(
@@ -321,35 +350,85 @@ _INVITATION_CARDS_JS = r"""
   const headlineFromLines = (lines, senderName, note, buttonTexts) => {
     for (const line of lines) {
       if (line === senderName) continue;
+      if (senderName && line.startsWith(senderName)) continue;
       if (line === note) continue;
       if (buttonTexts.has(line)) continue;
-      if (/^(\d+)\s*(h|d|w|m|mo)$/i.test(line)) continue;
-      if (/\bmutual\b/i.test(line)) continue;
+      if (/^(\d+)\s*(h|hr|hrs|hour|hours|heure|heures|d|day|days|j|jour|jours|w|week|weeks|sem|semaine|semaines|m|mo|month|months|mois)(?:\s+ago)?$/i.test(line)) continue;
+      if (/\b(mutual|relations?\s+en\s+commun)\b/i.test(line)) continue;
+      if (/\b(follows you|invit|vous suit)\b/i.test(line)) continue;
       return line;
     }
     return null;
   };
-  const cardForAnchor = anchor => {
-    const candidates = [
-      anchor.closest('li'),
-      anchor.closest('article'),
-      anchor.closest('[data-view-name]'),
-      anchor.closest('section'),
-      anchor.parentElement,
-    ];
-    return candidates.find(candidate => candidate && root.contains(candidate)) || null;
+  const visible = el => {
+    if (!el || !el.getClientRects) return false;
+    if (el.disabled) return false;
+    const rects = el.getClientRects();
+    if (!rects.length) return false;
+    const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+    return !style || (style.display !== 'none' && style.visibility !== 'hidden');
+  };
+  const identitySelector =
+    'a[href*="/in/"], a[href*="/company/"], a[href*="/showcase/"], a[href*="/newsletters/"]';
+  const actionControls = el => Array.from(
+    el.querySelectorAll('button, [role="button"]')
+  )
+    .filter(visible)
+    .filter(button => button.getAttribute('data-testid') !== 'expandable-text-button')
+    .filter(button => !button.closest('[data-testid="expandable-text-box"]'))
+    .filter(button => !button.closest('a[href]'))
+    .filter(button => linesFrom(button).length > 0 || button.hasAttribute('aria-label'));
+  const hasInvitationIdentity = el => !!el.querySelector(identitySelector);
+  const cardForActionControl = button => {
+    let el = button.parentElement;
+    while (el && el !== root) {
+      const actions = actionControls(el);
+      if (
+        visible(el) &&
+        hasInvitationIdentity(el) &&
+        cardText(el) &&
+        actions.length > 0 &&
+        actions.length <= 4
+      ) {
+        return el;
+      }
+      el = el.parentElement;
+    }
+    return null;
+  };
+  const outerInvitationCard = card => {
+    if (!card) return null;
+    const outer = card.closest('li, article');
+    if (
+      outer &&
+      root.contains(outer) &&
+      visible(outer) &&
+      hasInvitationIdentity(outer) &&
+      actionControls(outer).length > 0 &&
+      actionControls(outer).length <= 4
+    ) {
+      return outer;
+    }
+    return card;
   };
 
-  const result = [];
+  const cards = [];
   const seen = new WeakSet();
-  const anchors = root.querySelectorAll(
-    'a[href*="/in/"], a[href*="/company/"], a[href*="/showcase/"], a[href*="/newsletters/"]'
-  );
-  for (const anchor of anchors) {
-    const card = cardForAnchor(anchor);
+  for (const button of actionControls(root)) {
+    const card = outerInvitationCard(cardForActionControl(button));
     if (!card || seen.has(card)) continue;
     seen.add(card);
+    const rect = card.getBoundingClientRect();
+    cards.push({ card, rect, index: cards.length });
+  }
+  cards.sort((a, b) => (
+    (a.rect.top - b.rect.top) ||
+    (a.rect.left - b.rect.left) ||
+    (a.index - b.index)
+  ));
 
+  const result = [];
+  for (const { card } of cards) {
     const cardLines = linesFrom(card);
     const buttonTexts = new Set(
       Array.from(card.querySelectorAll('button, [role="button"]')).flatMap(linesFrom)
@@ -358,10 +437,15 @@ _INVITATION_CARDS_JS = r"""
       anchor: link,
       path: linkedInPath(link.getAttribute('href') || link.href),
       text: bestAnchorText(link),
+      image_only: isImageOnlyAnchor(link),
     }));
-    const profileLink = links.find(link => /^\/in\/[^/?#]+\/?/.test(link.path));
-    const pageLink = links.find(link => /^\/(?:company|showcase)\/[^/?#]+\/?/.test(link.path));
-    const newsletterLink = links.find(link => /^\/newsletters\/[^/?#]+\/?/.test(link.path));
+    const bestLink = predicate => {
+      const matches = links.filter(predicate);
+      return matches.find(link => !link.image_only) || matches[0];
+    };
+    const profileLink = bestLink(link => /^\/in\/[^/?#]+\/?/.test(link.path));
+    const pageLink = bestLink(link => /^\/(?:company|showcase)\/[^/?#]+\/?/.test(link.path));
+    const newsletterLink = bestLink(link => /^\/newsletters\/[^/?#]+\/?/.test(link.path));
     const messageLink = links.find(link => link.path.includes('/messaging/'));
 
     const type = newsletterLink
@@ -374,7 +458,7 @@ _INVITATION_CARDS_JS = r"""
     if (type === 'newsletter_subscription' && !newsletterLink) continue;
 
     const note = type === 'connection_request' ? noteText(card, buttonTexts) : null;
-    const senderName = profileLink?.text || null;
+    const senderName = senderNameFromProfileLink(profileLink);
     const text = cardText(card);
     result.push({
       type,
@@ -629,7 +713,8 @@ def _normalize_invitation_age(*values: Any) -> str | None:
             continue
         match = re.search(
             r"\b(\d+)\s*"
-            r"(h|hr|hrs|hour|hours|d|day|days|w|week|weeks|m|mo|month|months)"
+            r"(h|hr|hrs|hour|hours|heure|heures|d|day|days|j|jour|jours|"
+            r"w|week|weeks|sem|semaine|semaines|m|mo|month|months|mois)"
             r"(?:\s+ago)?\b",
             text,
             flags=re.IGNORECASE,
@@ -639,9 +724,9 @@ def _normalize_invitation_age(*values: Any) -> str | None:
         raw_unit = match.group(2).lower()
         if raw_unit.startswith("h"):
             unit = "h"
-        elif raw_unit.startswith("d"):
+        elif raw_unit.startswith(("d", "j")):
             unit = "d"
-        elif raw_unit.startswith("w"):
+        elif raw_unit.startswith(("w", "sem")):
             unit = "w"
         else:
             unit = "m"
@@ -656,7 +741,9 @@ def _invitation_mutual_connections(
         return None
 
     text = _optional_text(raw_text)
-    if text and re.search(r"\bmutual\b", text, flags=re.IGNORECASE):
+    if text and re.search(
+        r"\b(mutual|relations?\s+en\s+commun)\b", text, flags=re.IGNORECASE
+    ):
         other_match = re.search(
             r"(\d[\d,.\s]*)\s+other(?:s)?(?:\s+mutual)?",
             text,
@@ -672,6 +759,27 @@ def _invitation_mutual_connections(
         )
         if count_match:
             return _coerce_non_negative_int(count_match.group(1).replace(",", ""))
+
+        french_other_match = re.search(
+            r"\bet\s+(\d[\d,.\s]*)\s+relations?\s+en\s+commun",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if french_other_match:
+            return (
+                _coerce_non_negative_int(french_other_match.group(1).replace(",", ""))
+                + 1
+            )
+
+        french_count_match = re.search(
+            r"(\d[\d,.\s]*)\s+relations?\s+en\s+commun",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if french_count_match:
+            return _coerce_non_negative_int(
+                french_count_match.group(1).replace(",", "")
+            )
 
         return 1
 

@@ -17,6 +17,7 @@ from linkedin_mcp_server.scraping.connection import (
 from linkedin_mcp_server.scraping.extractor import (
     ExtractedSection,
     LinkedInExtractor,
+    _INVITATION_CARDS_JS,
     _RATE_LIMITED_MSG,
     _build_feed_references,
     _normalize_structured_invitation,
@@ -3664,6 +3665,11 @@ class TestGetInbox:
 
 
 class TestInvitationManagement:
+    def test_invitation_card_script_uses_visual_card_order(self):
+        assert "for (const button of actionControls(root))" in _INVITATION_CARDS_JS
+        assert "getBoundingClientRect()" in _INVITATION_CARDS_JS
+        assert "cards.sort" in _INVITATION_CARDS_JS
+
     @pytest.mark.parametrize(
         ("text", "expected"),
         [
@@ -3671,6 +3677,8 @@ class TestInvitationManagement:
             ("Hugo Attal mutual connection", 1),
             ("3 mutual connections", 3),
             ("Hugo Attal and 2 other mutual connections", 3),
+            ("Hugo Attal et 2 relations en commun", 3),
+            ("3 relations en commun", 3),
         ],
     )
     def test_connection_request_mutual_count_rules(self, text, expected):
@@ -3685,6 +3693,27 @@ class TestInvitationManagement:
         assert invitation is not None
         assert invitation["sender"]["mutual_connections"] == expected
 
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("1 hour ago", "1h"),
+            ("Il y a 18 heures", "18h"),
+            ("5 days ago", "5d"),
+            ("Il y a 5 jours", "5d"),
+        ],
+    )
+    def test_invitation_age_rules(self, text, expected):
+        invitation = _normalize_structured_invitation(
+            {
+                "type": "connection_request",
+                "sender": {"name": "Ayoub Chalabi", "url": "/in/ayoub-chalabi/"},
+                "text": text,
+            }
+        )
+
+        assert invitation is not None
+        assert invitation["invitation_age"] == expected
+
     async def test_get_pending_invitations_received(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
         invitations = [
@@ -3692,7 +3721,7 @@ class TestInvitationManagement:
                 "type": "page_follow",
                 "invitation_age": "1h",
                 "sender": {
-                    "name": "juanmanuelperez",
+                    "name": "Juan Manuel M. Pérez",
                     "url": "/in/juanmanuelperez/",
                     "headline": None,
                     "mutual_connections": None,
@@ -3709,11 +3738,11 @@ class TestInvitationManagement:
             },
             {
                 "type": "connection_request",
-                "invitation_age": "17h",
+                "invitation_age": "18h",
                 "sender": {
                     "name": "Ayoub Chalabi",
                     "url": "/in/ayoub-chalabi/",
-                    "headline": "Co-founder at Example",
+                    "headline": "Co-founder & CTO @ Learnrithm AI (SCV X26)",
                     "mutual_connections": 3,
                 },
                 "note": None,
@@ -3806,7 +3835,7 @@ class TestInvitationManagement:
                     "type": "page_follow",
                     "invitation_age": "1 hour ago",
                     "sender": {
-                        "name": "juanmanuelperez",
+                        "name": "Juan Manuel M. Pérez",
                         "url": "/in/juanmanuelperez/",
                         "headline": "Ignored headline",
                         "mutual_connections": 4,
@@ -3826,9 +3855,9 @@ class TestInvitationManagement:
                     "sender": {
                         "name": "Ayoub Chalabi",
                         "url": "/in/ayoub-chalabi/",
-                        "headline": "Co-founder at Example",
+                        "headline": "Co-founder & CTO @ Learnrithm AI (SCV X26)",
                     },
-                    "text": "Ayoub Chalabi Co-founder at Example Hugo Attal and 2 other mutual connections 17 hours ago",
+                    "text": "Ayoub Chalabi follows you and is inviting you to connect Co-founder & CTO @ Learnrithm AI (SCV X26) Hugo Attal and 2 other mutual connections 18 hours ago",
                     "target": {"page": {"name": "Ignored", "url": "/company/x/"}},
                     "message_url": "/messaging/compose/?recipient=ayoub-chalabi",
                 },
@@ -3859,7 +3888,7 @@ class TestInvitationManagement:
                 "type": "page_follow",
                 "invitation_age": "1h",
                 "sender": {
-                    "name": "juanmanuelperez",
+                    "name": "Juan Manuel M. Pérez",
                     "url": "/in/juanmanuelperez/",
                     "headline": None,
                     "mutual_connections": None,
@@ -3876,11 +3905,11 @@ class TestInvitationManagement:
             },
             {
                 "type": "connection_request",
-                "invitation_age": "17h",
+                "invitation_age": "18h",
                 "sender": {
                     "name": "Ayoub Chalabi",
                     "url": "/in/ayoub-chalabi/",
-                    "headline": "Co-founder at Example",
+                    "headline": "Co-founder & CTO @ Learnrithm AI (SCV X26)",
                     "mutual_connections": 3,
                 },
                 "note": None,
