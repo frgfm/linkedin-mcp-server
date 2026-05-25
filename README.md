@@ -43,8 +43,8 @@ Through this LinkedIn MCP server, AI assistants like Claude can connect to your 
 
 `get_pending_invitations` returns `{url, invitations}`. Each invitation exposes
 `type` (`connection_request`, `page_follow`, or `newsletter_subscription`),
-`invitation_age`, `sender`, optional `note`, `target`, and `message_url` for
-follow-up triage without parsing raw page text.
+`invitation_age` (`min`, `h`, `d`, `w`, or `mo`), `sender`, optional `note`,
+`target`, and `message_url` for follow-up triage without parsing raw page text.
 
 <br/>
 <br/>

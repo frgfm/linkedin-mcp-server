@@ -3669,6 +3669,7 @@ class TestInvitationManagement:
         assert "for (const button of actionControls(root))" in _INVITATION_CARDS_JS
         assert "getBoundingClientRect()" in _INVITATION_CARDS_JS
         assert "cards.sort" in _INVITATION_CARDS_JS
+        assert 'a[href*="/school/"]' in _INVITATION_CARDS_JS
 
     @pytest.mark.parametrize(
         ("text", "expected"),
@@ -3697,9 +3698,13 @@ class TestInvitationManagement:
         ("text", "expected"),
         [
             ("1 hour ago", "1h"),
+            ("23 minutes ago", "23min"),
             ("Il y a 18 heures", "18h"),
             ("5 days ago", "5d"),
             ("Il y a 5 jours", "5d"),
+            ("1 month ago", "1mo"),
+            ("Il y a 1 mois", "1mo"),
+            ("1m", "1mo"),
         ],
     )
     def test_invitation_age_rules(self, text, expected):
@@ -3850,6 +3855,20 @@ class TestInvitationManagement:
                     "message_url": "/messaging/compose/?recipient=alice",
                 },
                 {
+                    "type": "page_follow",
+                    "invitation_age": "1 hour ago",
+                    "sender": {
+                        "name": "Juan Manuel M. Pérez",
+                        "url": "/in/juanmanuelperez/",
+                    },
+                    "target": {
+                        "page": {
+                            "name": "Magical Potion Consulting",
+                            "url": "/company/magical-potion-consulting/",
+                        }
+                    },
+                },
+                {
                     "type": "connection_request",
                     "invitation_age": None,
                     "sender": {
@@ -3865,9 +3884,9 @@ class TestInvitationManagement:
                     "type": "newsletter_subscription",
                     "text": "The Example Brief 1 month ago",
                     "sender": {
-                        "name": "Carol Lee",
-                        "url": "/in/carol/",
-                        "mutual_connections": 2,
+                        "name": "CentraleSupélec",
+                        "url": "/school/centralesupelec/",
+                        "mutual_connections": None,
                     },
                     "target": {
                         "newsletter": {
@@ -3883,6 +3902,9 @@ class TestInvitationManagement:
 
         cards = await extractor._extract_invitation_cards(kind="sent", limit=10)
 
+        evaluate_args = mock_page.evaluate.await_args
+        assert evaluate_args is not None
+        assert evaluate_args.args[1] == {"kind": "sent", "limit": 20}
         assert cards == [
             {
                 "type": "page_follow",
@@ -3918,10 +3940,10 @@ class TestInvitationManagement:
             },
             {
                 "type": "newsletter_subscription",
-                "invitation_age": "1m",
+                "invitation_age": "1mo",
                 "sender": {
-                    "name": "Carol Lee",
-                    "url": "/in/carol/",
+                    "name": "CentraleSupélec",
+                    "url": "/school/centralesupelec/",
                     "headline": None,
                     "mutual_connections": None,
                 },

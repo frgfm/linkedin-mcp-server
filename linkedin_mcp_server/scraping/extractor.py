@@ -270,20 +270,22 @@ _INVITATION_CARDS_JS = r"""
     }
   };
   const ageFromLines = lines => {
-    const units = 'h|hr|hrs|hour|hours|heure|heures|d|day|days|j|jour|jours|w|week|weeks|sem|semaine|semaines|m|mo|month|months|mois';
+    const units = 'min|mins|minute|minutes|h|hr|hrs|hour|hours|heure|heures|d|day|days|j|jour|jours|w|week|weeks|sem|semaine|semaines|m|mo|month|months|mois';
     const exact = lines
       .map(line => line.match(new RegExp(`^(\\d+)\\s*(${units})(?:\\s+ago)?$`, 'i')))
       .find(Boolean);
     const found = exact || normalize(lines.join(' ')).match(new RegExp(`\\b(\\d+)\\s*(${units})(?:\\s+ago)?\\b`, 'i'));
     if (!found) return null;
     const rawUnit = found[2].toLowerCase();
-    const unit = rawUnit.startsWith('h')
+    const unit = rawUnit.startsWith('min')
+      ? 'min'
+      : rawUnit.startsWith('h')
       ? 'h'
       : rawUnit.startsWith('d') || rawUnit.startsWith('j')
         ? 'd'
         : rawUnit.startsWith('w') || rawUnit.startsWith('sem')
           ? 'w'
-          : 'm';
+          : 'mo';
     return `${found[1]}${unit}`;
   };
   const mutualCountFromText = text => {
@@ -369,7 +371,7 @@ _INVITATION_CARDS_JS = r"""
     return !style || (style.display !== 'none' && style.visibility !== 'hidden');
   };
   const identitySelector =
-    'a[href*="/in/"], a[href*="/company/"], a[href*="/showcase/"], a[href*="/newsletters/"]';
+    'a[href*="/in/"], a[href*="/company/"], a[href*="/showcase/"], a[href*="/school/"], a[href*="/newsletters/"]';
   const actionControls = el => Array.from(
     el.querySelectorAll('button, [role="button"]')
   )
@@ -444,6 +446,7 @@ _INVITATION_CARDS_JS = r"""
       return matches.find(link => !link.image_only) || matches[0];
     };
     const profileLink = bestLink(link => /^\/in\/[^/?#]+\/?/.test(link.path));
+    const organizationLink = bestLink(link => /^\/(?:company|showcase|school)\/[^/?#]+\/?/.test(link.path));
     const pageLink = bestLink(link => /^\/(?:company|showcase)\/[^/?#]+\/?/.test(link.path));
     const newsletterLink = bestLink(link => /^\/newsletters\/[^/?#]+\/?/.test(link.path));
     const messageLink = links.find(link => link.path.includes('/messaging/'));
@@ -458,7 +461,12 @@ _INVITATION_CARDS_JS = r"""
     if (type === 'newsletter_subscription' && !newsletterLink) continue;
 
     const note = type === 'connection_request' ? noteText(card, buttonTexts) : null;
-    const senderName = senderNameFromProfileLink(profileLink);
+    const senderLink = type === 'newsletter_subscription'
+      ? (organizationLink || profileLink)
+      : profileLink;
+    const senderName = type === 'newsletter_subscription'
+      ? (senderLink?.text || null)
+      : senderNameFromProfileLink(senderLink);
     const text = cardText(card);
     result.push({
       type,
@@ -466,7 +474,7 @@ _INVITATION_CARDS_JS = r"""
       text,
       sender: {
         name: senderName,
-        url: profileLink?.path || null,
+        url: senderLink?.path || null,
         headline: type === 'connection_request'
           ? headlineFromLines(cardLines, senderName, note, buttonTexts)
           : null,
@@ -713,8 +721,9 @@ def _normalize_invitation_age(*values: Any) -> str | None:
             continue
         match = re.search(
             r"\b(\d+)\s*"
-            r"(h|hr|hrs|hour|hours|heure|heures|d|day|days|j|jour|jours|"
-            r"w|week|weeks|sem|semaine|semaines|m|mo|month|months|mois)"
+            r"(min|mins|minute|minutes|h|hr|hrs|hour|hours|heure|heures|"
+            r"d|day|days|j|jour|jours|w|week|weeks|sem|semaine|semaines|"
+            r"m|mo|month|months|mois)"
             r"(?:\s+ago)?\b",
             text,
             flags=re.IGNORECASE,
@@ -724,12 +733,14 @@ def _normalize_invitation_age(*values: Any) -> str | None:
         raw_unit = match.group(2).lower()
         if raw_unit.startswith("h"):
             unit = "h"
+        elif raw_unit.startswith("min"):
+            unit = "min"
         elif raw_unit.startswith(("d", "j")):
             unit = "d"
         elif raw_unit.startswith(("w", "sem")):
             unit = "w"
         else:
-            unit = "m"
+            unit = "mo"
         return f"{match.group(1)}{unit}"
     return None
 
@@ -869,6 +880,25 @@ def _normalize_structured_invitation(raw: Any) -> dict[str, Any] | None:
             else None
         ),
     }
+
+
+def _invitation_identity_key(invitation: dict[str, Any]) -> tuple[str, str, str, str]:
+    raw_sender = invitation.get("sender")
+    sender: dict[str, Any] = raw_sender if isinstance(raw_sender, dict) else {}
+    raw_target = invitation.get("target")
+    target: dict[str, Any] = raw_target if isinstance(raw_target, dict) else {}
+    raw_page = target.get("page")
+    page: dict[str, Any] = raw_page if isinstance(raw_page, dict) else {}
+    raw_newsletter = target.get("newsletter")
+    newsletter: dict[str, Any] = (
+        raw_newsletter if isinstance(raw_newsletter, dict) else {}
+    )
+    return (
+        str(invitation.get("type") or ""),
+        str(sender.get("url") or ""),
+        str(page.get("url") or ""),
+        str(newsletter.get("url") or ""),
+    )
 
 
 def _normalize_csv(value: str, mapping: dict[str, str]) -> str:
@@ -4043,7 +4073,7 @@ class LinkedInExtractor:
         try:
             raw_cards = await self._page.evaluate(
                 _INVITATION_CARDS_JS,
-                {"kind": kind, "limit": limit},
+                {"kind": kind, "limit": min(limit * 2, 200)},
             )
         except Exception:
             logger.debug("Invitation card extraction failed", exc_info=True)
@@ -4052,10 +4082,17 @@ class LinkedInExtractor:
             return []
 
         cards: list[dict[str, Any]] = []
-        for raw in raw_cards[:limit]:
+        seen_keys: set[tuple[str, str, str, str]] = set()
+        for raw in raw_cards:
             invitation = _normalize_structured_invitation(raw)
             if invitation:
+                key = _invitation_identity_key(invitation)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
                 cards.append(invitation)
+                if len(cards) >= limit:
+                    break
         return cards
 
     async def accept_invitation(
