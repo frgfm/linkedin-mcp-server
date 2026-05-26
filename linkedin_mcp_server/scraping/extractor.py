@@ -270,13 +270,6 @@ _INVITATION_CARDS_JS = r"""
       return '';
     }
   };
-  const linkedInUrl = href => {
-    try {
-      return new URL(href, location.origin).toString();
-    } catch {
-      return '';
-    }
-  };
   const ageLineMatch = line => line.match(
     new RegExp(`^(?:(?:sent|envoyé|envoyée)\\s+)?(?:il\\s+y\\s+a\\s+)?(\\d+)\\s*(${ageUnits})(?:\\s+ago)?$`, 'i')
   );
@@ -428,18 +421,24 @@ _INVITATION_CARDS_JS = r"""
   };
   const outerInvitationCard = card => {
     if (!card) return null;
-    const outer = card.closest('[role="listitem"], li, article');
-    if (
-      outer &&
-      root.contains(outer) &&
-      visible(outer) &&
-      hasInvitationIdentity(outer) &&
-      actionControls(outer).length > 0 &&
-      actionControls(outer).length <= 4
-    ) {
-      return outer;
+    // No-note connection requests render the Message link as a sibling of the
+    // action row, so keep climbing until the parent contains another invite.
+    let candidate = card;
+    let el = card.parentElement;
+    while (el && el !== root) {
+      const actions = actionControls(el);
+      if (actions.length > 4) break;
+      if (
+        visible(el) &&
+        hasInvitationIdentity(el) &&
+        cardText(el) &&
+        actions.length > 0
+      ) {
+        candidate = el;
+      }
+      el = el.parentElement;
     }
-    return card;
+    return candidate;
   };
 
   const cards = [];
@@ -466,7 +465,6 @@ _INVITATION_CARDS_JS = r"""
     const links = Array.from(card.querySelectorAll('a[href]')).map(link => ({
       anchor: link,
       path: linkedInPath(link.getAttribute('href') || link.href),
-      url: linkedInUrl(link.getAttribute('href') || link.href),
       text: bestAnchorText(link),
       image_only: isImageOnlyAnchor(link),
     }));
@@ -539,7 +537,7 @@ _INVITATION_CARDS_JS = r"""
               ? { title: newsletterLink.text, url: newsletterLink.path }
               : null,
           },
-      message_url: type === 'connection_request' ? (messageLink?.url || null) : null,
+      message_url: type === 'connection_request' ? (messageLink?.path || null) : null,
     });
     if (limit && result.length >= limit) break;
   }

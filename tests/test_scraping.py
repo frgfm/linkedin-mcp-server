@@ -3684,11 +3684,11 @@ class TestInvitationManagement:
         assert "recipient:" in _INVITATION_CARDS_JS
         assert "sent|envoyé|envoyée" in _INVITATION_CARDS_JS
         assert "a[aria-label][href]" in _INVITATION_CARDS_JS
-        assert '[role="listitem"]' in _INVITATION_CARDS_JS
         assert "profile\\s+(?:photo|picture)" in _INVITATION_CARDS_JS
         assert "return senderNameFromProfileLink(profileLink);" in _INVITATION_CARDS_JS
-        assert "url: linkedInUrl" in _INVITATION_CARDS_JS
-        assert "messageLink?.url" in _INVITATION_CARDS_JS
+        assert "let candidate = card;" in _INVITATION_CARDS_JS
+        assert "if (actions.length > 4) break;" in _INVITATION_CARDS_JS
+        assert "messageLink?.path" in _INVITATION_CARDS_JS
         assert "^\\/messaging\\/compose\\/" in _INVITATION_CARDS_JS
 
     @pytest.mark.parametrize(
@@ -3772,7 +3772,7 @@ class TestInvitationManagement:
                 },
                 "note": None,
                 "target": None,
-                "message_url": "https://www.linkedin.com/messaging/compose/?recipient=ayoub-chalabi",
+                "message_url": "/messaging/compose/?recipient=ayoub-chalabi",
             },
         ]
         with (
@@ -3970,7 +3970,7 @@ class TestInvitationManagement:
                     },
                     "text": "Ayoub Chalabi follows you and is inviting you to connect Co-founder & CTO @ Learnrithm AI (SCV X26) Hugo Attal and 2 other mutual connections 18 hours ago",
                     "target": {"page": {"name": "Ignored", "url": "/company/x/"}},
-                    "message_url": "https://www.linkedin.com/messaging/compose/?recipient=ACoAAAqI0hgB6hz3TEqrc9e4jwzIth2jHkAWxjk&invitation=urn%3Ali%3Afsd_invitation%3A7464720462661468161&contextEntityUrn=urn%3Ali%3Afsd_invitation%3A7464720462661468161&recipients=List%28urn%3Ali%3Afsd_profile%3AACoAAAqI0hgB6hz3TEqrc9e4jwzIth2jHkAWxjk%29",
+                    "message_url": "/messaging/compose/?recipient=ACoAAAqI0hgB6hz3TEqrc9e4jwzIth2jHkAWxjk&invitation=urn%3Ali%3Afsd_invitation%3A7464720462661468161&contextEntityUrn=urn%3Ali%3Afsd_invitation%3A7464720462661468161&recipients=List%28urn%3Ali%3Afsd_profile%3AACoAAAqI0hgB6hz3TEqrc9e4jwzIth2jHkAWxjk%29",
                 },
                 {
                     "type": "newsletter_subscription",
@@ -4028,7 +4028,7 @@ class TestInvitationManagement:
                 },
                 "note": None,
                 "target": None,
-                "message_url": "https://www.linkedin.com/messaging/compose/?recipient=ACoAAAqI0hgB6hz3TEqrc9e4jwzIth2jHkAWxjk&invitation=urn%3Ali%3Afsd_invitation%3A7464720462661468161&contextEntityUrn=urn%3Ali%3Afsd_invitation%3A7464720462661468161&recipients=List%28urn%3Ali%3Afsd_profile%3AACoAAAqI0hgB6hz3TEqrc9e4jwzIth2jHkAWxjk%29",
+                "message_url": "/messaging/compose/?recipient=ACoAAAqI0hgB6hz3TEqrc9e4jwzIth2jHkAWxjk&invitation=urn%3Ali%3Afsd_invitation%3A7464720462661468161&contextEntityUrn=urn%3Ali%3Afsd_invitation%3A7464720462661468161&recipients=List%28urn%3Ali%3Afsd_profile%3AACoAAAqI0hgB6hz3TEqrc9e4jwzIth2jHkAWxjk%29",
             },
             {
                 "type": "newsletter_subscription",
