@@ -110,6 +110,10 @@
       "description": "List pending LinkedIn received invitations or sent connection requests as structured invitation records"
     },
     {
+      "name": "get_connections",
+      "description": "List the authenticated user's most recently added 1st-degree LinkedIn connections (name, profile URL, headline, connected_on ISO date)"
+    },
+    {
       "name": "get_feed",
       "description": "Get recent posts from the authenticated user's LinkedIn home feed"
     },

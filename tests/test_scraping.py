@@ -17,10 +17,14 @@ from linkedin_mcp_server.scraping.connection import (
 from linkedin_mcp_server.scraping.extractor import (
     ExtractedSection,
     LinkedInExtractor,
+    _CONNECTION_CARDS_JS,
     _INVITATION_CARDS_JS,
     _RATE_LIMITED_MSG,
     _build_feed_references,
+    _connection_identity_key,
+    _normalize_connection,
     _normalize_structured_invitation,
+    _parse_connected_on,
     _truncate_linkedin_noise,
     strip_linkedin_noise,
 )
@@ -5564,3 +5568,94 @@ class TestBuildFeedReferences:
             "/posts/alice_x-ugcPost-1-xx",
         ]
         assert kinds == {"feed_post"}
+
+
+class TestConnectionList:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("Connected on May 25, 2026", "2026-05-25"),
+            ("Connected on January 1, 2020", "2020-01-01"),
+            ("Connected on Dec 31, 1999", "1999-12-31"),
+            ("connected on jul 4, 2024", "2024-07-04"),
+            ("Some prefix · Connected on Feb 9, 2024 · suffix", "2024-02-09"),
+        ],
+    )
+    def test_parse_connected_on_en_us(self, text, expected):
+        assert _parse_connected_on(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            None,
+            "",
+            "   ",
+            "Mise en relation le 25 mai 2026",
+            "Connected on May 2026",
+            "Connected on Mai 25, 2026",
+            "Connected on May 32, 2026",
+        ],
+    )
+    def test_parse_connected_on_returns_none_for_unparseable(self, text):
+        assert _parse_connected_on(text) is None
+
+    def test_normalize_connection_full_record(self):
+        raw = {
+            "name": "  Rob Choy  ",
+            "profile_url": "/in/robchoy/",
+            "headline": "Founder & investor",
+            "connected_on_text": "Connected on May 25, 2026",
+        }
+        assert _normalize_connection(raw) == {
+            "name": "Rob Choy",
+            "url": "/in/robchoy/",
+            "headline": "Founder & investor",
+            "connected_on": "2026-05-25",
+        }
+
+    def test_normalize_connection_absolute_url_is_normalized(self):
+        raw = {
+            "name": "Santiago Moreno",
+            "profile_url": "https://www.linkedin.com/in/santiago-moreno-7098138b?miniProfileUrn=urn:li:fsd_profile:XYZ",
+            "headline": "Regional Operations Manager - RWE Renewables France",
+            "connected_on_text": "Connected on May 24, 2026",
+        }
+        result = _normalize_connection(raw)
+        assert result is not None
+        assert result["url"] == "/in/santiago-moreno-7098138b/"
+        assert result["connected_on"] == "2026-05-24"
+
+    def test_normalize_connection_drops_record_without_profile_url(self):
+        assert _normalize_connection({"name": "Anon", "profile_url": None}) is None
+        assert _normalize_connection({"name": "Anon"}) is None
+        assert _normalize_connection("not-a-dict") is None
+
+    def test_normalize_connection_surfaces_none_for_unparseable_date(self):
+        raw = {
+            "name": "Foreign Friend",
+            "profile_url": "/in/foreign/",
+            "headline": "Headline",
+            "connected_on_text": "Mise en relation le 24 mai 2026",
+        }
+        result = _normalize_connection(raw)
+        assert result is not None
+        assert result["connected_on"] is None
+
+    def test_connection_identity_key_dedupes_on_url(self):
+        a = {"url": "/in/robchoy/", "name": "Rob Choy"}
+        b = {"url": "/in/robchoy/", "name": "Robert Choy"}
+        c = {"url": "/in/santiago-moreno-7098138b/", "name": "Santiago Moreno"}
+        assert _connection_identity_key(a) == _connection_identity_key(b)
+        assert _connection_identity_key(a) != _connection_identity_key(c)
+
+    def test_connection_cards_script_uses_locale_independent_signals(self):
+        # Per AGENTS.md scraping rules: anchor-href URL patterns, not class
+        # names; minimal selectors; innerText-driven line classification.
+        assert 'a[href*="/in/"]' in _CONNECTION_CARDS_JS
+        assert "profileSlug" in _CONNECTION_CARDS_JS
+        assert "linesFrom" in _CONNECTION_CARDS_JS
+        assert "buttonTexts" in _CONNECTION_CARDS_JS
+        assert "connected_on_text" in _CONNECTION_CARDS_JS
+        # Headline / date selection must not depend on class names.
+        assert "className" not in _CONNECTION_CARDS_JS
+        assert "[class" not in _CONNECTION_CARDS_JS
