@@ -253,6 +253,35 @@ _OPEN_MORE_BUTTON_JS = (
 """
 )
 
+# Click the Pending control on the recipient's profile to open the
+# withdraw-confirm dialog. The Pending state is rendered as the labeled
+# action <a> inside the action root (see _ACTION_SIGNALS_JS comment block);
+# clicking it is what LinkedIn's UI does when the user clicks "Pending" on
+# a profile where they have an outstanding outgoing invitation. Caller
+# verifies that the labeled anchor really is Pending (and not e.g. Message)
+# by reading the connection state first via detect_connection_state.
+_CLICK_PENDING_WITHDRAW_JS = (
+    r"""
+(() => {
+"""
+    + _FIND_ACTION_ROOT_FN_JS
+    + r"""
+  const main = document.querySelector('main');
+  if (!main) return { found: false, clicked: false, reason: 'no_main' };
+  const actionRoot = findActionRoot(main);
+  if (!actionRoot) {
+    return { found: false, clicked: false, reason: 'no_action_root' };
+  }
+  const anchor = actionRoot.querySelector('a[aria-label][href]');
+  if (!anchor) {
+    return { found: false, clicked: false, reason: 'no_labeled_anchor' };
+  }
+  anchor.click();
+  return { found: true, clicked: true };
+})
+"""
+)
+
 _INVITATION_CARDS_JS = r"""
 ({ kind, limit }) => {
   const root = document.querySelector('main') || document.body;
@@ -4622,13 +4651,15 @@ class LinkedInExtractor:
                 break
         return cards
 
-    # Action -> (invitation manager kind, success status verb).
-    # All three actions share the same page-pipeline; only the page and the
-    # button-matching tokens (see _INVITATION_ACTION_JS) differ.
-    _INVITATION_ACTIONS: dict[str, tuple[Literal["received", "sent"], str]] = {
+    # Accept/ignore use the received invitation manager. Withdraw bypasses the
+    # invitation manager entirely (see _withdraw_outgoing_invitation) because
+    # the sent page is paginated and accounts with many outgoing requests can
+    # require many scrolls to surface a specific recipient — the profile page
+    # is one navigation and exposes the Pending control directly.
+    _INVITATION_ACTIONS: frozenset[str] = frozenset({"accept", "ignore", "withdraw"})
+    _INVITATION_MANAGER_ACTIONS: dict[str, tuple[Literal["received"], str]] = {
         "accept": ("received", "accepted"),
         "ignore": ("received", "ignored"),
-        "withdraw": ("sent", "withdrawn"),
     }
 
     async def act_on_invitation(
@@ -4638,17 +4669,23 @@ class LinkedInExtractor:
     ) -> dict[str, Any]:
         """Accept, ignore, or withdraw a pending invitation.
 
-        Navigates to the invitation manager (received for accept/ignore, sent
-        for withdraw), locates the card for ``linkedin_username``, clicks the
-        action button identified by stable engineering attributes, and verifies
-        the card disappeared.
+        Accept/ignore navigate to the received-invitations manager, locate the
+        card by username, and click the action button (identified via stable
+        engineering attributes with a documented UX-layout fallback). Withdraw
+        navigates directly to the recipient's profile and clicks the Pending
+        control — sidesteps the sent-page pagination cost for accounts with
+        many outstanding requests.
         """
         if action not in self._INVITATION_ACTIONS:
             raise ValueError(
                 f"Unknown invitation action: {action!r} "
                 f"(expected one of: {sorted(self._INVITATION_ACTIONS)})"
             )
-        kind, success_status = self._INVITATION_ACTIONS[action]
+
+        if action == "withdraw":
+            return await self._withdraw_outgoing_invitation(linkedin_username)
+
+        kind, success_status = self._INVITATION_MANAGER_ACTIONS[action]
 
         username = _normalize_invitation_username(linkedin_username)
         url = _invitation_manager_url(kind)
@@ -4730,6 +4767,137 @@ class LinkedInExtractor:
     ) -> dict[str, Any]:
         """Accept a received invitation. Thin wrapper used by ``connect_with_person``."""
         return await self.act_on_invitation(linkedin_username, "accept")
+
+    async def _withdraw_outgoing_invitation(
+        self,
+        linkedin_username: str,
+    ) -> dict[str, Any]:
+        """Withdraw an outgoing invitation via the recipient's profile page.
+
+        One navigation: load ``/in/{username}/``, confirm the connection state
+        is ``pending``, click the Pending action anchor (labeled <a> in the
+        action root — locale-independent signal documented in
+        :func:`_read_action_signals`), then click the primary button in the
+        confirm dialog. Avoids the sent-invitations-manager pagination cost
+        for accounts with many outstanding requests.
+        """
+        from linkedin_mcp_server.scraping.connection import detect_connection_state
+
+        username = _normalize_invitation_username(linkedin_username)
+        url = f"https://www.linkedin.com/in/{username}/"
+        profile_url = f"/in/{username}/" if username else ""
+
+        if not username:
+            return _invitation_action_result(
+                url,
+                "not_found",
+                "LinkedIn username is required.",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+
+        profile = await self.scrape_person(username, {"main_profile"})
+        page_text = profile.get("sections", {}).get("main_profile", "")
+        if not page_text:
+            return _invitation_action_result(
+                url,
+                "not_found",
+                f"Could not load profile for {username}.",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+
+        signals = await self._read_action_signals(username)
+        state = detect_connection_state(page_text, signals)
+        if state == "already_connected":
+            return _invitation_action_result(
+                url,
+                "already_connected",
+                f"{username} is already a 1st-degree connection; nothing to withdraw.",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+        if state != "pending":
+            return _invitation_action_result(
+                url,
+                "not_found",
+                f"No outgoing connection request found for {username} (state={state}).",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+
+        try:
+            click_result = await self._page.evaluate(_CLICK_PENDING_WITHDRAW_JS)
+        except Exception:
+            logger.debug("Pending anchor click failed", exc_info=True)
+            click_result = {"found": False, "clicked": False}
+        if not (isinstance(click_result, dict) and click_result.get("clicked")):
+            return _invitation_action_result(
+                url,
+                "action_unavailable",
+                "Could not find or click the Pending control on the profile.",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+
+        if not await self._dialog_is_open(timeout=5000):
+            return _invitation_action_result(
+                url,
+                "action_unavailable",
+                "Pending was clicked but the confirm dialog did not open.",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=profile_url,
+                performed=True,
+            )
+
+        confirmed = await self._click_dialog_primary_button()
+        if not confirmed:
+            await self._dismiss_dialog()
+            return _invitation_action_result(
+                url,
+                "action_unavailable",
+                "Could not click the primary Withdraw button in the confirm dialog.",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=profile_url,
+                performed=True,
+            )
+
+        try:
+            await self._page.wait_for_selector(
+                _DIALOG_SELECTOR, state="hidden", timeout=5000
+            )
+        except PlaywrightTimeoutError:
+            logger.debug("Withdraw confirm dialog did not close")
+
+        verified_signals = await self._read_action_signals(username)
+        verified_state = detect_connection_state(page_text, verified_signals)
+        if verified_state == "pending":
+            return _invitation_action_result(
+                url,
+                "verification_failed",
+                f"Clicked withdraw, but {username} still shows as pending.",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=profile_url,
+                performed=True,
+            )
+
+        return _invitation_action_result(
+            url,
+            "withdrawn",
+            "Invitation withdrawn.",
+            action="withdraw",
+            linkedin_username=username,
+            profile_url=profile_url,
+            performed=True,
+        )
 
     async def _click_invitation_action(
         self,

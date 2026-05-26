@@ -4226,7 +4226,8 @@ class TestInvitationManagement:
         [
             ("accept", "received", "accepted"),
             ("ignore", "received", "ignored"),
-            ("withdraw", "sent", "withdrawn"),
+            # withdraw is tested separately — it bypasses the invitation
+            # manager and uses the recipient's profile page.
         ],
     )
     async def test_act_on_invitation_success_path(
@@ -4268,7 +4269,8 @@ class TestInvitationManagement:
         assert result["performed"] is True
         assert result["linkedin_username"] == "alice"
         assert result["profile_url"] == "/in/alice/"
-        assert result["action_count"] == (2 if kind == "received" else 1)
+        # received cards have 2 visible buttons (Ignore + Accept).
+        assert result["action_count"] == 2
         assert result["match_strategy"] == "attr"
 
     async def test_act_on_invitation_not_found_without_username(self, mock_page):
@@ -4318,13 +4320,13 @@ class TestInvitationManagement:
                     },
                 )
             )
-            result = await extractor.act_on_invitation("alice", "withdraw")
+            result = await extractor.act_on_invitation("alice", "ignore")
         assert result["status"] == "action_unavailable"
-        assert result["action"] == "withdraw"
+        assert result["action"] == "ignore"
         assert result["performed"] is False
-        assert "withdraw" in result["message"]
+        assert "ignore" in result["message"]
         # Diagnostic: surface the observed button count so callers can debug
-        # against the documented expected layout (withdraw expects 1).
+        # against the documented expected layout (ignore expects 2).
         assert result["action_count"] == 3
 
     async def test_act_on_invitation_propagates_position_fallback_strategy(
@@ -4360,6 +4362,147 @@ class TestInvitationManagement:
         assert result["status"] == "ignored"
         assert result["match_strategy"] == "position"
         assert result["action_count"] == 2
+
+    # --- withdraw via profile page ----------------------------------------
+
+    @staticmethod
+    def _patch_withdraw_profile_pipeline(
+        extractor,
+        *,
+        state: str,
+        verified_state: str | None = None,
+        click_clicked: bool = True,
+        dialog_open: bool = True,
+        confirm_clicked: bool = True,
+    ):
+        """Patch the scrape→signals→click→dialog→verify pipeline used by
+        _withdraw_outgoing_invitation. Returns the ExitStack (entered by
+        caller) and a MagicMock for ``detect_connection_state`` so tests
+        can assert call order if needed."""
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        e = stack.enter_context
+
+        e(
+            patch.object(
+                extractor,
+                "scrape_person",
+                new_callable=AsyncMock,
+                return_value={"sections": {"main_profile": "Alice\n--\nLondon"}},
+            )
+        )
+        e(
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                # First call returns state-relevant signals; second
+                # (verification) returns verified-state signals.
+                side_effect=[MagicMock(), MagicMock()],
+            )
+        )
+        detect_mock = MagicMock(
+            side_effect=[state, verified_state if verified_state is not None else state]
+        )
+        e(
+            patch(
+                "linkedin_mcp_server.scraping.connection.detect_connection_state",
+                detect_mock,
+            )
+        )
+        evaluate_mock = AsyncMock(
+            return_value={"found": click_clicked, "clicked": click_clicked}
+        )
+        extractor._page.evaluate = evaluate_mock
+        e(
+            patch.object(
+                extractor,
+                "_dialog_is_open",
+                new_callable=AsyncMock,
+                return_value=dialog_open,
+            )
+        )
+        e(
+            patch.object(
+                extractor,
+                "_click_dialog_primary_button",
+                new_callable=AsyncMock,
+                return_value=confirm_clicked,
+            )
+        )
+        e(
+            patch.object(
+                extractor,
+                "_dismiss_dialog",
+                new_callable=AsyncMock,
+            )
+        )
+        extractor._page.wait_for_selector = AsyncMock()
+        return stack, detect_mock, evaluate_mock
+
+    async def test_withdraw_via_profile_success(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        stack, _, _ = self._patch_withdraw_profile_pipeline(
+            extractor, state="pending", verified_state="connectable"
+        )
+        with stack:
+            result = await extractor.act_on_invitation("alice", "withdraw")
+        assert result["status"] == "withdrawn"
+        assert result["action"] == "withdraw"
+        assert result["performed"] is True
+        assert result["url"] == "https://www.linkedin.com/in/alice/"
+        assert result["profile_url"] == "/in/alice/"
+
+    async def test_withdraw_via_profile_already_connected_short_circuits(
+        self, mock_page
+    ):
+        extractor = LinkedInExtractor(mock_page)
+        stack, _, evaluate_mock = self._patch_withdraw_profile_pipeline(
+            extractor, state="already_connected"
+        )
+        with stack:
+            result = await extractor.act_on_invitation("alice", "withdraw")
+        assert result["status"] == "already_connected"
+        assert result["performed"] is False
+        # No dialog interaction should have occurred — short-circuit before click.
+        evaluate_mock.assert_not_awaited()
+
+    async def test_withdraw_via_profile_not_pending_returns_not_found(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        stack, _, evaluate_mock = self._patch_withdraw_profile_pipeline(
+            extractor, state="connectable"
+        )
+        with stack:
+            result = await extractor.act_on_invitation("bob", "withdraw")
+        assert result["status"] == "not_found"
+        assert "No outgoing connection request found" in result["message"]
+        assert result["performed"] is False
+        evaluate_mock.assert_not_awaited()
+
+    async def test_withdraw_via_profile_dialog_does_not_open(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        stack, _, _ = self._patch_withdraw_profile_pipeline(
+            extractor, state="pending", dialog_open=False
+        )
+        with stack:
+            result = await extractor.act_on_invitation("alice", "withdraw")
+        assert result["status"] == "action_unavailable"
+        # We clicked Pending but the dialog never opened -> performed=True so
+        # callers can see that a side effect did happen even though it
+        # didn't complete the full withdraw flow.
+        assert result["performed"] is True
+
+    async def test_withdraw_via_profile_verification_failed(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        # Initial state=pending, verification still sees pending -> failed.
+        stack, _, _ = self._patch_withdraw_profile_pipeline(
+            extractor, state="pending", verified_state="pending"
+        )
+        with stack:
+            result = await extractor.act_on_invitation("alice", "withdraw")
+        assert result["status"] == "verification_failed"
+        assert result["performed"] is True
 
     def test_invitation_action_js_declares_position_fallback(self):
         """Regression guard: the JS must keep its documented position fallback
