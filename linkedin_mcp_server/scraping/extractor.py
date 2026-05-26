@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import date
 import json
 import logging
 import re
@@ -39,6 +40,7 @@ from linkedin_mcp_server.scraping.link_metadata import (
 from linkedin_mcp_server.scraping.conversation import (
     extract_conversation,
     normalize_profile_url,
+    parse_day_heading,
 )
 
 from .fields import COMPANY_SECTIONS, PERSON_SECTIONS
@@ -705,106 +707,65 @@ _CONNECTION_CARDS_JS = r"""
     const m = path && path.match(/^\/in\/([^/?#]+)/);
     return m ? decodeURIComponent(m[1]) : '';
   };
-  const bestAnchorText = anchor => {
-    const directText = normalize(anchor.textContent);
-    if (directText) return directText;
-    const imgAlt = anchor.querySelector('img[alt]')?.getAttribute('alt');
-    return normalize(imgAlt) || null;
-  };
-  const profileNameFromText = text => {
-    if (!text) return null;
-    const cleaned = normalize(text)
-      .replace(/^profile photo of\s+/i, '')
-      .replace(/^photo de profil de\s+/i, '')
-      .replace(/\s*(?:'s|’s)\s+profile\s+(?:photo|picture)$/i, '')
-      .replace(/\s+profile\s+(?:photo|picture)$/i, '')
-      .trim();
-    return cleaned || null;
-  };
+  const connectedOnRe = /\bconnected\s+(?:on|since)\b/i;
 
   // Climb from each profile anchor up to the smallest visible ancestor
-  // that resembles a connections-list card. Heuristic: bounded innerText
-  // size and at most one /in/ anchor for this slug (cards have an image
-  // anchor + a name anchor pointing to the same profile). Depth is
-  // bounded to avoid escaping into the full page chrome.
+  // whose text contains the en-US "Connected on/since ..." line and at
+  // most one /in/ slug (this slug). The Connected-on line is the V1
+  // contract: anchors whose surroundings lack it are not connection rows
+  // (e.g. People-You-May-Know rails) and are skipped.
   const cardForAnchor = (anchor, slug) => {
     let el = anchor.parentElement;
     let depth = 0;
-    let best = null;
     while (el && el !== root && depth < 10) {
-      if (!visible(el)) { el = el.parentElement; depth += 1; continue; }
-      const text = el.innerText || el.textContent || '';
-      if (text && text.length < 800) {
-        const inAnchors = Array.from(el.querySelectorAll('a[href*="/in/"]'))
-          .filter(a => profileSlug(linkedInPath(a.getAttribute('href') || a.href)) === slug);
-        const otherProfiles = Array.from(el.querySelectorAll('a[href*="/in/"]'))
-          .filter(a => {
-            const otherSlug = profileSlug(linkedInPath(a.getAttribute('href') || a.href));
-            return otherSlug && otherSlug !== slug;
-          });
-        if (inAnchors.length > 0 && otherProfiles.length === 0) {
-          best = el;
-        } else if (otherProfiles.length > 0) {
-          break;
+      if (visible(el)) {
+        const text = el.innerText || el.textContent || '';
+        if (text && text.length < 800 && connectedOnRe.test(text)) {
+          const otherProfiles = Array.from(el.querySelectorAll('a[href*="/in/"]'))
+            .filter(a => {
+              const otherSlug = profileSlug(linkedInPath(a.getAttribute('href') || a.href));
+              return otherSlug && otherSlug !== slug;
+            });
+          if (otherProfiles.length === 0) return el;
         }
       }
       el = el.parentElement;
       depth += 1;
     }
-    return best || anchor.closest('[role="listitem"]') || anchor.closest('li') || anchor.parentElement;
+    return null;
   };
 
   const cards = [];
   const seenSlugs = new Set();
-  const anchors = Array.from(root.querySelectorAll('a[href*="/in/"]')).filter(visible);
-  for (const anchor of anchors) {
+  for (const anchor of Array.from(root.querySelectorAll('a[href*="/in/"]')).filter(visible)) {
     const path = linkedInPath(anchor.getAttribute('href') || anchor.href);
     const slug = profileSlug(path);
     if (!slug) continue;
     if (seenSlugs.has(slug)) continue;
     const card = cardForAnchor(anchor, slug);
     if (!card) continue;
-    seenSlugs.add(slug);
 
-    const sameSlugAnchors = Array.from(card.querySelectorAll('a[href*="/in/"]'))
-      .filter(a => profileSlug(linkedInPath(a.getAttribute('href') || a.href)) === slug && visible(a));
-    const nameAnchor = sameSlugAnchors.find(a => linesFrom(a).length > 0) || sameSlugAnchors[0] || anchor;
+    // Identity is the URL; name comes from visible anchor text. If no
+    // anchor in this card has visible text, skip rather than fall back
+    // to ``img[alt]`` labels — those carry locale-specific cleanup rules
+    // (English possessive, French "photo de profil de …") that the V1
+    // en-US contract does not support.
+    const nameAnchor = Array.from(card.querySelectorAll('a[href*="/in/"]'))
+      .filter(a => profileSlug(linkedInPath(a.getAttribute('href') || a.href)) === slug && visible(a))
+      .find(a => linesFrom(a).length > 0);
+    if (!nameAnchor) continue;
+
     const nameAnchorLines = linesFrom(nameAnchor);
-    const rawName = nameAnchorLines[0] || bestAnchorText(nameAnchor);
-    const name = profileNameFromText(rawName);
+    const name = nameAnchorLines[0];
+    // The connections page renders the headline as subsequent
+    // ``innerText`` lines inside the same profile anchor. Anchor-line
+    // parsing is sufficient on its own — no card-wide line fallback.
+    const headline = nameAnchorLines.slice(1)
+      .filter(line => line && line !== name)
+      .join(' • ') || null;
+    const connectedLine = linesFrom(card).find(line => connectedOnRe.test(line)) || null;
 
-    // Treat ``<a aria-label>`` controls as buttons too — LinkedIn renders
-    // "Message" on the connections page as an aria-labelled link, not a
-    // ``<button>``, so it slips past a button-only filter and pollutes the
-    // headline.
-    const buttonTexts = new Set(
-      Array.from(card.querySelectorAll('button, [role="button"], a[aria-label]'))
-        .filter(visible)
-        .filter(el => !el.matches('a[href*="/in/"]'))
-        .flatMap(linesFrom)
-    );
-
-    // On the connections page the profile anchor itself contains both the
-    // name and the headline as separate ``innerText`` lines. Prefer those
-    // over scanning sibling lines, which are noisier.
-    const anchorRest = nameAnchorLines.slice(1)
-      .map(line => profileNameFromText(line) || line)
-      .filter(line => line && line !== name && !buttonTexts.has(line));
-    const cardLines = linesFrom(card);
-    const connectedLine = cardLines.find(line => /\bconnected\s+(?:on|since)\b/i.test(line)) || null;
-    let headline = anchorRest[0] || null;
-    if (!headline) {
-      headline = cardLines.find(line => {
-        if (!line) return false;
-        if (name && (line === name || line.startsWith(name))) return false;
-        if (rawName && line === rawName) return false;
-        if (buttonTexts.has(line)) return false;
-        if (line === connectedLine) return false;
-        if (/\bconnected\b/i.test(line)) return false;
-        return true;
-      }) || null;
-    }
-
+    seenSlugs.add(slug);
     cards.push({
       name,
       profile_url: `/in/${slug}/`,
@@ -1130,25 +1091,14 @@ def _invitation_identity_key(invitation: dict[str, Any]) -> tuple[str, str, str,
 
 _CONNECTIONS_URL = "https://www.linkedin.com/mynetwork/invite-connect/connections/"
 
-# en-US month abbreviations for parsing "Connected on <Month> <D>, <YYYY>".
-# Locale scope matches conversation.py's en-US assumption: dates we cannot
-# parse surface as ``connected_on: null`` rather than raise.
-_CONNECTED_ON_MONTHS_EN_US: dict[str, int] = {
-    "jan": 1,
-    "feb": 2,
-    "mar": 3,
-    "apr": 4,
-    "may": 5,
-    "jun": 6,
-    "jul": 7,
-    "aug": 8,
-    "sep": 9,
-    "oct": 10,
-    "nov": 11,
-    "dec": 12,
-}
+# en-US "Connected on/since" prefix followed by a strict day-heading
+# shape (``Month DD`` with optional ``, YYYY``). Bounded capture stops at
+# the heading itself so trailing separators (``·``, em-dash, etc.) do not
+# leak into :func:`conversation.parse_day_heading`. Locale scope matches
+# conversation.py's en-US assumption: dates we cannot parse surface as
+# ``connected_on: null`` rather than raise.
 _CONNECTED_ON_RE_EN_US = re.compile(
-    r"connected\s+(?:on|since)\s+([A-Za-z]{3,9})\s+(\d{1,2}),\s*(\d{4})",
+    r"\bconnected\s+(?:on|since)\s+([A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?)",
     flags=re.IGNORECASE,
 )
 
@@ -1156,7 +1106,10 @@ _CONNECTED_ON_RE_EN_US = re.compile(
 def _parse_connected_on(value: Any) -> str | None:
     """Parse "Connected on Month DD, YYYY" → "YYYY-MM-DD" (en-US).
 
-    Returns None for missing, non-en-US, or malformed values — never raises.
+    Reuses :func:`conversation.parse_day_heading` for the day-heading tail
+    so the en-US month table lives in exactly one place. Validation is via
+    :class:`datetime.date`, which rejects impossible dates like Feb 30.
+    Returns None for missing, non-en-US, or invalid values — never raises.
     """
     text = _optional_text(value)
     if not text:
@@ -1164,17 +1117,16 @@ def _parse_connected_on(value: Any) -> str | None:
     match = _CONNECTED_ON_RE_EN_US.search(text)
     if not match:
         return None
-    month = _CONNECTED_ON_MONTHS_EN_US.get(match.group(1)[:3].lower())
-    if month is None:
+    parsed = parse_day_heading(match.group(1).strip())
+    if not parsed:
+        return None
+    month, day, year = parsed
+    if year is None:
         return None
     try:
-        day = int(match.group(2))
-        year = int(match.group(3))
+        return date(year, month, day).isoformat()
     except ValueError:
         return None
-    if not (1 <= day <= 31 and 1900 <= year <= 2999):
-        return None
-    return f"{year:04d}-{month:02d}-{day:02d}"
 
 
 def _normalize_connection(raw: Any) -> dict[str, Any] | None:
@@ -4462,7 +4414,10 @@ class LinkedInExtractor:
 
         connections: list[dict[str, Any]] = []
         seen_keys: set[tuple[str]] = set()
-        max_scrolls = max(0, (limit + 4) // 5 - 1)
+        # Generous scroll cap; the ``len(connections) >= limit`` and
+        # ``not moved`` guards below handle early termination so this cap
+        # does not bake in a per-viewport card-density assumption.
+        max_scrolls = 20
         for attempt in range(max_scrolls + 1):
             for connection in await self._extract_connection_cards(limit=limit):
                 key = _connection_identity_key(connection)
@@ -4476,11 +4431,22 @@ class LinkedInExtractor:
             if len(connections) >= limit or attempt >= max_scrolls:
                 break
 
-            moved = await self._scroll_invitation_manager_down()
+            moved = await self._scroll_connections_down()
             if not moved:
                 break
 
         return {"url": url, "connections": connections}
+
+    async def _scroll_connections_down(self) -> bool:
+        """Scroll the connections page one viewport down.
+
+        Aliases :meth:`_scroll_invitation_manager_down`: today both pages
+        share the same "find the largest scrollable container inside
+        ``<main>``" heuristic. Keeping a named entry point makes the
+        connections call site read honestly and gives the two pages a
+        cheap divergence path if their scroll containers ever differ.
+        """
+        return await self._scroll_invitation_manager_down()
 
     async def _extract_connection_cards(
         self,
@@ -4506,16 +4472,14 @@ class LinkedInExtractor:
         if not isinstance(raw_cards, list):
             return []
 
+        # ``_CONNECTION_CARDS_JS`` already dedupes by ``profileSlug`` so we
+        # do not re-check identity here. Cross-scroll dedup is handled by
+        # ``get_connections`` via ``_connection_identity_key``.
         cards: list[dict[str, Any]] = []
-        seen_keys: set[tuple[str]] = set()
         for raw in raw_cards:
             connection = _normalize_connection(raw)
             if connection is None:
                 continue
-            key = _connection_identity_key(connection)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
             cards.append(connection)
             if len(cards) >= limit:
                 break

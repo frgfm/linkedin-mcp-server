@@ -5594,6 +5594,9 @@ class TestConnectionList:
             "Connected on May 2026",
             "Connected on Mai 25, 2026",
             "Connected on May 32, 2026",
+            # Impossible date — caught by ``datetime.date`` validation.
+            "Connected on Feb 30, 2024",
+            "Connected on Apr 31, 2024",
         ],
     )
     def test_parse_connected_on_returns_none_for_unparseable(self, text):
@@ -5654,8 +5657,12 @@ class TestConnectionList:
         assert 'a[href*="/in/"]' in _CONNECTION_CARDS_JS
         assert "profileSlug" in _CONNECTION_CARDS_JS
         assert "linesFrom" in _CONNECTION_CARDS_JS
-        assert "buttonTexts" in _CONNECTION_CARDS_JS
         assert "connected_on_text" in _CONNECTION_CARDS_JS
+        # V1 contract: only rows whose ancestor exposes the en-US
+        # "Connected on/since" line are surfaced — the regex must be
+        # present in the JS source.
+        assert "connectedOnRe" in _CONNECTION_CARDS_JS
+        assert r"connected\s+(?:on|since)\b" in _CONNECTION_CARDS_JS
         # Headline / date selection must not depend on class names.
         assert "className" not in _CONNECTION_CARDS_JS
         assert "[class" not in _CONNECTION_CARDS_JS
