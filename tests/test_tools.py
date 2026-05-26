@@ -1,5 +1,5 @@
 from typing import Any, Callable, Coroutine, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastmcp import FastMCP
@@ -33,6 +33,7 @@ def _make_mock_extractor(scrape_result: dict) -> MagicMock:
     mock.get_conversation = AsyncMock(return_value=scrape_result)
     mock.search_conversations = AsyncMock(return_value=scrape_result)
     mock.send_message = AsyncMock(return_value=scrape_result)
+    mock.get_pending_invitations = AsyncMock(return_value=scrape_result)
     mock.get_my_profile = AsyncMock(return_value=scrape_result)
     mock.search_companies = AsyncMock(return_value=scrape_result)
     mock.get_company_employees = AsyncMock(return_value=scrape_result)
@@ -1138,6 +1139,147 @@ class TestFeedTools:
             await mcp.call_tool("get_feed", {"num_posts": 51})
 
 
+class TestNetworkTools:
+    async def test_get_pending_invitations_success(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/",
+            "invitations": [
+                {
+                    "type": "page_follow",
+                    "invitation_age": "1h",
+                    "sender": {
+                        "name": "Juan Manuel M. Pérez",
+                        "url": "/in/juanmanuelperez/",
+                        "headline": None,
+                        "mutual_connections": None,
+                    },
+                    "note": None,
+                    "target": {
+                        "page": {
+                            "name": "Magical Potion Consulting",
+                            "url": "/company/magical-potion-consulting/",
+                        },
+                        "newsletter": None,
+                    },
+                    "message_url": None,
+                }
+            ],
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "get_pending_invitations")
+        result = await tool_fn(mock_context, extractor=mock_extractor)
+
+        assert list(result) == ["url", "invitations"]
+        assert result["invitations"][0]["type"] == "page_follow"
+        assert result["invitations"][0]["sender"]["url"] == "/in/juanmanuelperez/"
+        mock_extractor.get_pending_invitations.assert_awaited_once_with(
+            limit=20,
+            kind="received",
+        )
+
+    async def test_get_pending_invitations_sent_kind(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/mynetwork/invitation-manager/sent/",
+            "invitations": [
+                {
+                    "type": "connection_request",
+                    "invitation_age": "1w",
+                    "recipient": {
+                        "name": "Laurent SORBIER",
+                        "url": "/in/laurent-sorbier/",
+                        "headline": "chargé d’affaires chez belectric",
+                    },
+                }
+            ],
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "get_pending_invitations")
+        result = await tool_fn(
+            mock_context,
+            limit=5,
+            kind="sent",
+            extractor=mock_extractor,
+        )
+
+        assert result["url"].endswith("/sent/")
+        invitation = result["invitations"][0]
+        assert invitation["recipient"]["headline"] == "chargé d’affaires chez belectric"
+        assert "sender" not in invitation
+        mock_extractor.get_pending_invitations.assert_awaited_once_with(
+            limit=5,
+            kind="sent",
+        )
+
+    async def test_get_pending_invitations_structured_content_shape(self):
+        expected = {
+            "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/",
+            "invitations": [],
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        with patch(
+            "linkedin_mcp_server.tools.network.get_ready_extractor",
+            new_callable=AsyncMock,
+            return_value=mock_extractor,
+        ):
+            result = await mcp.call_tool(
+                "get_pending_invitations",
+                {"kind": "received", "limit": 2},
+            )
+
+        assert result.structured_content == expected
+        assert list(result.structured_content or {}) == ["url", "invitations"]
+
+    async def test_get_pending_invitations_rejects_invalid_kind(self):
+        from pydantic import ValidationError
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        with pytest.raises(ValidationError, match="kind"):
+            await mcp.call_tool("get_pending_invitations", {"kind": "archived"})
+
+    async def test_get_pending_invitations_rejects_excessive_limit(self):
+        from pydantic import ValidationError
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        with pytest.raises(ValidationError, match="limit"):
+            await mcp.call_tool("get_pending_invitations", {"limit": 101})
+
+    async def test_invitation_action_tools_are_not_registered(self):
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        assert await mcp.get_tool("accept_invitation") is None
+        assert await mcp.get_tool("reject_invitation") is None
+        assert await mcp.get_tool("withdraw_invitation") is None
+
+
 class TestToolTimeouts:
     async def test_all_tools_have_global_timeout(self):
         from linkedin_mcp_server.server import create_mcp_server
@@ -1158,6 +1300,7 @@ class TestToolTimeouts:
             "get_conversation",
             "search_conversations",
             "send_message",
+            "get_pending_invitations",
             "get_feed",
             "close_session",
         )
@@ -1189,6 +1332,7 @@ class TestToolTimeouts:
             "get_conversation",
             "search_conversations",
             "send_message",
+            "get_pending_invitations",
             "get_feed",
             "close_session",
         )

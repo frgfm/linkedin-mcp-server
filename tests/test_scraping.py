@@ -17,8 +17,10 @@ from linkedin_mcp_server.scraping.connection import (
 from linkedin_mcp_server.scraping.extractor import (
     ExtractedSection,
     LinkedInExtractor,
+    _INVITATION_CARDS_JS,
     _RATE_LIMITED_MSG,
     _build_feed_references,
+    _normalize_structured_invitation,
     _truncate_linkedin_noise,
     strip_linkedin_noise,
 )
@@ -1316,15 +1318,20 @@ class TestConnectWithPerson:
             ),
             patch.object(
                 extractor,
-                "click_button_by_text",
+                "_accept_incoming_invitation",
                 new_callable=AsyncMock,
-                return_value=True,
-            ) as mock_click,
+                return_value={
+                    "status": "accepted",
+                    "message": "Incoming invitation accepted.",
+                    "linkedin_username": "testuser",
+                    "performed": True,
+                },
+            ) as mock_accept,
         ):
             result = await extractor.connect_with_person("testuser")
 
         assert result["status"] == "accepted"
-        mock_click.assert_awaited_once_with("Accept", scope="main")
+        mock_accept.assert_awaited_once_with("testuser")
 
     async def test_incoming_request_send_failed_when_no_first_degree(self, mock_page):
         """Accept clicked but profile never transitions to 1st-degree."""
@@ -1345,9 +1352,14 @@ class TestConnectWithPerson:
             ),
             patch.object(
                 extractor,
-                "click_button_by_text",
+                "_accept_incoming_invitation",
                 new_callable=AsyncMock,
-                return_value=True,
+                return_value={
+                    "status": "accepted",
+                    "message": "Incoming invitation accepted.",
+                    "linkedin_username": "testuser",
+                    "performed": True,
+                },
             ),
         ):
             result = await extractor.connect_with_person("testuser")
@@ -3660,6 +3672,481 @@ class TestGetInbox:
         assert refs[0]["kind"] == "conversation"
         assert refs[0]["url"] == "/messaging/thread/2-abc123/"
         assert refs[0]["text"] == "Tony Chan"
+
+
+class TestInvitationManagement:
+    def test_invitation_card_script_uses_visual_card_order(self):
+        assert "for (const button of actionControls(root))" in _INVITATION_CARDS_JS
+        assert "getBoundingClientRect()" in _INVITATION_CARDS_JS
+        assert "cards.sort" in _INVITATION_CARDS_JS
+        assert 'a[href*="/school/"]' in _INVITATION_CARDS_JS
+        assert "if (kind === 'sent')" in _INVITATION_CARDS_JS
+        assert "recipient:" in _INVITATION_CARDS_JS
+        assert "sent|envoyé|envoyée" in _INVITATION_CARDS_JS
+        assert "a[aria-label][href]" in _INVITATION_CARDS_JS
+        assert "profile\\s+(?:photo|picture)" in _INVITATION_CARDS_JS
+        assert "return senderNameFromProfileLink(profileLink);" in _INVITATION_CARDS_JS
+        assert "let candidate = card;" in _INVITATION_CARDS_JS
+        assert "if (actions.length > 4) break;" in _INVITATION_CARDS_JS
+        assert "messageLink?.path" in _INVITATION_CARDS_JS
+        assert "^\\/messaging\\/compose\\/" in _INVITATION_CARDS_JS
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("", 0),
+            ("Hugo Attal mutual connection", 1),
+            ("3 mutual connections", 3),
+            ("Hugo Attal and 2 other mutual connections", 3),
+            ("Hugo Attal et 2 relations en commun", 3),
+            ("3 relations en commun", 3),
+        ],
+    )
+    def test_connection_request_mutual_count_rules(self, text, expected):
+        invitation = _normalize_structured_invitation(
+            {
+                "type": "connection_request",
+                "sender": {"name": "Ayoub Chalabi", "url": "/in/ayoub-chalabi/"},
+                "text": text,
+            }
+        )
+
+        assert invitation is not None
+        assert invitation["sender"]["mutual_connections"] == expected
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("1 hour ago", "1h"),
+            ("23 minutes ago", "23min"),
+            ("Il y a 18 heures", "18h"),
+            ("5 days ago", "5d"),
+            ("Il y a 5 jours", "5d"),
+            ("1 month ago", "1mo"),
+            ("Il y a 1 mois", "1mo"),
+            ("1m", "1mo"),
+        ],
+    )
+    def test_invitation_age_rules(self, text, expected):
+        invitation = _normalize_structured_invitation(
+            {
+                "type": "connection_request",
+                "sender": {"name": "Ayoub Chalabi", "url": "/in/ayoub-chalabi/"},
+                "text": text,
+            }
+        )
+
+        assert invitation is not None
+        assert invitation["invitation_age"] == expected
+
+    async def test_get_pending_invitations_received(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        invitations = [
+            {
+                "type": "page_follow",
+                "invitation_age": "1h",
+                "sender": {
+                    "name": "Juan Manuel M. Pérez",
+                    "url": "/in/juanmanuelperez/",
+                    "headline": None,
+                    "mutual_connections": None,
+                },
+                "note": None,
+                "target": {
+                    "page": {
+                        "name": "Magical Potion Consulting",
+                        "url": "/company/magical-potion-consulting/",
+                    },
+                    "newsletter": None,
+                },
+                "message_url": None,
+            },
+            {
+                "type": "connection_request",
+                "invitation_age": "18h",
+                "sender": {
+                    "name": "Ayoub Chalabi",
+                    "url": "/in/ayoub-chalabi/",
+                    "headline": "Co-founder & CTO @ Learnrithm AI (SCV X26)",
+                    "mutual_connections": 3,
+                },
+                "note": None,
+                "target": None,
+                "message_url": "/messaging/compose/?recipient=ayoub-chalabi",
+            },
+        ]
+        with (
+            patch.object(
+                extractor,
+                "_navigate_to_page",
+                new_callable=AsyncMock,
+            ) as mock_nav,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor, "_scroll_invitation_manager_down", new_callable=AsyncMock
+            ),
+            patch.object(
+                extractor, "_expand_invitation_note_toggles", new_callable=AsyncMock
+            ),
+            patch.object(
+                extractor,
+                "_extract_invitation_cards",
+                new_callable=AsyncMock,
+                return_value=invitations,
+            ) as mock_cards,
+        ):
+            result = await extractor.get_pending_invitations(limit=2)
+
+        mock_nav.assert_awaited_once_with(
+            "https://www.linkedin.com/mynetwork/invitation-manager/received/"
+        )
+        mock_cards.assert_awaited_once_with(kind="received", limit=2)
+        assert list(result) == ["url", "invitations"]
+        assert result["invitations"] == invitations
+
+    async def test_get_pending_invitations_collects_before_scrolling(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        first_rows = [
+            {
+                "type": "connection_request",
+                "invitation_age": "1w",
+                "recipient": {
+                    "name": "Laurent SORBIER",
+                    "url": "/in/laurent-sorbier/",
+                    "headline": "chargé d’affaires chez belectric",
+                },
+            },
+            {
+                "type": "connection_request",
+                "invitation_age": "1w",
+                "recipient": {
+                    "name": "Hugues Jouffroy",
+                    "url": "/in/hugues-jouffroy/",
+                    "headline": "Directeur Général Délégué aux Opérations",
+                },
+            },
+        ]
+        second_rows = [
+            first_rows[1],
+            {
+                "type": "connection_request",
+                "invitation_age": "1w",
+                "recipient": {
+                    "name": "Rémi SACHOT",
+                    "url": "/in/remisachotenr/",
+                    "headline": "Directeur Exploitation chez TSE Energy",
+                },
+            },
+        ]
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor,
+                "_scroll_invitation_manager_down",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_scroll,
+            patch.object(
+                extractor, "_expand_invitation_note_toggles", new_callable=AsyncMock
+            ),
+            patch.object(
+                extractor,
+                "_extract_invitation_cards",
+                new_callable=AsyncMock,
+                side_effect=[first_rows, second_rows],
+            ),
+        ):
+            result = await extractor.get_pending_invitations(limit=6, kind="sent")
+
+        assert result["invitations"] == [
+            first_rows[0],
+            first_rows[1],
+            second_rows[1],
+        ]
+        mock_scroll.assert_awaited_once()
+
+    async def test_get_pending_invitations_sent_url(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(
+                extractor,
+                "_navigate_to_page",
+                new_callable=AsyncMock,
+            ) as mock_nav,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor, "_scroll_invitation_manager_down", new_callable=AsyncMock
+            ),
+            patch.object(
+                extractor, "_expand_invitation_note_toggles", new_callable=AsyncMock
+            ),
+            patch.object(
+                extractor,
+                "_extract_invitation_cards",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            result = await extractor.get_pending_invitations(limit=5, kind="sent")
+
+        mock_nav.assert_awaited_once_with(
+            "https://www.linkedin.com/mynetwork/invitation-manager/sent/"
+        )
+        assert result == {
+            "url": "https://www.linkedin.com/mynetwork/invitation-manager/sent/",
+            "invitations": [],
+        }
+
+    async def test_extract_received_invitation_cards_returns_structured_payload(
+        self, mock_page
+    ):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "type": "page_follow",
+                    "invitation_age": "1 hour ago",
+                    "sender": {
+                        "name": "Juan Manuel M. Pérez",
+                        "url": "/in/juanmanuelperez/",
+                        "headline": "Ignored headline",
+                        "mutual_connections": 4,
+                    },
+                    "note": "Ignored note",
+                    "target": {
+                        "page": {
+                            "name": "Magical Potion Consulting",
+                            "url": "/company/magical-potion-consulting/",
+                        }
+                    },
+                    "message_url": "/messaging/compose/?recipient=alice",
+                },
+                {
+                    "type": "page_follow",
+                    "invitation_age": "1 hour ago",
+                    "sender": {
+                        "name": "Juan Manuel M. Pérez",
+                        "url": "/in/juanmanuelperez/",
+                    },
+                    "target": {
+                        "page": {
+                            "name": "Magical Potion Consulting",
+                            "url": "/company/magical-potion-consulting/",
+                        }
+                    },
+                },
+                {
+                    "type": "connection_request",
+                    "invitation_age": None,
+                    "sender": {
+                        "name": "Ayoub Chalabi",
+                        "url": "/in/ayoub-chalabi/",
+                        "headline": "Co-founder & CTO @ Learnrithm AI (SCV X26)",
+                    },
+                    "text": "Ayoub Chalabi follows you and is inviting you to connect Co-founder & CTO @ Learnrithm AI (SCV X26) Hugo Attal and 2 other mutual connections 18 hours ago",
+                    "target": {"page": {"name": "Ignored", "url": "/company/x/"}},
+                    "message_url": "/messaging/compose/?recipient=ACoAAAqI0hgB6hz3TEqrc9e4jwzIth2jHkAWxjk&invitation=urn%3Ali%3Afsd_invitation%3A7464720462661468161&contextEntityUrn=urn%3Ali%3Afsd_invitation%3A7464720462661468161&recipients=List%28urn%3Ali%3Afsd_profile%3AACoAAAqI0hgB6hz3TEqrc9e4jwzIth2jHkAWxjk%29",
+                },
+                {
+                    "type": "newsletter_subscription",
+                    "text": "The Example Brief 1 month ago",
+                    "sender": {
+                        "name": "CentraleSupélec",
+                        "url": "/school/centralesupelec/",
+                        "mutual_connections": None,
+                    },
+                    "target": {
+                        "newsletter": {
+                            "title": "The Example Brief",
+                            "url": "/newsletters/the-example-brief-123/",
+                        }
+                    },
+                },
+                {"type": "connection_request", "sender": {}},
+                "bad row",
+            ]
+        )
+
+        cards = await extractor._extract_invitation_cards(kind="received", limit=10)
+
+        evaluate_args = mock_page.evaluate.await_args
+        assert evaluate_args is not None
+        assert evaluate_args.args[1] == {"kind": "received", "limit": 20}
+        assert cards == [
+            {
+                "type": "page_follow",
+                "invitation_age": "1h",
+                "sender": {
+                    "name": "Juan Manuel M. Pérez",
+                    "url": "/in/juanmanuelperez/",
+                    "headline": None,
+                    "mutual_connections": None,
+                },
+                "note": None,
+                "target": {
+                    "page": {
+                        "name": "Magical Potion Consulting",
+                        "url": "/company/magical-potion-consulting/",
+                    },
+                    "newsletter": None,
+                },
+                "message_url": None,
+            },
+            {
+                "type": "connection_request",
+                "invitation_age": "18h",
+                "sender": {
+                    "name": "Ayoub Chalabi",
+                    "url": "/in/ayoub-chalabi/",
+                    "headline": "Co-founder & CTO @ Learnrithm AI (SCV X26)",
+                    "mutual_connections": 3,
+                },
+                "note": None,
+                "target": None,
+                "message_url": "/messaging/compose/?recipient=ACoAAAqI0hgB6hz3TEqrc9e4jwzIth2jHkAWxjk&invitation=urn%3Ali%3Afsd_invitation%3A7464720462661468161&contextEntityUrn=urn%3Ali%3Afsd_invitation%3A7464720462661468161&recipients=List%28urn%3Ali%3Afsd_profile%3AACoAAAqI0hgB6hz3TEqrc9e4jwzIth2jHkAWxjk%29",
+            },
+            {
+                "type": "newsletter_subscription",
+                "invitation_age": "1mo",
+                "sender": {
+                    "name": "CentraleSupélec",
+                    "url": "/school/centralesupelec/",
+                    "headline": None,
+                    "mutual_connections": None,
+                },
+                "note": None,
+                "target": {
+                    "page": None,
+                    "newsletter": {
+                        "title": "The Example Brief",
+                        "url": "/newsletters/the-example-brief-123/",
+                    },
+                },
+                "message_url": None,
+            },
+        ]
+
+    async def test_extract_sent_invitation_cards_returns_recipient_payload(
+        self, mock_page
+    ):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "type": "connection_request",
+                    "invitation_age": "Sent 1 week ago",
+                    "recipient": {
+                        "name": "Laurent SORBIER",
+                        "url": "/in/laurent-sorbier/",
+                        "headline": "chargé d’affaires chez belectric",
+                    },
+                    "sender": {
+                        "name": "Ignored sender",
+                        "url": "/in/ignored/",
+                        "headline": "Ignored headline",
+                        "mutual_connections": 7,
+                    },
+                    "note": "Ignored note",
+                    "target": {"page": {"name": "Ignored", "url": "/company/x/"}},
+                    "message_url": "/messaging/compose/?recipient=ignored",
+                },
+                {
+                    "type": "connection_request",
+                    "invitation_age": "Sent 1 week ago",
+                    "recipient": {
+                        "name": "Laurent SORBIER",
+                        "url": "/in/laurent-sorbier/",
+                        "headline": "chargé d’affaires chez belectric",
+                    },
+                },
+                {
+                    "type": "connection_request",
+                    "text": "Hugues Jouffroy\nDirecteur Général Délégué aux Opérations\nSent 1 week ago\nWithdraw",
+                    "recipient": {
+                        "name": "Hugues Jouffroy",
+                        "url": "/in/hugues-jouffroy/",
+                        "headline": "Directeur Général Délégué aux Opérations",
+                    },
+                },
+                {"type": "page_follow", "recipient": {"name": "Ignored"}},
+                "bad row",
+            ]
+        )
+
+        cards = await extractor._extract_invitation_cards(kind="sent", limit=10)
+
+        evaluate_args = mock_page.evaluate.await_args
+        assert evaluate_args is not None
+        assert evaluate_args.args[1] == {"kind": "sent", "limit": 20}
+        assert cards == [
+            {
+                "type": "connection_request",
+                "invitation_age": "1w",
+                "recipient": {
+                    "name": "Laurent SORBIER",
+                    "url": "/in/laurent-sorbier/",
+                    "headline": "chargé d’affaires chez belectric",
+                },
+            },
+            {
+                "type": "connection_request",
+                "invitation_age": "1w",
+                "recipient": {
+                    "name": "Hugues Jouffroy",
+                    "url": "/in/hugues-jouffroy/",
+                    "headline": "Directeur Général Délégué aux Opérations",
+                },
+            },
+        ]
+        assert "sender" not in cards[0]
+        assert "target" not in cards[0]
+        assert "note" not in cards[0]
+        assert "message_url" not in cards[0]
+
+    async def test_expand_invitation_note_toggles_runs_second_pass(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.evaluate = AsyncMock(side_effect=[1, 0])
+        with patch(
+            "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as mock_sleep:
+            await extractor._expand_invitation_note_toggles()
+
+        assert mock_page.evaluate.await_count == 2
+        mock_sleep.assert_awaited_once_with(0.5)
+
+    async def test_invitation_card_present_fails_closed_on_evaluate_error(
+        self, mock_page
+    ):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.evaluate = AsyncMock(side_effect=RuntimeError("page crashed"))
+
+        assert await extractor._invitation_card_present("alice") is False
 
 
 # ----------------------------------------------------------------------
