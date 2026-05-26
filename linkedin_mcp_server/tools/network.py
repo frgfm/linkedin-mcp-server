@@ -97,3 +97,82 @@ def register_network_tools(
                 raise_tool_error(relogin_exc, "get_connections")
         except Exception as e:
             raise_tool_error(e, "get_connections")  # NoReturn
+
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="Respond to Invitation",
+        annotations={"destructiveHint": True, "openWorldHint": True},
+        tags={"network", "actions"},
+        exclude_args=["extractor"],
+    )
+    async def respond_to_invitation(
+        linkedin_username: str,
+        action: Literal["accept", "ignore"],
+        ctx: Context,
+        extractor: Any | None = None,
+    ) -> dict[str, Any]:
+        """
+        Accept or ignore a received LinkedIn connection request.
+
+        Navigates to ``/mynetwork/invitation-manager/received/``, finds the
+        card for ``linkedin_username``, and clicks the requested action button.
+        Identification uses stable engineering attributes (``data-control-name``
+        etc), not localized button text.
+
+        Status: ``accepted`` | ``ignored`` | ``not_found`` | ``action_unavailable``
+        | ``verification_failed``.
+        """
+        try:
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="respond_to_invitation"
+            )
+            logger.info(
+                "Responding to invitation: %s (action=%s)",
+                linkedin_username,
+                action,
+            )
+            result = await extractor.act_on_invitation(linkedin_username, action)
+            return result
+        except AuthenticationError as e:
+            try:
+                await handle_auth_error(e, ctx)
+            except Exception as relogin_exc:
+                raise_tool_error(relogin_exc, "respond_to_invitation")
+        except Exception as e:
+            raise_tool_error(e, "respond_to_invitation")  # NoReturn
+
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="Withdraw Invitation",
+        annotations={"destructiveHint": True, "openWorldHint": True},
+        tags={"network", "actions"},
+        exclude_args=["extractor"],
+    )
+    async def withdraw_invitation(
+        linkedin_username: str,
+        ctx: Context,
+        extractor: Any | None = None,
+    ) -> dict[str, Any]:
+        """
+        Withdraw an outgoing LinkedIn connection request.
+
+        Navigates to ``/mynetwork/invitation-manager/sent/``, finds the card
+        for ``linkedin_username``, and clicks Withdraw.
+
+        Status: ``withdrawn`` | ``not_found`` | ``action_unavailable``
+        | ``verification_failed``.
+        """
+        try:
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="withdraw_invitation"
+            )
+            logger.info("Withdrawing invitation: %s", linkedin_username)
+            result = await extractor.act_on_invitation(linkedin_username, "withdraw")
+            return result
+        except AuthenticationError as e:
+            try:
+                await handle_auth_error(e, ctx)
+            except Exception as relogin_exc:
+                raise_tool_error(relogin_exc, "withdraw_invitation")
+        except Exception as e:
+            raise_tool_error(e, "withdraw_invitation")  # NoReturn

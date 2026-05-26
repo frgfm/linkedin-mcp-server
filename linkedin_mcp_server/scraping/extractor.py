@@ -570,8 +570,21 @@ _INVITATION_CARD_PRESENT_JS = r"""
 }
 """
 
-_INVITATION_ACCEPT_ACTION_JS = r"""
-({ username }) => {
+_INVITATION_ACTION_JS = r"""
+({ username, action }) => {
+  // Action -> attr-substring whitelist. We match LinkedIn's stable engineering
+  // attributes (data-control-name etc), never aria-label text — per CLAUDE.md
+  // the verb in an aria-label is locale-dependent.
+  const ACTION_TOKENS = {
+    accept:   ['accept', 'confirm'],
+    ignore:   ['ignore', 'decline', 'dismiss', 'reject'],
+    withdraw: ['withdraw', 'cancel'],
+  };
+  const tokens = ACTION_TOKENS[action];
+  if (!tokens) {
+    return { found: false, clicked: false, reason: 'unknown_action' };
+  }
+
   const root = document.querySelector('main') || document.body;
   if (!root) {
     return { found: false, clicked: false, reason: 'no_root' };
@@ -637,12 +650,21 @@ _INVITATION_ACCEPT_ACTION_JS = r"""
     };
   }
 
-  let target = buttons.find(button => {
+  // Pick by stable attribute substring only. No "last button" fallback —
+  // silently clicking the wrong button is worse than failing explicitly.
+  const target = buttons.find(button => {
     const attrs = actionAttrs(button);
-    return attrs.includes('accept') || attrs.includes('confirm');
+    return tokens.some(token => attrs.includes(token));
   });
   if (!target) {
-    target = buttons[buttons.length - 1];
+    return {
+      found: true,
+      clicked: false,
+      reason: 'action_unavailable',
+      profile_url: profileUrl,
+      action_count: buttons.length,
+      text: normalize(card.innerText || card.textContent),
+    };
   }
 
   target.click();
@@ -800,20 +822,22 @@ def _connection_result(
     return result
 
 
-def _incoming_invitation_accept_result(
+def _invitation_action_result(
     url: str,
     status: str,
     message: str,
     *,
+    action: str,
     linkedin_username: str,
     profile_url: str = "",
     performed: bool = False,
 ) -> dict[str, Any]:
-    """Build the internal response for incoming-request acceptance."""
+    """Build the response for an invitation action (accept / ignore / withdraw)."""
     result: dict[str, Any] = {
         "url": url,
         "status": status,
         "message": message,
+        "action": action,
         "linkedin_username": linkedin_username,
         "performed": performed,
     }
@@ -4567,81 +4591,117 @@ class LinkedInExtractor:
                 break
         return cards
 
-    async def _accept_incoming_invitation(
+    # Action -> (invitation manager kind, success status verb).
+    # All three actions share the same page-pipeline; only the page and the
+    # button-matching tokens (see _INVITATION_ACTION_JS) differ.
+    _INVITATION_ACTIONS: dict[str, tuple[Literal["received", "sent"], str]] = {
+        "accept": ("received", "accepted"),
+        "ignore": ("received", "ignored"),
+        "withdraw": ("sent", "withdrawn"),
+    }
+
+    async def act_on_invitation(
         self,
         linkedin_username: str,
+        action: Literal["accept", "ignore", "withdraw"],
     ) -> dict[str, Any]:
-        """Accept a received invitation from the invitation manager for connect flow."""
+        """Accept, ignore, or withdraw a pending invitation.
+
+        Navigates to the invitation manager (received for accept/ignore, sent
+        for withdraw), locates the card for ``linkedin_username``, clicks the
+        action button identified by stable engineering attributes, and verifies
+        the card disappeared.
+        """
+        if action not in self._INVITATION_ACTIONS:
+            raise ValueError(
+                f"Unknown invitation action: {action!r} "
+                f"(expected one of: {sorted(self._INVITATION_ACTIONS)})"
+            )
+        kind, success_status = self._INVITATION_ACTIONS[action]
+
         username = _normalize_invitation_username(linkedin_username)
-        url = _invitation_manager_url("received")
+        url = _invitation_manager_url(kind)
         profile_url = f"/in/{username}/" if username else ""
         if not username:
-            return _incoming_invitation_accept_result(
+            return _invitation_action_result(
                 url,
                 "not_found",
                 "LinkedIn username is required.",
+                action=action,
                 linkedin_username=username,
                 profile_url=profile_url,
             )
 
         await self._navigate_to_page(url)
         await detect_rate_limit(self._page)
-        await self._wait_for_main_text(log_context="Invitations (received)")
+        await self._wait_for_main_text(log_context=f"Invitations ({kind})")
         await handle_modal_close(self._page)
         await self._scroll_main_scrollable_region(
             position="bottom", attempts=3, pause_time=0.5
         )
         await self._expand_invitation_note_toggles()
 
-        clicked = await self._click_incoming_invitation_accept(username=username)
+        clicked = await self._click_invitation_action(username=username, action=action)
         profile_url = str(clicked.get("profile_url") or profile_url)
         if not clicked.get("found"):
-            return _incoming_invitation_accept_result(
+            return _invitation_action_result(
                 url,
                 "not_found",
-                f"No received invitation was found for {username}.",
+                f"No {kind} invitation was found for {username}.",
+                action=action,
                 linkedin_username=username,
                 profile_url=profile_url,
             )
         if not clicked.get("clicked"):
-            return _incoming_invitation_accept_result(
+            return _invitation_action_result(
                 url,
                 "action_unavailable",
-                f"LinkedIn did not expose a usable accept action for {username}.",
+                f"LinkedIn did not expose a usable {action} action for {username}.",
+                action=action,
                 linkedin_username=username,
                 profile_url=profile_url,
             )
 
         await asyncio.sleep(0.75)
         if await self._invitation_card_present(username):
-            return _incoming_invitation_accept_result(
+            return _invitation_action_result(
                 url,
                 "verification_failed",
-                "Clicked accept, but the invitation card was still visible.",
+                f"Clicked {action}, but the invitation card was still visible.",
+                action=action,
                 linkedin_username=username,
                 profile_url=profile_url,
                 performed=True,
             )
 
-        return _incoming_invitation_accept_result(
+        return _invitation_action_result(
             url,
-            "accepted",
-            "Invitation accepted.",
+            success_status,
+            f"Invitation {success_status}.",
+            action=action,
             linkedin_username=username,
             profile_url=profile_url,
             performed=True,
         )
 
-    async def _click_incoming_invitation_accept(
+    async def _accept_incoming_invitation(
+        self,
+        linkedin_username: str,
+    ) -> dict[str, Any]:
+        """Accept a received invitation. Thin wrapper used by ``connect_with_person``."""
+        return await self.act_on_invitation(linkedin_username, "accept")
+
+    async def _click_invitation_action(
         self,
         *,
         username: str,
+        action: str,
     ) -> dict[str, Any]:
-        """Click a received invitation accept action without localized text."""
+        """Click an invitation action button without relying on localized text."""
         try:
             result = await self._page.evaluate(
-                _INVITATION_ACCEPT_ACTION_JS,
-                {"username": username},
+                _INVITATION_ACTION_JS,
+                {"username": username, "action": action},
             )
         except Exception:
             logger.debug("Invitation action click failed", exc_info=True)

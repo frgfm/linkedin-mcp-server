@@ -34,6 +34,7 @@ def _make_mock_extractor(scrape_result: dict) -> MagicMock:
     mock.search_conversations = AsyncMock(return_value=scrape_result)
     mock.send_message = AsyncMock(return_value=scrape_result)
     mock.get_pending_invitations = AsyncMock(return_value=scrape_result)
+    mock.act_on_invitation = AsyncMock(return_value=scrape_result)
     mock.get_my_profile = AsyncMock(return_value=scrape_result)
     mock.search_companies = AsyncMock(return_value=scrape_result)
     mock.get_company_employees = AsyncMock(return_value=scrape_result)
@@ -1269,15 +1270,86 @@ class TestNetworkTools:
         with pytest.raises(ValidationError, match="limit"):
             await mcp.call_tool("get_pending_invitations", {"limit": 101})
 
-    async def test_invitation_action_tools_are_not_registered(self):
+    async def test_invitation_action_tools_are_registered(self):
         from linkedin_mcp_server.tools.network import register_network_tools
 
         mcp = FastMCP("test")
         register_network_tools(mcp)
 
-        assert await mcp.get_tool("accept_invitation") is None
-        assert await mcp.get_tool("reject_invitation") is None
-        assert await mcp.get_tool("withdraw_invitation") is None
+        assert await mcp.get_tool("respond_to_invitation") is not None
+        assert await mcp.get_tool("withdraw_invitation") is not None
+
+    @pytest.mark.parametrize("action", ["accept", "ignore"])
+    async def test_respond_to_invitation_success(self, mock_context, action):
+        expected = {
+            "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/",
+            "status": "accepted" if action == "accept" else "ignored",
+            "message": "Invitation handled.",
+            "action": action,
+            "linkedin_username": "alice",
+            "performed": True,
+            "profile_url": "/in/alice/",
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "respond_to_invitation")
+        result = await tool_fn(
+            linkedin_username="alice",
+            action=action,
+            ctx=mock_context,
+            extractor=mock_extractor,
+        )
+
+        assert result["action"] == action
+        assert result["status"] == ("accepted" if action == "accept" else "ignored")
+        mock_extractor.act_on_invitation.assert_awaited_once_with("alice", action)
+
+    async def test_respond_to_invitation_rejects_invalid_action(self):
+        from pydantic import ValidationError
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        with pytest.raises(ValidationError, match="action"):
+            await mcp.call_tool(
+                "respond_to_invitation",
+                {"linkedin_username": "alice", "action": "withdraw"},
+            )
+
+    async def test_withdraw_invitation_success(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/mynetwork/invitation-manager/sent/",
+            "status": "withdrawn",
+            "message": "Invitation withdrawn.",
+            "action": "withdraw",
+            "linkedin_username": "bob",
+            "performed": True,
+            "profile_url": "/in/bob/",
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "withdraw_invitation")
+        result = await tool_fn(
+            linkedin_username="bob",
+            ctx=mock_context,
+            extractor=mock_extractor,
+        )
+
+        assert result["status"] == "withdrawn"
+        assert result["action"] == "withdraw"
+        mock_extractor.act_on_invitation.assert_awaited_once_with("bob", "withdraw")
 
     async def test_get_connections_success(self, mock_context):
         expected = {

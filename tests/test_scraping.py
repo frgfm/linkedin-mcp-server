@@ -4178,6 +4178,197 @@ class TestInvitationManagement:
 
         assert await extractor._invitation_card_present("alice") is False
 
+    # --- act_on_invitation -------------------------------------------------
+
+    @staticmethod
+    def _patch_invitation_pipeline(extractor):
+        """Patch the navigate→scroll→expand pipeline used by act_on_invitation."""
+        stack = ExitStack()
+        e = stack.enter_context
+        nav = e(patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock))
+        e(
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            )
+        )
+        e(
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            )
+        )
+        e(patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock))
+        e(
+            patch.object(
+                extractor,
+                "_scroll_main_scrollable_region",
+                new_callable=AsyncMock,
+            )
+        )
+        e(
+            patch.object(
+                extractor,
+                "_expand_invitation_note_toggles",
+                new_callable=AsyncMock,
+            )
+        )
+        e(
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            )
+        )
+        return stack, nav
+
+    @pytest.mark.parametrize(
+        "action, kind, status",
+        [
+            ("accept", "received", "accepted"),
+            ("ignore", "received", "ignored"),
+            ("withdraw", "sent", "withdrawn"),
+        ],
+    )
+    async def test_act_on_invitation_success_path(
+        self, mock_page, action, kind, status
+    ):
+        extractor = LinkedInExtractor(mock_page)
+        stack, nav = self._patch_invitation_pipeline(extractor)
+        with stack:
+            click_mock = stack.enter_context(
+                patch.object(
+                    extractor,
+                    "_click_invitation_action",
+                    new_callable=AsyncMock,
+                    return_value={
+                        "found": True,
+                        "clicked": True,
+                        "profile_url": "/in/alice/",
+                    },
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    extractor,
+                    "_invitation_card_present",
+                    new_callable=AsyncMock,
+                    return_value=False,
+                )
+            )
+            result = await extractor.act_on_invitation("alice", action)
+
+        nav.assert_awaited_once_with(
+            f"https://www.linkedin.com/mynetwork/invitation-manager/{kind}/"
+        )
+        click_mock.assert_awaited_once_with(username="alice", action=action)
+        assert result["status"] == status
+        assert result["action"] == action
+        assert result["performed"] is True
+        assert result["linkedin_username"] == "alice"
+        assert result["profile_url"] == "/in/alice/"
+
+    async def test_act_on_invitation_not_found_without_username(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        # No pipeline patching — should short-circuit before any nav.
+        with patch.object(
+            extractor, "_navigate_to_page", new_callable=AsyncMock
+        ) as nav:
+            result = await extractor.act_on_invitation("", "accept")
+        nav.assert_not_awaited()
+        assert result["status"] == "not_found"
+        assert result["action"] == "accept"
+        assert result["performed"] is False
+
+    async def test_act_on_invitation_not_found_when_card_missing(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        stack, _ = self._patch_invitation_pipeline(extractor)
+        with stack:
+            stack.enter_context(
+                patch.object(
+                    extractor,
+                    "_click_invitation_action",
+                    new_callable=AsyncMock,
+                    return_value={"found": False, "clicked": False},
+                )
+            )
+            result = await extractor.act_on_invitation("ghost", "ignore")
+        assert result["status"] == "not_found"
+        assert result["action"] == "ignore"
+        assert result["performed"] is False
+
+    async def test_act_on_invitation_action_unavailable_when_no_button(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        stack, _ = self._patch_invitation_pipeline(extractor)
+        with stack:
+            stack.enter_context(
+                patch.object(
+                    extractor,
+                    "_click_invitation_action",
+                    new_callable=AsyncMock,
+                    return_value={
+                        "found": True,
+                        "clicked": False,
+                        "reason": "action_unavailable",
+                        "profile_url": "/in/alice/",
+                    },
+                )
+            )
+            result = await extractor.act_on_invitation("alice", "withdraw")
+        assert result["status"] == "action_unavailable"
+        assert result["action"] == "withdraw"
+        assert result["performed"] is False
+        assert "withdraw" in result["message"]
+
+    async def test_act_on_invitation_verification_failed(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        stack, _ = self._patch_invitation_pipeline(extractor)
+        with stack:
+            stack.enter_context(
+                patch.object(
+                    extractor,
+                    "_click_invitation_action",
+                    new_callable=AsyncMock,
+                    return_value={
+                        "found": True,
+                        "clicked": True,
+                        "profile_url": "/in/alice/",
+                    },
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    extractor,
+                    "_invitation_card_present",
+                    new_callable=AsyncMock,
+                    return_value=True,
+                )
+            )
+            result = await extractor.act_on_invitation("alice", "accept")
+        assert result["status"] == "verification_failed"
+        assert result["performed"] is True
+
+    async def test_act_on_invitation_rejects_unknown_action(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        # Bypass static-type narrowing to exercise the runtime guard.
+        act = getattr(extractor, "act_on_invitation")
+        with pytest.raises(ValueError, match="Unknown invitation action"):
+            await act("alice", "explode")
+
+    async def test_accept_incoming_invitation_delegates_to_act_on_invitation(
+        self, mock_page
+    ):
+        """Slim wrapper preserves connect_with_person's call shape."""
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "act_on_invitation",
+            new_callable=AsyncMock,
+            return_value={"status": "accepted"},
+        ) as mock_act:
+            result = await extractor._accept_incoming_invitation("alice")
+        mock_act.assert_awaited_once_with("alice", "accept")
+        assert result == {"status": "accepted"}
+
 
 # ----------------------------------------------------------------------
 # Conversation test helpers.
