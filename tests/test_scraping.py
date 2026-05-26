@@ -4244,6 +4244,8 @@ class TestInvitationManagement:
                         "found": True,
                         "clicked": True,
                         "profile_url": "/in/alice/",
+                        "action_count": 2 if kind == "received" else 1,
+                        "match_strategy": "attr",
                     },
                 )
             )
@@ -4266,6 +4268,8 @@ class TestInvitationManagement:
         assert result["performed"] is True
         assert result["linkedin_username"] == "alice"
         assert result["profile_url"] == "/in/alice/"
+        assert result["action_count"] == (2 if kind == "received" else 1)
+        assert result["match_strategy"] == "attr"
 
     async def test_act_on_invitation_not_found_without_username(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
@@ -4310,6 +4314,7 @@ class TestInvitationManagement:
                         "clicked": False,
                         "reason": "action_unavailable",
                         "profile_url": "/in/alice/",
+                        "action_count": 3,
                     },
                 )
             )
@@ -4318,6 +4323,60 @@ class TestInvitationManagement:
         assert result["action"] == "withdraw"
         assert result["performed"] is False
         assert "withdraw" in result["message"]
+        # Diagnostic: surface the observed button count so callers can debug
+        # against the documented expected layout (withdraw expects 1).
+        assert result["action_count"] == 3
+
+    async def test_act_on_invitation_propagates_position_fallback_strategy(
+        self, mock_page
+    ):
+        """When the JS picks Ignore by position fallback, the result echoes it."""
+        extractor = LinkedInExtractor(mock_page)
+        stack, _ = self._patch_invitation_pipeline(extractor)
+        with stack:
+            stack.enter_context(
+                patch.object(
+                    extractor,
+                    "_click_invitation_action",
+                    new_callable=AsyncMock,
+                    return_value={
+                        "found": True,
+                        "clicked": True,
+                        "profile_url": "/in/alice/",
+                        "action_count": 2,
+                        "match_strategy": "position",
+                    },
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    extractor,
+                    "_invitation_card_present",
+                    new_callable=AsyncMock,
+                    return_value=False,
+                )
+            )
+            result = await extractor.act_on_invitation("alice", "ignore")
+        assert result["status"] == "ignored"
+        assert result["match_strategy"] == "position"
+        assert result["action_count"] == 2
+
+    def test_invitation_action_js_declares_position_fallback(self):
+        """Regression guard: the JS must keep its documented position fallback
+        and 2/1-button expected layout (received: ignore=0, accept=1;
+        sent: withdraw=0). Without it, accounts whose Ignore/Accept buttons
+        carry opaque data-* attrs fall back to action_unavailable."""
+        from linkedin_mcp_server.scraping.extractor import _INVITATION_ACTION_JS
+
+        assert "POSITION_FALLBACK" in _INVITATION_ACTION_JS
+        assert "match_strategy" in _INVITATION_ACTION_JS
+        # The accept/ignore/withdraw position constants must remain.
+        for needle in (
+            "accept:   { count: 2, index: 1 }",
+            "ignore:   { count: 2, index: 0 }",
+            "withdraw: { count: 1, index: 0 }",
+        ):
+            assert needle in _INVITATION_ACTION_JS, f"missing: {needle!r}"
 
     async def test_act_on_invitation_verification_failed(self, mock_page):
         extractor = LinkedInExtractor(mock_page)

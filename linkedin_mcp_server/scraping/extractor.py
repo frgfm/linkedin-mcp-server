@@ -574,14 +574,28 @@ _INVITATION_ACTION_JS = r"""
 ({ username, action }) => {
   // Action -> attr-substring whitelist. We match LinkedIn's stable engineering
   // attributes (data-control-name etc), never aria-label text — per CLAUDE.md
-  // the verb in an aria-label is locale-dependent.
+  // the verb in an aria-label is locale-dependent. If the stable attrs don't
+  // carry the token (LinkedIn's invitation manager often emits opaque attrs
+  // like `data-view-name="pending-invitation-card"` on every action button),
+  // we fall back to the documented LinkedIn UX layout:
+  //   * received card: [Ignore (secondary, left), Accept (primary, right)]
+  //   * sent card:     [Withdraw]
+  // The fallback only fires when the card's visible-button count matches the
+  // expected layout for that action — otherwise we return action_unavailable.
   const ACTION_TOKENS = {
     accept:   ['accept', 'confirm'],
     ignore:   ['ignore', 'decline', 'dismiss', 'reject'],
     withdraw: ['withdraw', 'cancel'],
   };
+  // (expected button count on the card, index to click when count matches)
+  const POSITION_FALLBACK = {
+    accept:   { count: 2, index: 1 },  // Accept is the right/primary button
+    ignore:   { count: 2, index: 0 },  // Ignore is the left/secondary button
+    withdraw: { count: 1, index: 0 },  // Withdraw is the only action
+  };
   const tokens = ACTION_TOKENS[action];
-  if (!tokens) {
+  const fallback = POSITION_FALLBACK[action];
+  if (!tokens || !fallback) {
     return { found: false, clicked: false, reason: 'unknown_action' };
   }
 
@@ -606,9 +620,11 @@ _INVITATION_ACTION_JS = r"""
   };
   const actionAttrs = el => [
     el.getAttribute('data-control-name'),
+    el.getAttribute('data-tracking-control-name'),
     el.getAttribute('data-test-id'),
     el.getAttribute('data-testid'),
     el.getAttribute('data-view-name'),
+    el.getAttribute('name'),
     el.getAttribute('id'),
   ].filter(Boolean).join(' ').toLowerCase();
 
@@ -650,12 +666,20 @@ _INVITATION_ACTION_JS = r"""
     };
   }
 
-  // Pick by stable attribute substring only. No "last button" fallback —
-  // silently clicking the wrong button is worse than failing explicitly.
-  const target = buttons.find(button => {
+  // 1) Preferred: pick by stable engineering attribute substring.
+  let target = buttons.find(button => {
     const attrs = actionAttrs(button);
     return tokens.some(token => attrs.includes(token));
   });
+  let strategy = target ? 'attr' : null;
+
+  // 2) Fallback: pick by documented UX position when the card matches the
+  //    expected button layout for this action.
+  if (!target && buttons.length === fallback.count) {
+    target = buttons[fallback.index];
+    strategy = 'position';
+  }
+
   if (!target) {
     return {
       found: true,
@@ -673,6 +697,7 @@ _INVITATION_ACTION_JS = r"""
     clicked: true,
     profile_url: profileUrl,
     action_count: buttons.length,
+    match_strategy: strategy,
     text: normalize(card.innerText || card.textContent),
   };
 }
@@ -831,6 +856,8 @@ def _invitation_action_result(
     linkedin_username: str,
     profile_url: str = "",
     performed: bool = False,
+    action_count: int | None = None,
+    match_strategy: str | None = None,
 ) -> dict[str, Any]:
     """Build the response for an invitation action (accept / ignore / withdraw)."""
     result: dict[str, Any] = {
@@ -843,6 +870,10 @@ def _invitation_action_result(
     }
     if profile_url:
         result["profile_url"] = profile_url
+    if action_count is not None:
+        result["action_count"] = action_count
+    if match_strategy:
+        result["match_strategy"] = match_strategy
     return result
 
 
@@ -4643,6 +4674,10 @@ class LinkedInExtractor:
 
         clicked = await self._click_invitation_action(username=username, action=action)
         profile_url = str(clicked.get("profile_url") or profile_url)
+        raw_count = clicked.get("action_count")
+        action_count = raw_count if isinstance(raw_count, int) else None
+        raw_strategy = clicked.get("match_strategy")
+        match_strategy = raw_strategy if isinstance(raw_strategy, str) else None
         if not clicked.get("found"):
             return _invitation_action_result(
                 url,
@@ -4660,6 +4695,7 @@ class LinkedInExtractor:
                 action=action,
                 linkedin_username=username,
                 profile_url=profile_url,
+                action_count=action_count,
             )
 
         await asyncio.sleep(0.75)
@@ -4672,6 +4708,8 @@ class LinkedInExtractor:
                 linkedin_username=username,
                 profile_url=profile_url,
                 performed=True,
+                action_count=action_count,
+                match_strategy=match_strategy,
             )
 
         return _invitation_action_result(
@@ -4682,6 +4720,8 @@ class LinkedInExtractor:
             linkedin_username=username,
             profile_url=profile_url,
             performed=True,
+            action_count=action_count,
+            match_strategy=match_strategy,
         )
 
     async def _accept_incoming_invitation(
