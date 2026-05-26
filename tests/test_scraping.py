@@ -4373,12 +4373,12 @@ class TestInvitationManagement:
         verified_state: str | None = None,
         click_clicked: bool = True,
         dialog_open: bool = True,
-        confirm_clicked: bool = True,
     ):
-        """Patch the scrape→signals→click→dialog→verify pipeline used by
-        _withdraw_outgoing_invitation. Returns the ExitStack (entered by
-        caller) and a MagicMock for ``detect_connection_state`` so tests
-        can assert call order if needed."""
+        """Patch the scrape→signals→click→dialog→confirm→verify pipeline used
+        by ``_withdraw_outgoing_invitation``. Returns the ExitStack (entered
+        by caller), the ``detect_connection_state`` MagicMock, and the
+        ``page.evaluate`` AsyncMock (so tests can override its side_effect
+        to exercise confirm-click failures)."""
         from contextlib import ExitStack
 
         stack = ExitStack()
@@ -4411,6 +4411,8 @@ class TestInvitationManagement:
                 detect_mock,
             )
         )
+        # Two evaluate calls happen on the happy path: the Pending anchor
+        # click and the dialog confirm click. Both return success by default.
         evaluate_mock = AsyncMock(
             return_value={"found": click_clicked, "clicked": click_clicked}
         )
@@ -4421,21 +4423,6 @@ class TestInvitationManagement:
                 "_dialog_is_open",
                 new_callable=AsyncMock,
                 return_value=dialog_open,
-            )
-        )
-        e(
-            patch.object(
-                extractor,
-                "_click_dialog_primary_button",
-                new_callable=AsyncMock,
-                return_value=confirm_clicked,
-            )
-        )
-        e(
-            patch.object(
-                extractor,
-                "_dismiss_dialog",
-                new_callable=AsyncMock,
             )
         )
         extractor._page.wait_for_selector = AsyncMock()
@@ -4503,6 +4490,25 @@ class TestInvitationManagement:
             result = await extractor.act_on_invitation("alice", "withdraw")
         assert result["status"] == "verification_failed"
         assert result["performed"] is True
+
+    async def test_withdraw_via_profile_confirm_click_fails(self, mock_page):
+        """If the JS confirm click doesn't land, we return action_unavailable
+        without dismissing the dialog — a dismiss would actively close the
+        modal without withdrawing, which is the original bug we are fixing."""
+        extractor = LinkedInExtractor(mock_page)
+        stack, _, evaluate_mock = self._patch_withdraw_profile_pipeline(
+            extractor, state="pending"
+        )
+        # Pending click succeeds; confirm click fails.
+        evaluate_mock.side_effect = [
+            {"found": True, "clicked": True},
+            {"found": True, "clicked": False, "reason": "no_buttons"},
+        ]
+        with stack:
+            result = await extractor.act_on_invitation("alice", "withdraw")
+        assert result["status"] == "action_unavailable"
+        assert result["performed"] is True
+        assert "confirm" in result["message"].lower()
 
     def test_invitation_action_js_declares_position_fallback(self):
         """Regression guard: the JS must keep its documented position fallback

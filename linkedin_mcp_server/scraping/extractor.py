@@ -282,6 +282,39 @@ _CLICK_PENDING_WITHDRAW_JS = (
 """
 )
 
+# Click the primary (last) button inside the open confirm dialog. Used to
+# confirm the withdraw modal. We click via DOM .click() instead of
+# Playwright's .click() because Playwright's actionability checks
+# (visibility-stability, hit-testing) race with LinkedIn's modal mount
+# animation and the click can silently time out — the same reason
+# send_message clicks the Send button via JS. LinkedIn consistently
+# places the primary action as the last button in dialog DOM order
+# (×, Cancel, Confirm); we filter out disabled/hidden buttons and take
+# the last remaining one.
+_CLICK_DIALOG_LAST_BUTTON_JS = r"""
+() => {
+  const dialog = document.querySelector('dialog[open], [role="dialog"]');
+  if (!dialog) {
+    return { found: false, clicked: false, reason: 'no_dialog' };
+  }
+  const buttons = Array.from(
+    dialog.querySelectorAll('button, [role="button"]')
+  ).filter(btn => {
+    if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
+      return false;
+    }
+    const rects = btn.getClientRects ? btn.getClientRects() : [];
+    return rects.length > 0;
+  });
+  if (buttons.length === 0) {
+    return { found: true, clicked: false, reason: 'no_buttons' };
+  }
+  const target = buttons[buttons.length - 1];
+  target.click();
+  return { found: true, clicked: true, button_count: buttons.length };
+}
+"""
+
 _INVITATION_CARDS_JS = r"""
 ({ kind, limit }) => {
   const root = document.querySelector('main') || document.body;
@@ -4856,13 +4889,21 @@ class LinkedInExtractor:
                 performed=True,
             )
 
-        confirmed = await self._click_dialog_primary_button()
-        if not confirmed:
-            await self._dismiss_dialog()
+        # Confirm via DOM .click() — Playwright's actionability checks race
+        # with the modal mount animation here (the same reason send_message
+        # clicks Send via JS). Do not call _dismiss_dialog on failure: if
+        # the confirm click didn't land, dismissing would actively close the
+        # dialog without withdrawing. Let LinkedIn time out the modal.
+        try:
+            confirm_result = await self._page.evaluate(_CLICK_DIALOG_LAST_BUTTON_JS)
+        except Exception:
+            logger.debug("Withdraw confirm click failed", exc_info=True)
+            confirm_result = {"found": False, "clicked": False}
+        if not (isinstance(confirm_result, dict) and confirm_result.get("clicked")):
             return _invitation_action_result(
                 url,
                 "action_unavailable",
-                "Could not click the primary Withdraw button in the confirm dialog.",
+                "Could not click the Withdraw confirm button in the dialog.",
                 action="withdraw",
                 linkedin_username=username,
                 profile_url=profile_url,
