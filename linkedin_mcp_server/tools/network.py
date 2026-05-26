@@ -57,3 +57,43 @@ def register_network_tools(
                 raise_tool_error(relogin_exc, "get_pending_invitations")
         except Exception as e:
             raise_tool_error(e, "get_pending_invitations")  # NoReturn
+
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="Get Connections",
+        annotations={"readOnlyHint": True, "openWorldHint": True},
+        tags={"network", "scraping"},
+        exclude_args=["extractor"],
+    )
+    async def get_connections(
+        ctx: Context,
+        limit: Annotated[int, Field(ge=1, le=100)] = 20,
+        extractor: Any | None = None,
+    ) -> dict[str, Any]:
+        """
+        List the authenticated user's most recently added 1st-degree connections.
+
+        Returns ``url`` and a ``connections`` array. Each connection is
+        ``{name, url, headline, connected_on}``. ``url`` is the relative
+        ``/in/<slug>/`` profile path. ``connected_on`` is an ISO date
+        (``YYYY-MM-DD``) parsed from the en-US "Connected on Month DD, YYYY"
+        line, or ``None`` for other locales / unparseable text.
+        """
+        try:
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="get_connections"
+            )
+            logger.info("Fetching connections (limit=%d)", limit)
+            await ctx.report_progress(
+                progress=0, total=100, message="Loading connections"
+            )
+            result = await extractor.get_connections(limit=limit)
+            await ctx.report_progress(progress=100, total=100, message="Complete")
+            return result
+        except AuthenticationError as e:
+            try:
+                await handle_auth_error(e, ctx)
+            except Exception as relogin_exc:
+                raise_tool_error(relogin_exc, "get_connections")
+        except Exception as e:
+            raise_tool_error(e, "get_connections")  # NoReturn

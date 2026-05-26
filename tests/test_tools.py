@@ -1279,6 +1279,75 @@ class TestNetworkTools:
         assert await mcp.get_tool("reject_invitation") is None
         assert await mcp.get_tool("withdraw_invitation") is None
 
+    async def test_get_connections_success(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/mynetwork/invite-connect/connections/",
+            "connections": [
+                {
+                    "name": "Rob Choy",
+                    "url": "/in/robchoy/",
+                    "headline": "Founder & investor",
+                    "connected_on": "2026-05-25",
+                },
+                {
+                    "name": "Santiago Moreno",
+                    "url": "/in/santiago-moreno-7098138b/",
+                    "headline": "Regional Operations Manager - RWE Renewables France",
+                    "connected_on": "2026-05-24",
+                },
+            ],
+        }
+        mock_extractor = _make_mock_extractor(expected)
+        mock_extractor.get_connections = AsyncMock(return_value=expected)
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "get_connections")
+        result = await tool_fn(mock_context, extractor=mock_extractor)
+
+        assert list(result) == ["url", "connections"]
+        assert result["connections"][0]["url"] == "/in/robchoy/"
+        assert result["connections"][0]["connected_on"] == "2026-05-25"
+        mock_extractor.get_connections.assert_awaited_once_with(limit=20)
+
+    async def test_get_connections_structured_content_shape(self):
+        expected = {
+            "url": "https://www.linkedin.com/mynetwork/invite-connect/connections/",
+            "connections": [],
+        }
+        mock_extractor = _make_mock_extractor(expected)
+        mock_extractor.get_connections = AsyncMock(return_value=expected)
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        with patch(
+            "linkedin_mcp_server.tools.network.get_ready_extractor",
+            new_callable=AsyncMock,
+            return_value=mock_extractor,
+        ):
+            result = await mcp.call_tool("get_connections", {"limit": 5})
+
+        assert result.structured_content == expected
+        assert list(result.structured_content or {}) == ["url", "connections"]
+        mock_extractor.get_connections.assert_awaited_once_with(limit=5)
+
+    async def test_get_connections_rejects_excessive_limit(self):
+        from pydantic import ValidationError
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        with pytest.raises(ValidationError, match="limit"):
+            await mcp.call_tool("get_connections", {"limit": 101})
+
 
 class TestToolTimeouts:
     async def test_all_tools_have_global_timeout(self):
@@ -1301,6 +1370,7 @@ class TestToolTimeouts:
             "search_conversations",
             "send_message",
             "get_pending_invitations",
+            "get_connections",
             "get_feed",
             "close_session",
         )
@@ -1333,6 +1403,7 @@ class TestToolTimeouts:
             "search_conversations",
             "send_message",
             "get_pending_invitations",
+            "get_connections",
             "get_feed",
             "close_session",
         )

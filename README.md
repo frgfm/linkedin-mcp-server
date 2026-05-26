@@ -28,6 +28,7 @@ Through this LinkedIn MCP server, AI assistants like Claude can connect to your 
 | `search_conversations` | Search messages by keyword | working |
 | `send_message` | Send a message to a LinkedIn user (requires confirmation) | [#433](https://github.com/stickerdaniel/linkedin-mcp-server/issues/433) [#441](https://github.com/stickerdaniel/linkedin-mcp-server/issues/441) |
 | `get_pending_invitations` | List pending network invitations from `/mynetwork/invitation-manager/` (`received` or `sent`) | working |
+| `get_connections` | List most recently added 1st-degree connections from `/mynetwork/invite-connect/connections/` | working |
 | `get_company_profile` | Extract company information with explicit section selection (posts, jobs); about-section references may include a `company_urn` entry carrying the numeric id used by LinkedIn's people-search `currentCompany` URL facet | working |
 | `get_company_posts` | Get recent posts from a company's LinkedIn feed | working |
 | `search_companies` | Search for companies on LinkedIn by keywords | working |
@@ -44,6 +45,11 @@ expose `type` (`connection_request`, `page_follow`, or
 `sender`, optional `note`, `target`, and `message_url` (compose path with full
 query string for connection requests). Sent invitations are connection requests
 with `invitation_age` and `recipient` (`name`, `url`, `headline`).
+
+`get_connections` returns `{url, connections}` ordered most-recently-added
+first. Each connection has `name`, `url` (relative `/in/<slug>/`), `headline`,
+and `connected_on` (ISO date `YYYY-MM-DD`, parsed from the en-US "Connected on
+Month DD, YYYY" line — `null` for other locales or unparseable text).
 
 <br/>
 <br/>

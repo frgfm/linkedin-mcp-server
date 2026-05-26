@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import date
 import json
 import logging
 import re
@@ -36,7 +37,11 @@ from linkedin_mcp_server.scraping.link_metadata import (
     build_references,
     dedupe_references,
 )
-from linkedin_mcp_server.scraping.conversation import extract_conversation
+from linkedin_mcp_server.scraping.conversation import (
+    extract_conversation,
+    normalize_profile_url,
+    parse_day_heading,
+)
 
 from .fields import COMPANY_SECTIONS, PERSON_SECTIONS
 
@@ -673,6 +678,106 @@ _EXPAND_INVITATION_NOTES_JS = r"""
 }
 """
 
+_CONNECTION_CARDS_JS = r"""
+({ limit }) => {
+  const root = document.querySelector('main') || document.body;
+  if (!root) return [];
+
+  const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+  const linesFrom = el => {
+    const text = el ? (el.innerText || el.textContent || '') : '';
+    return text.split('\n').map(normalize).filter(Boolean);
+  };
+  const linkedInPath = href => {
+    try {
+      const url = new URL(href, location.origin);
+      return `${url.pathname}${url.search}${url.hash}`;
+    } catch {
+      return '';
+    }
+  };
+  const visible = el => {
+    if (!el || !el.getClientRects) return false;
+    const rects = el.getClientRects();
+    if (!rects.length) return false;
+    const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+    return !style || (style.display !== 'none' && style.visibility !== 'hidden');
+  };
+  const profileSlug = path => {
+    const m = path && path.match(/^\/in\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : '';
+  };
+  const connectedOnRe = /\bconnected\s+(?:on|since)\b/i;
+
+  // Climb from each profile anchor up to the smallest visible ancestor
+  // whose text contains the en-US "Connected on/since ..." line and at
+  // most one /in/ slug (this slug). The Connected-on line is the V1
+  // contract: anchors whose surroundings lack it are not connection rows
+  // (e.g. People-You-May-Know rails) and are skipped.
+  const cardForAnchor = (anchor, slug) => {
+    let el = anchor.parentElement;
+    let depth = 0;
+    while (el && el !== root && depth < 10) {
+      if (visible(el)) {
+        const text = el.innerText || el.textContent || '';
+        if (text && text.length < 800 && connectedOnRe.test(text)) {
+          const otherProfiles = Array.from(el.querySelectorAll('a[href*="/in/"]'))
+            .filter(a => {
+              const otherSlug = profileSlug(linkedInPath(a.getAttribute('href') || a.href));
+              return otherSlug && otherSlug !== slug;
+            });
+          if (otherProfiles.length === 0) return el;
+        }
+      }
+      el = el.parentElement;
+      depth += 1;
+    }
+    return null;
+  };
+
+  const cards = [];
+  const seenSlugs = new Set();
+  for (const anchor of Array.from(root.querySelectorAll('a[href*="/in/"]')).filter(visible)) {
+    const path = linkedInPath(anchor.getAttribute('href') || anchor.href);
+    const slug = profileSlug(path);
+    if (!slug) continue;
+    if (seenSlugs.has(slug)) continue;
+    const card = cardForAnchor(anchor, slug);
+    if (!card) continue;
+
+    // Identity is the URL; name comes from visible anchor text. If no
+    // anchor in this card has visible text, skip rather than fall back
+    // to ``img[alt]`` labels — those carry locale-specific cleanup rules
+    // (English possessive, French "photo de profil de …") that the V1
+    // en-US contract does not support.
+    const nameAnchor = Array.from(card.querySelectorAll('a[href*="/in/"]'))
+      .filter(a => profileSlug(linkedInPath(a.getAttribute('href') || a.href)) === slug && visible(a))
+      .find(a => linesFrom(a).length > 0);
+    if (!nameAnchor) continue;
+
+    const nameAnchorLines = linesFrom(nameAnchor);
+    const name = nameAnchorLines[0];
+    // The connections page renders the headline as subsequent
+    // ``innerText`` lines inside the same profile anchor. Anchor-line
+    // parsing is sufficient on its own — no card-wide line fallback.
+    const headline = nameAnchorLines.slice(1)
+      .filter(line => line && line !== name)
+      .join(' • ') || null;
+    const connectedLine = linesFrom(card).find(line => connectedOnRe.test(line)) || null;
+
+    seenSlugs.add(slug);
+    cards.push({
+      name,
+      profile_url: `/in/${slug}/`,
+      headline,
+      connected_on_text: connectedLine,
+    });
+    if (limit && cards.length >= limit) break;
+  }
+  return cards;
+}
+"""
+
 
 def _connection_result(
     url: str,
@@ -982,6 +1087,69 @@ def _invitation_identity_key(invitation: dict[str, Any]) -> tuple[str, str, str,
         str(page.get("url") or ""),
         str(newsletter.get("url") or ""),
     )
+
+
+_CONNECTIONS_URL = "https://www.linkedin.com/mynetwork/invite-connect/connections/"
+
+# en-US "Connected on/since" prefix followed by a strict day-heading
+# shape (``Month DD`` with optional ``, YYYY``). Bounded capture stops at
+# the heading itself so trailing separators (``·``, em-dash, etc.) do not
+# leak into :func:`conversation.parse_day_heading`. Locale scope matches
+# conversation.py's en-US assumption: dates we cannot parse surface as
+# ``connected_on: null`` rather than raise.
+_CONNECTED_ON_RE_EN_US = re.compile(
+    r"\bconnected\s+(?:on|since)\s+([A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?)",
+    flags=re.IGNORECASE,
+)
+
+
+def _parse_connected_on(value: Any) -> str | None:
+    """Parse "Connected on Month DD, YYYY" → "YYYY-MM-DD" (en-US).
+
+    Reuses :func:`conversation.parse_day_heading` for the day-heading tail
+    so the en-US month table lives in exactly one place. Validation is via
+    :class:`datetime.date`, which rejects impossible dates like Feb 30.
+    Returns None for missing, non-en-US, or invalid values — never raises.
+    """
+    text = _optional_text(value)
+    if not text:
+        return None
+    match = _CONNECTED_ON_RE_EN_US.search(text)
+    if not match:
+        return None
+    parsed = parse_day_heading(match.group(1).strip())
+    if not parsed:
+        return None
+    month, day, year = parsed
+    if year is None:
+        return None
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+def _normalize_connection(raw: Any) -> dict[str, Any] | None:
+    """Normalize a raw connection card into the public record shape.
+
+    Returns ``{name, url, headline, connected_on}`` or ``None`` when the
+    profile URL is missing — every connection must be addressable.
+    """
+    if not isinstance(raw, dict):
+        return None
+    url = normalize_profile_url(_optional_text(raw.get("profile_url")))
+    if not url:
+        return None
+    return {
+        "name": _optional_text(raw.get("name")),
+        "url": url,
+        "headline": _optional_text(raw.get("headline")),
+        "connected_on": _parse_connected_on(raw.get("connected_on_text")),
+    }
+
+
+def _connection_identity_key(connection: dict[str, Any]) -> tuple[str]:
+    return (str(connection.get("url") or ""),)
 
 
 def _normalize_csv(value: str, mapping: dict[str, str]) -> str:
@@ -4227,6 +4395,94 @@ class LinkedInExtractor:
                 cards.append(invitation)
                 if len(cards) >= limit:
                     break
+        return cards
+
+    async def get_connections(self, limit: int = 20) -> dict[str, Any]:
+        """List the authenticated user's most recently added 1st-degree connections.
+
+        Returns ``{url, connections}`` where each connection is
+        ``{name, url, headline, connected_on}``. ``connected_on`` is an
+        ISO date (``YYYY-MM-DD``) parsed from the en-US "Connected on
+        Month DD, YYYY" line, or ``None`` for other locales / unparseable
+        text. ``url`` is the relative ``/in/<slug>/`` profile path.
+        """
+        url = _CONNECTIONS_URL
+        await self._navigate_to_page(url)
+        await detect_rate_limit(self._page)
+        await self._wait_for_main_text(log_context="Connections")
+        await handle_modal_close(self._page)
+
+        connections: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str]] = set()
+        # Generous scroll cap; the ``len(connections) >= limit`` and
+        # ``not moved`` guards below handle early termination so this cap
+        # does not bake in a per-viewport card-density assumption.
+        max_scrolls = 20
+        for attempt in range(max_scrolls + 1):
+            for connection in await self._extract_connection_cards(limit=limit):
+                key = _connection_identity_key(connection)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                connections.append(connection)
+                if len(connections) >= limit:
+                    break
+
+            if len(connections) >= limit or attempt >= max_scrolls:
+                break
+
+            moved = await self._scroll_connections_down()
+            if not moved:
+                break
+
+        return {"url": url, "connections": connections}
+
+    async def _scroll_connections_down(self) -> bool:
+        """Scroll the connections page one viewport down.
+
+        Aliases :meth:`_scroll_invitation_manager_down`: today both pages
+        share the same "find the largest scrollable container inside
+        ``<main>``" heuristic. Keeping a named entry point makes the
+        connections call site read honestly and gives the two pages a
+        cheap divergence path if their scroll containers ever differ.
+        """
+        return await self._scroll_invitation_manager_down()
+
+    async def _extract_connection_cards(
+        self,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Extract structured connection cards from the connections page.
+
+        DOM access is needed because each row's headline and "Connected on"
+        line are siblings of the profile anchor, not attributes. Card
+        boundaries are inferred by climbing the anchor's parents until a
+        bounded-size ancestor containing only this connection's ``/in/``
+        anchors is found — locale-independent.
+        """
+        try:
+            raw_cards = await self._page.evaluate(
+                _CONNECTION_CARDS_JS,
+                {"limit": min(limit * 2, 200)},
+            )
+        except Exception:
+            logger.debug("Connection card extraction failed", exc_info=True)
+            return []
+        if not isinstance(raw_cards, list):
+            return []
+
+        # ``_CONNECTION_CARDS_JS`` already dedupes by ``profileSlug`` so we
+        # do not re-check identity here. Cross-scroll dedup is handled by
+        # ``get_connections`` via ``_connection_identity_key``.
+        cards: list[dict[str, Any]] = []
+        for raw in raw_cards:
+            connection = _normalize_connection(raw)
+            if connection is None:
+                continue
+            cards.append(connection)
+            if len(cards) >= limit:
+                break
         return cards
 
     async def _accept_incoming_invitation(
