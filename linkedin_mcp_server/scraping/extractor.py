@@ -5262,13 +5262,38 @@ class LinkedInExtractor:
                 )
             )
 
-        # Give LinkedIn a moment to commit the state change before re-reading.
-        await asyncio.sleep(0.75)
-        verified_signals = await self._read_action_signals(username)
-        # Re-read the page text only for accept (which can flip state via
-        # the messaging-only action root); ignore strips the incoming-request
-        # buttons from the top-card without changing other signals.
-        verified_state = detect_connection_state(page_text, verified_signals)
+        # Verify the click landed by polling fresh page state. The DOM
+        # does not update synchronously after click() — LinkedIn streams
+        # the Accept/Ignore button removal — so we must re-read text and
+        # signals on each attempt. Critically, we *re-fetch* main's
+        # innerText: the original page_text variable is a frozen snapshot
+        # from the first scrape, and reusing it would make
+        # detect_connection_state return incoming_request forever
+        # because _has_incoming_request_text is text-only and would
+        # always see the stale Accept/Ignore lines.
+        #
+        # Budget: ~5 s (10 × 0.5 s) — empirically enough on every profile
+        # observed in testing. Fast path: first iteration after the
+        # immediate state flip exits the loop in <1 s.
+        verified_state: str = "incoming_request"
+        for _ in range(10):
+            try:
+                fresh_text = await self._page.evaluate(
+                    """() => {
+                      const main = document.querySelector('main');
+                      return main ? (main.innerText || main.textContent || '') : '';
+                    }"""
+                )
+            except Exception:
+                fresh_text = ""
+            if not isinstance(fresh_text, str):
+                fresh_text = ""
+            verified_signals = await self._read_action_signals(username)
+            verified_state = detect_connection_state(fresh_text, verified_signals)
+            if verified_state != "incoming_request":
+                break
+            await asyncio.sleep(0.5)
+
         if verified_state == "incoming_request":
             return _attach_diagnostics(
                 _invitation_action_result(

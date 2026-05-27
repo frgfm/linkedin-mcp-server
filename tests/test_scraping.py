@@ -4201,7 +4201,16 @@ class TestInvitationManagement:
         ``_respond_to_incoming_invitation``. Returns the ExitStack (entered
         by caller), the ``detect_connection_state`` MagicMock, and the
         ``page.evaluate`` AsyncMock so tests can override its return value
-        to exercise diagnostic surfacing."""
+        to exercise diagnostic surfacing.
+
+        Verification polls (up to 10 iterations) so detect/signals/evaluate
+        mocks must tolerate arbitrary call counts. The first
+        ``detect_connection_state`` call returns ``state``; subsequent calls
+        return ``verified_state``. The first ``page.evaluate`` returns the
+        click result; subsequent calls (fresh-text fetches during polling)
+        return empty string. Tests that need to inject diagnostics into the
+        click result mutate ``evaluate_mock.click_result``.
+        """
         from contextlib import ExitStack
 
         stack = ExitStack()
@@ -4220,26 +4229,45 @@ class TestInvitationManagement:
                 extractor,
                 "_read_action_signals",
                 new_callable=AsyncMock,
-                # First call returns state-relevant signals; second
-                # (verification) returns verified-state signals.
-                side_effect=[MagicMock(), MagicMock()],
+                # Any number of calls return a fresh MagicMock; detect_mock
+                # is what actually drives the state transition.
+                return_value=MagicMock(),
             )
         )
-        detect_mock = MagicMock(
-            side_effect=[
-                state,
-                verified_state if verified_state is not None else state,
-            ]
-        )
+
+        detect_calls = {"n": 0}
+        final_state = verified_state if verified_state is not None else state
+
+        def _detect_side_effect(*args, **kwargs):
+            detect_calls["n"] += 1
+            return state if detect_calls["n"] == 1 else final_state
+
+        detect_mock = MagicMock(side_effect=_detect_side_effect)
         e(
             patch(
                 "linkedin_mcp_server.scraping.connection.detect_connection_state",
                 detect_mock,
             )
         )
-        evaluate_mock = AsyncMock(
-            return_value={"found": click_clicked, "clicked": click_clicked}
-        )
+
+        # evaluate_mock.click_result is the dict returned by the FIRST
+        # evaluate (the click). Subsequent calls (polling for fresh main
+        # innerText) return an empty string so the verification loop reads
+        # a non-incoming-request text and exits as soon as detect_mock
+        # transitions.
+        evaluate_calls = {"n": 0}
+
+        async def _evaluate_side_effect(*args, **kwargs):
+            evaluate_calls["n"] += 1
+            if evaluate_calls["n"] == 1:
+                return evaluate_mock.click_result
+            return ""
+
+        evaluate_mock = AsyncMock(side_effect=_evaluate_side_effect)
+        evaluate_mock.click_result = {
+            "found": click_clicked,
+            "clicked": click_clicked,
+        }
         extractor._page.evaluate = evaluate_mock
         e(
             patch(
@@ -4276,9 +4304,10 @@ class TestInvitationManagement:
         assert result["linkedin_username"] == "alice"
         assert result["profile_url"] == "/in/alice/"
         assert result["url"] == "https://www.linkedin.com/in/alice/"
-        # The click JS was invoked with the action + locale-table labels.
-        evaluate_mock.assert_awaited_once()
-        js_args = evaluate_mock.await_args.args[1]
+        # The click JS was the FIRST evaluate call; subsequent calls fetch
+        # fresh main innerText during verification polling.
+        first_call = evaluate_mock.await_args_list[0]
+        js_args = first_call.args[1]
         assert js_args["action"] == action
         # Labels come from INCOMING_REQUEST_LABELS — at least the English
         # pair must be present in target/other label arrays.
@@ -4335,7 +4364,7 @@ class TestInvitationManagement:
         stack, _, evaluate_mock = self._patch_incoming_profile_pipeline(
             extractor, state="incoming_request"
         )
-        evaluate_mock.return_value = {
+        evaluate_mock.click_result = {
             "found": True,
             "clicked": False,
             "reason": "no_buttons",
@@ -4377,7 +4406,7 @@ class TestInvitationManagement:
                 {"tag": "button", "text": "Accept", "classes": "artdeco-button--primary"},
             ],
         }
-        evaluate_mock.return_value = click_diagnostics
+        evaluate_mock.click_result = click_diagnostics
         with stack:
             result = await extractor.act_on_invitation("alice", "accept")
 
@@ -4661,6 +4690,37 @@ class TestInvitationManagement:
             result = await extractor.act_on_invitation("alice", "accept")
         assert result["status"] == "verification_failed"
         assert result["performed"] is True
+
+    async def test_respond_to_incoming_verification_polls_fresh_text(
+        self, mock_page
+    ):
+        """Live regression: verification must re-fetch <main> innerText
+        rather than reusing the original scrape's page_text. The original
+        text still contains the "Accept\\nIgnore" lines and would always
+        re-classify as incoming_request, falsely reporting
+        verification_failed even after a successful click.
+
+        This test forces detect_connection_state to flip to
+        already_connected on the second call — verifying the polling
+        loop actually re-evaluates rather than caching the initial state.
+        """
+        extractor = LinkedInExtractor(mock_page)
+        stack, detect_mock, evaluate_mock = self._patch_incoming_profile_pipeline(
+            extractor,
+            state="incoming_request",
+            verified_state="already_connected",
+        )
+        with stack:
+            result = await extractor.act_on_invitation("alice", "accept")
+
+        assert result["status"] == "accepted"
+        assert result["performed"] is True
+        # detect_connection_state must be called at least twice: once for
+        # the pre-click state, once for the post-click verification.
+        assert detect_mock.call_count >= 2
+        # page.evaluate must be awaited at least twice: once for the
+        # click, once for the fresh-text fetch during verification.
+        assert evaluate_mock.await_count >= 2
 
     async def test_act_on_invitation_rejects_unknown_action(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
