@@ -149,18 +149,18 @@ class MainProfile(TypedDict):
     assume en-US (BrowserManager forces en-US).
     """
 
-    name: Required[str | None]
-    headline: Required[str | None]
-    location: Required[str | None]
-    profile_picture_url: Required[str | None]
-    connection_count: Required[int | None]
-    follower_count: Required[int | None]
-    mutual_connection_count: Required[int | None]
-    main_organization: Required[str | None]
-    main_education: Required[str | None]
-    about: Required[str | None]
-    experience: Required[list[Experience]]
-    education: Required[list[Education]]
+    name: str | None
+    headline: str | None
+    location: str | None
+    profile_picture_url: str | None
+    connection_count: int | None
+    follower_count: int | None
+    mutual_connection_count: int | None
+    main_organization: str | None
+    main_education: str | None
+    about: str | None
+    experience: list[Experience]
+    education: list[Education]
 
 
 _GENERIC_LABELS = {

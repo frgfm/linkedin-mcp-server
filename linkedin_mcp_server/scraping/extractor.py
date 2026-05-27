@@ -1970,6 +1970,8 @@ class LinkedInExtractor:
         url: str,
         section_name: str,
         max_scrolls: int | None = None,
+        *,
+        skip_scroll: bool = False,
     ) -> ExtractedSection:
         """Navigate to a URL, scroll to load lazy content, and extract innerText.
 
@@ -1977,19 +1979,27 @@ class LinkedInExtractor:
         (sidebar/footer noise with no actual content), which indicates a soft
         rate limit.
 
+        ``skip_scroll`` skips the lazy-load scroll sweep. Use when a downstream
+        extractor (e.g. ``extract_main_profile``) owns the scroll strategy and
+        the duplicate sweep would just churn the DOM.
+
         Raises LinkedInScraperException subclasses (rate limit, auth, etc.).
         Returns _RATE_LIMITED_MSG sentinel when soft-rate-limited after retry.
         Returns empty string for unexpected non-domain failures (error isolation).
         """
         try:
-            result = await self._extract_page_once(url, section_name, max_scrolls)
+            result = await self._extract_page_once(
+                url, section_name, max_scrolls, skip_scroll=skip_scroll
+            )
             if result.text != _RATE_LIMITED_MSG:
                 return result
 
             # Retry once after backoff
             logger.info("Retrying %s after %.0fs backoff", url, _RATE_LIMIT_RETRY_DELAY)
             await asyncio.sleep(_RATE_LIMIT_RETRY_DELAY)
-            return await self._extract_page_once(url, section_name, max_scrolls)
+            return await self._extract_page_once(
+                url, section_name, max_scrolls, skip_scroll=skip_scroll
+            )
 
         except LinkedInScraperException:
             raise
@@ -2011,16 +2021,22 @@ class LinkedInExtractor:
         url: str,
         section_name: str,
         max_scrolls: int | None = None,
+        *,
+        skip_scroll: bool = False,
     ) -> ExtractedSection:
         """Single attempt to navigate, scroll, and extract innerText."""
         await self._navigate_to_page(url)
-        return await self._extract_loaded_section(url, section_name, max_scrolls)
+        return await self._extract_loaded_section(
+            url, section_name, max_scrolls, skip_scroll=skip_scroll
+        )
 
     async def _extract_loaded_section(
         self,
         url: str,
         section_name: str,
         max_scrolls: int | None = None,
+        *,
+        skip_scroll: bool = False,
     ) -> ExtractedSection:
         """Run the post-navigation extraction pipeline on the current page.
 
@@ -2138,8 +2154,12 @@ class LinkedInExtractor:
                     logger.debug("Show more click failed: %s", e)
                     break
 
-        # Scroll to trigger lazy loading
-        if is_activity:
+        # Scroll to trigger lazy loading. Callers that own their own scroll
+        # strategy (e.g. extract_main_profile) opt out via skip_scroll to
+        # avoid a redundant full-page sweep.
+        if skip_scroll:
+            pass
+        elif is_activity:
             scrolls = max_scrolls if max_scrolls is not None else 10
             await scroll_to_bottom(self._page, pause_time=1.0, max_scrolls=scrolls)
         else:
@@ -2292,15 +2312,11 @@ class LinkedInExtractor:
                     await asyncio.sleep(_NAV_DELAY)
 
                 url = base_url + suffix
-                # main_profile needs a deeper scroll budget than the
-                # default 5 so the experience/education entry lists
-                # finish hydrating before extract_main_profile reads
-                # them. Honor an explicit user override.
-                section_max_scrolls = (
-                    8
-                    if section_name == "main_profile" and max_scrolls is None
-                    else max_scrolls
-                )
+                # main_profile owns its own scroll strategy inside
+                # extract_main_profile (container-aware sweep + per-section
+                # scrollIntoView). Skip the default scroll_to_bottom pass so
+                # the page only scrolls once per profile load.
+                skip_scroll = section_name == "main_profile"
                 try:
                     can_reuse_main = (
                         section_name == "main_profile"
@@ -2312,7 +2328,8 @@ class LinkedInExtractor:
                         extracted = await self._extract_loaded_section(
                             url,
                             section_name=section_name,
-                            max_scrolls=section_max_scrolls,
+                            max_scrolls=max_scrolls,
+                            skip_scroll=skip_scroll,
                         )
                         if extracted.text == _RATE_LIMITED_MSG:
                             logger.info(
@@ -2322,7 +2339,8 @@ class LinkedInExtractor:
                             extracted = await self.extract_page(
                                 url,
                                 section_name=section_name,
-                                max_scrolls=section_max_scrolls,
+                                max_scrolls=max_scrolls,
+                                skip_scroll=skip_scroll,
                             )
                     elif is_overlay:
                         extracted = await self._extract_overlay(
@@ -2332,7 +2350,8 @@ class LinkedInExtractor:
                         extracted = await self.extract_page(
                             url,
                             section_name=section_name,
-                            max_scrolls=section_max_scrolls,
+                            max_scrolls=max_scrolls,
+                            skip_scroll=skip_scroll,
                         )
 
                     if extracted.text and extracted.text != _RATE_LIMITED_MSG:
@@ -2439,6 +2458,19 @@ class LinkedInExtractor:
         except Exception as e:
             logger.debug("Re-read of <main> innerText failed: %s", e)
             return ""
+
+    async def _main_innertext_if_present(self, profile: dict[str, Any]) -> str:
+        """Re-read ``<main>`` innerText only when ``main_profile`` was scraped.
+
+        Wraps the guard ``connect_with_person`` repeats after every
+        post-action ``scrape_person`` call: structured dicts can't feed
+        :func:`detect_connection_state`, so we re-fetch the raw text from
+        the page — but only when the section actually came back, otherwise
+        the empty string keeps existing fallback paths intact.
+        """
+        if "main_profile" not in profile.get("sections", {}):
+            return ""
+        return await self._read_main_innertext()
 
     async def _read_action_signals(self, username: str) -> ActionSignals:
         """Read locale-independent structural signals for a profile's
@@ -2625,11 +2657,7 @@ class LinkedInExtractor:
                     profile=page_text,
                 )
             verified = await self.scrape_person(username, {"main_profile"})
-            verified_text = (
-                await self._read_main_innertext()
-                if "main_profile" in verified.get("sections", {})
-                else ""
-            )
+            verified_text = await self._main_innertext_if_present(verified)
             verified_signals = await self._read_action_signals(username)
             verified_state = detect_connection_state(verified_text, verified_signals)
             if verified_state != "already_connected":
@@ -2695,11 +2723,7 @@ class LinkedInExtractor:
             )
 
         verified = await self.scrape_person(username, {"main_profile"})
-        verified_text = (
-            await self._read_main_innertext()
-            if "main_profile" in verified.get("sections", {})
-            else ""
-        )
+        verified_text = await self._main_innertext_if_present(verified)
         verified_signals = await self._read_action_signals(username)
         verified_state = detect_connection_state(verified_text, verified_signals)
 
