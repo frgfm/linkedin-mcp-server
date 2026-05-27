@@ -435,15 +435,16 @@ _CLICK_WITHDRAW_CONFIRM_JS = r"""
 }
 """
 
-# Click the primary (last) button inside the open confirm dialog. Used to
-# confirm the withdraw modal. We click via DOM .click() instead of
-# Playwright's .click() because Playwright's actionability checks
-# (visibility-stability, hit-testing) race with LinkedIn's modal mount
-# animation and the click can silently time out — the same reason
-# send_message clicks the Send button via JS. LinkedIn consistently
-# places the primary action as the last button in dialog DOM order
-# (×, Cancel, Confirm); we filter out disabled/hidden buttons and take
-# the last remaining one.
+# Reads <main>'s rendered innerText. Used for state-detection text
+# scans (e.g. _has_incoming_request_text) that need fresh top-card text
+# without the cost of a full scrape_person section extraction.
+_READ_MAIN_INNERTEXT_JS = r"""
+() => {
+  const main = document.querySelector('main');
+  return main ? (main.innerText || main.textContent || '') : '';
+}
+"""
+
 
 _INVITATION_CARDS_JS = r"""
 ({ kind, limit }) => {
@@ -2715,10 +2716,7 @@ class LinkedInExtractor:
         surfaces the raw text without depending on that shape.
         """
         try:
-            return await self._page.evaluate(
-                "() => { const m = document.querySelector('main');"
-                " return m ? (m.innerText || '') : ''; }"
-            )
+            return await self._page.evaluate(_READ_MAIN_INNERTEXT_JS)
         except Exception as e:
             logger.debug("Re-read of <main> innerText failed: %s", e)
             return ""
@@ -2735,6 +2733,32 @@ class LinkedInExtractor:
         if "main_profile" not in profile.get("sections", {}):
             return ""
         return await self._read_main_innertext()
+
+    async def _load_profile_for_state(
+        self, username: str
+    ) -> tuple[str, ActionSignals]:
+        """Lightweight loader for invitation-action write paths.
+
+        Returns ``(page_text, signals)`` — exactly what
+        :func:`detect_connection_state` consumes — without going through
+        :meth:`scrape_person`'s full section-extraction + references
+        pipeline. Used by ``_withdraw_outgoing_invitation`` and
+        ``_respond_to_incoming_invitation`` because those flows only
+        need to classify the current relationship state before clicking
+        an action button; the structured ``main_profile`` payload that
+        ``scrape_person`` builds is unused on the mutation path.
+
+        Decoupling these write paths from ``scrape_person`` also avoids
+        coupling them to future ``main_profile`` extraction changes —
+        the contract here is purely raw ``<main>`` innerText + ARIA
+        signals.
+        """
+        url = f"https://www.linkedin.com/in/{username}/"
+        await self._navigate_to_page(url)
+        await self._wait_for_main_text(log_context=f"Profile {username}")
+        text = await self._read_main_innertext()
+        signals = await self._read_action_signals(username)
+        return text, signals
 
     async def _read_action_signals(self, username: str) -> ActionSignals:
         """Read locale-independent structural signals for a profile's
@@ -4903,8 +4927,13 @@ class LinkedInExtractor:
                 profile_url=profile_url,
             )
 
-        profile = await self.scrape_person(username, {"main_profile"})
-        page_text = profile.get("sections", {}).get("main_profile", "")
+        # Lean gating: this is a write path that only needs the top-card
+        # text (for the locale-table fallbacks in detect_connection_state)
+        # and the action signals — not the full section extraction
+        # pipeline. Avoid scrape_person's scroll + structured-extraction
+        # + references cost; navigate, wait for main, read fresh
+        # innerText + signals directly.
+        page_text, signals = await self._load_profile_for_state(username)
         if not page_text:
             return _invitation_action_result(
                 url,
@@ -4915,7 +4944,6 @@ class LinkedInExtractor:
                 profile_url=profile_url,
             )
 
-        signals = await self._read_action_signals(username)
         state = detect_connection_state(page_text, signals)
         if state == "already_connected":
             return _invitation_action_result(
@@ -5157,8 +5185,10 @@ class LinkedInExtractor:
                 profile_url=profile_url,
             )
 
-        profile = await self.scrape_person(username, {"main_profile"})
-        page_text = profile.get("sections", {}).get("main_profile", "")
+        # Lean gating: write path; same rationale as
+        # _withdraw_outgoing_invitation. Avoid scrape_person's full
+        # section-extraction pipeline.
+        page_text, signals = await self._load_profile_for_state(username)
         if not page_text:
             return _invitation_action_result(
                 url,
@@ -5168,8 +5198,6 @@ class LinkedInExtractor:
                 linkedin_username=username,
                 profile_url=profile_url,
             )
-
-        signals = await self._read_action_signals(username)
         state = detect_connection_state(page_text, signals)
         if state == "already_connected":
             # Accept on an already-connected profile is a no-op success;
@@ -5278,12 +5306,7 @@ class LinkedInExtractor:
         verified_state: str = "incoming_request"
         for _ in range(10):
             try:
-                fresh_text = await self._page.evaluate(
-                    """() => {
-                      const main = document.querySelector('main');
-                      return main ? (main.innerText || main.textContent || '') : '';
-                    }"""
-                )
+                fresh_text = await self._page.evaluate(_READ_MAIN_INNERTEXT_JS)
             except Exception:
                 fresh_text = ""
             if not isinstance(fresh_text, str):

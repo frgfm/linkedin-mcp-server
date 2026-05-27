@@ -153,11 +153,13 @@ def register_network_tools(
         """
         Withdraw an outgoing LinkedIn connection request.
 
-        Navigates to ``/mynetwork/invitation-manager/sent/``, finds the card
-        for ``linkedin_username``, and clicks Withdraw.
+        Navigates to ``/in/{linkedin_username}/``, verifies the page is
+        showing an outgoing-pending state, clicks the Pending control,
+        and confirms in the withdraw modal. Sidesteps the sent-page
+        pagination cost for accounts with many outstanding requests.
 
-        Status: ``withdrawn`` | ``not_found`` | ``action_unavailable``
-        | ``verification_failed``.
+        Status: ``withdrawn`` | ``not_found`` | ``already_connected``
+        | ``action_unavailable`` | ``verification_failed``.
         """
         try:
             extractor = extractor or await get_ready_extractor(

@@ -4216,21 +4216,26 @@ class TestInvitationManagement:
         stack = ExitStack()
         e = stack.enter_context
 
+        # The lean gating path: _load_profile_for_state replaces the
+        # heavier scrape_person + _read_action_signals pair on write
+        # paths. Mock it directly so tests don't need to know about the
+        # internal navigation + innertext + signals decomposition.
         e(
             patch.object(
                 extractor,
-                "scrape_person",
+                "_load_profile_for_state",
                 new_callable=AsyncMock,
-                return_value={"sections": {"main_profile": "Alice\n--\nLondon"}},
+                return_value=("Alice\n--\nLondon", MagicMock()),
             )
         )
+        # The polling verification still calls _read_action_signals
+        # directly. Any number of calls return a fresh MagicMock;
+        # detect_mock drives the state transition.
         e(
             patch.object(
                 extractor,
                 "_read_action_signals",
                 new_callable=AsyncMock,
-                # Any number of calls return a fresh MagicMock; detect_mock
-                # is what actually drives the state transition.
                 return_value=MagicMock(),
             )
         )
@@ -4473,22 +4478,23 @@ class TestInvitationManagement:
         stack = ExitStack()
         e = stack.enter_context
 
+        # Lean gating: _load_profile_for_state replaces scrape_person +
+        # _read_action_signals on write paths.
         e(
             patch.object(
                 extractor,
-                "scrape_person",
+                "_load_profile_for_state",
                 new_callable=AsyncMock,
-                return_value={"sections": {"main_profile": "Alice\n--\nLondon"}},
+                return_value=("Alice\n--\nLondon", MagicMock()),
             )
         )
+        # Withdraw also re-reads signals for verification (call 2).
         e(
             patch.object(
                 extractor,
                 "_read_action_signals",
                 new_callable=AsyncMock,
-                # First call returns state-relevant signals; second
-                # (verification) returns verified-state signals.
-                side_effect=[MagicMock(), MagicMock()],
+                return_value=MagicMock(),
             )
         )
         detect_mock = MagicMock(

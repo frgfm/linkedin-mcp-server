@@ -1432,6 +1432,8 @@ class TestToolTimeouts:
             "send_message",
             "get_pending_invitations",
             "get_connections",
+            "ignore_connection_request",
+            "withdraw_invitation",
             "get_feed",
             "close_session",
         )
@@ -1465,6 +1467,8 @@ class TestToolTimeouts:
             "send_message",
             "get_pending_invitations",
             "get_connections",
+            "ignore_connection_request",
+            "withdraw_invitation",
             "get_feed",
             "close_session",
         )
