@@ -766,16 +766,13 @@ _INVITATION_CARDS_JS = r"""
 # visible from the tool result without re-running with extra logging.
 _CLICK_INCOMING_ACTION_JS = (
     r"""
-((action) => {
+((args) => {
+  const { action, target_labels, other_labels } = args;
 """
     + _FIND_ACTION_ROOT_FN_JS
     + r"""
   const main = document.querySelector('main');
   if (!main) return { found: false, clicked: false, reason: 'no_main' };
-  const actionRoot = findActionRoot(main);
-  if (!actionRoot) {
-    return { found: false, clicked: false, reason: 'no_action_root' };
-  }
 
   const visible = el => {
     if (el.disabled) return false;
@@ -784,6 +781,8 @@ _CLICK_INCOMING_ACTION_JS = (
   };
   const isTextBearing = b =>
     ((b.innerText || b.textContent || '').trim()).length > 0;
+  const buttonText = b =>
+    ((b.innerText || b.textContent || '').trim()).toLowerCase();
   const stableAttrs = el => [
     el.getAttribute('data-control-name'),
     el.getAttribute('data-tracking-control-name'),
@@ -805,60 +804,97 @@ _CLICK_INCOMING_ACTION_JS = (
       typeof el.className === 'string' ? el.className.slice(0, 120) : null,
   });
 
-  // Candidates: text-bearing <button>s inside the action root that are
-  // not aria-expanded menu openers (the More button).
-  const buttons = Array.from(actionRoot.querySelectorAll('button'))
+  const targetSet = new Set(
+    (target_labels || []).map(s => s.toLowerCase())
+  );
+  const otherSet = new Set(
+    (other_labels || []).map(s => s.toLowerCase())
+  );
+
+  // --- Strategy 0: locale-table label scan over the entire <main> ----------
+  // LinkedIn does not always render a Message button alongside an incoming
+  // request, so a compose-anchor walk (findActionRoot) can return null
+  // even when Accept + Ignore are clearly in the DOM. This first pass
+  // sidesteps that: scan every visible text-bearing <button> in main and
+  // pick the one whose normalized text matches one of the target action's
+  // labels from INCOMING_REQUEST_LABELS. Per CLAUDE.md, this is the
+  // sanctioned text-fallback path — gated through the same locale table
+  // already used by detect_connection_state.
+  const mainButtons = Array.from(
+    main.querySelectorAll('button, [role="button"]')
+  )
     .filter(visible)
     .filter(isTextBearing)
     .filter(b => !b.hasAttribute('aria-expanded'));
-  const enumeration = buttons.map(describe);
 
-  if (buttons.length === 0) {
-    return {
-      found: true,
-      clicked: false,
-      reason: 'no_buttons',
-      action_buttons: enumeration,
-    };
+  const mainEnumeration = mainButtons.map(describe);
+  let target = null;
+  let strategy = null;
+
+  if (targetSet.size > 0) {
+    target = mainButtons.find(b => targetSet.has(buttonText(b)));
+    if (target) strategy = 'label_text';
   }
 
-  const ACTION_ATTR_TOKEN = { accept: 'accept', ignore: 'ignore' };
-  const token = ACTION_ATTR_TOKEN[action];
-  if (!token) {
-    return { found: false, clicked: false, reason: 'unknown_action' };
-  }
+  // --- Strategies 1-3: structural fallbacks scoped to the action root ------
+  // If the label scan misses (locale not in the table, or LinkedIn
+  // changed the label slightly), fall back to action-root structural
+  // detection so we still have a chance of clicking the right button.
+  let rootButtons = [];
+  if (!target) {
+    const actionRoot = findActionRoot(main);
+    if (actionRoot) {
+      rootButtons = Array.from(actionRoot.querySelectorAll('button'))
+        .filter(visible)
+        .filter(isTextBearing)
+        .filter(b => !b.hasAttribute('aria-expanded'));
 
-  let target = buttons.find(b => stableAttrs(b).includes(token));
-  let strategy = target ? `attr_${action}` : null;
+      // Exclude buttons whose text matches the *other* action's labels —
+      // protects against accidentally clicking Ignore when we wanted Accept.
+      const candidates = otherSet.size > 0
+        ? rootButtons.filter(b => !otherSet.has(buttonText(b)))
+        : rootButtons;
 
-  // Design-system class layer: Accept is the primary CTA; Ignore is the
-  // non-primary text-bearing button. Only meaningful when both
-  // Accept + Ignore are present.
-  if (!target && buttons.length >= 2) {
-    if (action === 'accept') {
-      target = buttons.find(b =>
-        b.classList.contains('artdeco-button--primary')
-      );
-    } else {
-      target = buttons.find(b =>
-        !b.classList.contains('artdeco-button--primary')
-      );
+      // 1) Stable engineering attr substring.
+      const token = action === 'accept' ? 'accept' : 'ignore';
+      target = candidates.find(b => stableAttrs(b).includes(token));
+      if (target) strategy = 'attr_' + action;
+
+      // 2) Design-system class: Accept is primary, Ignore is the non-primary
+      //    text-bearing sibling.
+      if (!target && candidates.length >= 2) {
+        if (action === 'accept') {
+          target = candidates.find(b =>
+            b.classList.contains('artdeco-button--primary')
+          );
+        } else {
+          target = candidates.find(b =>
+            !b.classList.contains('artdeco-button--primary')
+          );
+        }
+        if (target) strategy = 'design_system_class';
+      }
+
+      // 3) Position fallback: documented UX layout [Ignore, Accept].
+      if (!target && candidates.length === 2) {
+        target = candidates[action === 'accept' ? 1 : 0];
+        strategy = 'position';
+      }
     }
-    if (target) strategy = 'design_system_class';
   }
 
-  // Position fallback: documented UX layout [Ignore, Accept].
-  if (!target && buttons.length === 2) {
-    target = buttons[action === 'accept' ? 1 : 0];
-    strategy = 'position';
-  }
+  const rootEnumeration = rootButtons.map(describe);
 
   if (!target) {
     return {
-      found: true,
+      found: false,
       clicked: false,
-      reason: 'action_unavailable',
-      action_buttons: enumeration,
+      reason: targetSet.size === 0 && rootButtons.length === 0
+        ? 'no_action_root'
+        : 'action_unavailable',
+      main_buttons: mainEnumeration,
+      action_buttons: rootEnumeration,
+      target_labels: Array.from(targetSet),
     };
   }
 
@@ -866,10 +902,11 @@ _CLICK_INCOMING_ACTION_JS = (
   return {
     found: true,
     clicked: true,
-    button_count: buttons.length,
+    button_count: (strategy === 'label_text' ? mainButtons : rootButtons).length,
     match_strategy: strategy,
     clicked_button: describe(target),
-    action_buttons: enumeration,
+    action_buttons: strategy === 'label_text' ? mainEnumeration : rootEnumeration,
+    main_buttons: mainEnumeration,
   };
 })
 """
@@ -5158,9 +5195,27 @@ class LinkedInExtractor:
                 profile_url=profile_url,
             )
 
+        # Pass the locale-gated label table to the JS so it can match
+        # buttons by visible text (the strongest signal — works even when
+        # the compose-anchor walk fails because LinkedIn renders the
+        # incoming-request top-card without a Message button).
+        from linkedin_mcp_server.scraping.connection import (
+            INCOMING_REQUEST_LABELS,
+        )
+
+        accept_labels = [pair[0] for pair in INCOMING_REQUEST_LABELS.values()]
+        ignore_labels = [pair[1] for pair in INCOMING_REQUEST_LABELS.values()]
+        target_labels = accept_labels if action == "accept" else ignore_labels
+        other_labels = ignore_labels if action == "accept" else accept_labels
+
         try:
             click_result = await self._page.evaluate(
-                _CLICK_INCOMING_ACTION_JS, action
+                _CLICK_INCOMING_ACTION_JS,
+                {
+                    "action": action,
+                    "target_labels": target_labels,
+                    "other_labels": other_labels,
+                },
             )
         except Exception:
             logger.debug(
@@ -5175,6 +5230,7 @@ class LinkedInExtractor:
                 "match_strategy",
                 "clicked_button",
                 "action_buttons",
+                "main_buttons",
                 "button_count",
             ):
                 value = click_result.get(key)

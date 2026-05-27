@@ -4259,10 +4259,18 @@ class TestInvitationManagement:
         assert result["linkedin_username"] == "alice"
         assert result["profile_url"] == "/in/alice/"
         assert result["url"] == "https://www.linkedin.com/in/alice/"
-        # The click JS was invoked with the action as positional argument.
+        # The click JS was invoked with the action + locale-table labels.
         evaluate_mock.assert_awaited_once()
-        _, call_args = evaluate_mock.await_args.args[:2]
-        assert call_args == action
+        js_args = evaluate_mock.await_args.args[1]
+        assert js_args["action"] == action
+        # Labels come from INCOMING_REQUEST_LABELS — at least the English
+        # pair must be present in target/other label arrays.
+        if action == "accept":
+            assert "Accept" in js_args["target_labels"]
+            assert "Ignore" in js_args["other_labels"]
+        else:
+            assert "Ignore" in js_args["target_labels"]
+            assert "Accept" in js_args["other_labels"]
 
     async def test_act_on_invitation_not_found_without_username(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
@@ -4365,16 +4373,25 @@ class TestInvitationManagement:
         assert result["action_count"] == 2
 
     def test_click_incoming_action_js_declares_strategy_layers(self):
-        """Regression guard: the incoming-action JS must keep its documented
-        three-layer strategy (attr → design-system class → position) and
-        filter out icon-only/expanded buttons so we never land on a More menu
-        opener or chevron button."""
+        """Regression guard: the incoming-action JS must keep its four
+        documented strategy layers (label_text → attr → design-system class
+        → position) and filter out icon-only/expanded buttons so we never
+        land on a More menu opener or chevron button.
+
+        The label_text strategy is essential because LinkedIn does not
+        always render a Message button alongside an incoming request —
+        the compose-anchor action-root walk can return null even when
+        Accept + Ignore are clearly in the DOM. Scanning <main> for
+        buttons whose visible text matches INCOMING_REQUEST_LABELS is
+        the robust catch-all per CLAUDE.md's text-fallback exception.
+        """
         from linkedin_mcp_server.scraping.extractor import _CLICK_INCOMING_ACTION_JS
 
+        # Strategy 0: locale-table label scan.
+        assert "'label_text'" in _CLICK_INCOMING_ACTION_JS
+        assert "target_labels" in _CLICK_INCOMING_ACTION_JS
         # Strategy 1: stable attr substrings.
-        assert "'attr_${action}'" in _CLICK_INCOMING_ACTION_JS or (
-            "`attr_${action}`" in _CLICK_INCOMING_ACTION_JS
-        )
+        assert "'attr_' + action" in _CLICK_INCOMING_ACTION_JS
         # Strategy 2: design-system primary class.
         assert "'design_system_class'" in _CLICK_INCOMING_ACTION_JS
         assert "artdeco-button--primary" in _CLICK_INCOMING_ACTION_JS
@@ -4387,6 +4404,7 @@ class TestInvitationManagement:
         assert "aria-expanded" in _CLICK_INCOMING_ACTION_JS
         # Diagnostic enumeration on every return path.
         assert "action_buttons:" in _CLICK_INCOMING_ACTION_JS
+        assert "main_buttons:" in _CLICK_INCOMING_ACTION_JS
 
     # --- withdraw via profile page ----------------------------------------
 
