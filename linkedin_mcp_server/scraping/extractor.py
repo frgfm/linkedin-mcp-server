@@ -283,18 +283,43 @@ _CLICK_PENDING_WITHDRAW_JS = (
 )
 
 # Click the Withdraw button inside the confirm dialog opened by clicking
-# Pending. Scoped to the open dialog and structured to avoid the close X:
-#   * artdeco-modal__dismiss is filtered out — it's LinkedIn's stable
-#     design-system class for the close icon, locale-independent and used
-#     across every modal.
-#   * Prefer stable engineering attributes (data-control-name etc) that
-#     carry 'withdraw' or 'confirm' tokens.
-#   * Fall back to the documented [Cancel, Withdraw] DOM order — pick the
-#     last remaining button. Safe: the close X is already filtered.
+# Pending. Three layered strategies, in order:
+#   1. attr 'withdraw' — narrow, never matches Cancel.
+#      (We deliberately do NOT match 'confirm' as an attr substring:
+#       LinkedIn names the Cancel button with attrs like
+#       "modal-confirm-cancel" or "confirm-dialog-cancel" — using
+#       'confirm' as a needle silently misroutes the click onto Cancel.)
+#   2. artdeco-button--primary class — LinkedIn's stable design-system
+#      class for "this is the primary action of the modal". Locale-
+#      independent. This is the most reliable signal once the close X is
+#      out of the way.
+#   3. Position: last visible non-dismiss button. Safe fallback when both
+#      attribute-based strategies miss.
+#
+# The dialog selector prefers .artdeco-modal (LinkedIn's design-system
+# class) and excludes aria-hidden containers — a defensive guard against
+# matching dormant dialog wrappers that remain in the DOM after closing.
+#
+# The close X (.artdeco-modal__dismiss) is filtered before scoring, so no
+# strategy can ever land on it.
+#
+# Every return path includes a diagnostic enumeration of the dialog's
+# visible buttons (`dialog_buttons`) and the chosen target
+# (`clicked_button`) — surfaced through to the tool result so misroutes
+# are visible without re-running with extra logging.
 _CLICK_WITHDRAW_CONFIRM_JS = r"""
 () => {
-  const dialog = document.querySelector('dialog[open]') ||
-                 document.querySelector('[role="dialog"]');
+  const candidateDialogs = [
+    ...document.querySelectorAll(
+      '.artdeco-modal[role="dialog"]:not([aria-hidden="true"])'
+    ),
+    ...document.querySelectorAll('dialog[open]'),
+    ...document.querySelectorAll('[role="dialog"]:not([aria-hidden="true"])'),
+  ];
+  const dialog = candidateDialogs.find(d => {
+    const rects = d.getClientRects ? d.getClientRects() : [];
+    return rects.length > 0;
+  });
   if (!dialog) {
     return { found: false, clicked: false, reason: 'no_dialog' };
   }
@@ -313,23 +338,42 @@ _CLICK_WITHDRAW_CONFIRM_JS = r"""
     el.getAttribute('name'),
     el.getAttribute('id'),
   ].filter(Boolean).join(' ').toLowerCase();
+  const describe = el => ({
+    tag: el.tagName.toLowerCase(),
+    aria_label: el.getAttribute('aria-label'),
+    text: ((el.innerText || el.textContent || '').trim()).slice(0, 80),
+    data_control: el.getAttribute('data-control-name'),
+    data_test:
+      el.getAttribute('data-test-id') || el.getAttribute('data-testid'),
+    data_view: el.getAttribute('data-view-name'),
+    classes:
+      typeof el.className === 'string' ? el.className.slice(0, 120) : null,
+  });
 
   const buttons = Array.from(
     dialog.querySelectorAll('button, [role="button"]')
   )
     .filter(visible)
     .filter(b => !b.classList.contains('artdeco-modal__dismiss'));
+  const enumeration = buttons.map(describe);
 
   if (buttons.length === 0) {
-    return { found: true, clicked: false, reason: 'no_buttons' };
+    return {
+      found: true,
+      clicked: false,
+      reason: 'no_buttons',
+      dialog_buttons: enumeration,
+    };
   }
 
-  let target = buttons.find(b => {
-    const a = stableAttrs(b);
-    return a.includes('withdraw') || a.includes('confirm');
-  });
-  let strategy = target ? 'attr' : null;
-
+  let target = buttons.find(b => stableAttrs(b).includes('withdraw'));
+  let strategy = target ? 'attr_withdraw' : null;
+  if (!target) {
+    target = buttons.find(b =>
+      b.classList.contains('artdeco-button--primary')
+    );
+    if (target) strategy = 'design_system_primary';
+  }
   if (!target) {
     target = buttons[buttons.length - 1];
     strategy = 'position';
@@ -341,6 +385,8 @@ _CLICK_WITHDRAW_CONFIRM_JS = r"""
     clicked: true,
     button_count: buttons.length,
     match_strategy: strategy,
+    clicked_button: describe(target),
+    dialog_buttons: enumeration,
   };
 }
 """
@@ -4940,15 +4986,39 @@ class LinkedInExtractor:
         except Exception:
             logger.debug("Withdraw confirm click failed", exc_info=True)
             confirm_result = {"found": False, "clicked": False}
-        if not (isinstance(confirm_result, dict) and confirm_result.get("clicked")):
-            return _invitation_action_result(
-                url,
-                "action_unavailable",
-                "Could not click the Withdraw confirm button in the dialog.",
-                action="withdraw",
-                linkedin_username=username,
-                profile_url=profile_url,
-                performed=True,
+        if not isinstance(confirm_result, dict):
+            confirm_result = {"found": False, "clicked": False}
+
+        def _attach_confirm_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+            """Surface dialog enumeration so misroutes are visible without
+            re-running with extra logging."""
+            for key in ("match_strategy", "clicked_button", "dialog_buttons"):
+                value = confirm_result.get(key)
+                if value is not None:
+                    result[key] = value
+            return result
+
+        # Log the strategy + every visible button in the dialog so the
+        # next layout change is debuggable from server logs alone.
+        logger.info(
+            "Withdraw confirm result for %s: strategy=%s clicked=%s buttons=%s",
+            username,
+            confirm_result.get("match_strategy"),
+            confirm_result.get("clicked_button"),
+            confirm_result.get("dialog_buttons"),
+        )
+
+        if not confirm_result.get("clicked"):
+            return _attach_confirm_diagnostics(
+                _invitation_action_result(
+                    url,
+                    "action_unavailable",
+                    "Could not click the Withdraw confirm button in the dialog.",
+                    action="withdraw",
+                    linkedin_username=username,
+                    profile_url=profile_url,
+                    performed=True,
+                )
             )
 
         try:
@@ -4961,24 +5031,28 @@ class LinkedInExtractor:
         verified_signals = await self._read_action_signals(username)
         verified_state = detect_connection_state(page_text, verified_signals)
         if verified_state == "pending":
-            return _invitation_action_result(
+            return _attach_confirm_diagnostics(
+                _invitation_action_result(
+                    url,
+                    "verification_failed",
+                    f"Clicked withdraw, but {username} still shows as pending.",
+                    action="withdraw",
+                    linkedin_username=username,
+                    profile_url=profile_url,
+                    performed=True,
+                )
+            )
+
+        return _attach_confirm_diagnostics(
+            _invitation_action_result(
                 url,
-                "verification_failed",
-                f"Clicked withdraw, but {username} still shows as pending.",
+                "withdrawn",
+                "Invitation withdrawn.",
                 action="withdraw",
                 linkedin_username=username,
                 profile_url=profile_url,
                 performed=True,
             )
-
-        return _invitation_action_result(
-            url,
-            "withdrawn",
-            "Invitation withdrawn.",
-            action="withdraw",
-            linkedin_username=username,
-            profile_url=profile_url,
-            performed=True,
         )
 
     async def _click_invitation_action(

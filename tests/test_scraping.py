@@ -4491,6 +4491,47 @@ class TestInvitationManagement:
         assert result["status"] == "verification_failed"
         assert result["performed"] is True
 
+    async def test_withdraw_via_profile_surfaces_confirm_diagnostics(self, mock_page):
+        """The dialog enumeration from the confirm JS must propagate to the
+        tool result so misroutes are debuggable from the JSON-RPC response."""
+        extractor = LinkedInExtractor(mock_page)
+        stack, _, evaluate_mock = self._patch_withdraw_profile_pipeline(
+            extractor, state="pending", verified_state="connectable"
+        )
+        # First evaluate call (Pending anchor click): minimal success result.
+        # Second evaluate call (Withdraw confirm): rich diagnostics that
+        # must round-trip into the tool result unchanged.
+        confirm_diagnostics = {
+            "found": True,
+            "clicked": True,
+            "match_strategy": "design_system_primary",
+            "clicked_button": {
+                "tag": "button",
+                "aria_label": None,
+                "text": "Withdraw",
+                "data_control": None,
+                "data_test": None,
+                "data_view": None,
+                "classes": "artdeco-button artdeco-button--primary",
+            },
+            "dialog_buttons": [
+                {"tag": "button", "text": "Cancel", "classes": "artdeco-button"},
+                {"tag": "button", "text": "Withdraw", "classes": "artdeco-button--primary"},
+            ],
+        }
+        evaluate_mock.side_effect = [
+            {"found": True, "clicked": True},  # Pending anchor click
+            confirm_diagnostics,  # Withdraw confirm click
+        ]
+        with stack:
+            result = await extractor.act_on_invitation("alice", "withdraw")
+
+        assert result["status"] == "withdrawn"
+        assert result["match_strategy"] == "design_system_primary"
+        assert result["clicked_button"]["text"] == "Withdraw"
+        assert len(result["dialog_buttons"]) == 2
+        assert result["dialog_buttons"][1]["text"] == "Withdraw"
+
     async def test_withdraw_via_profile_confirm_click_fails(self, mock_page):
         """If the JS confirm click doesn't land, we return action_unavailable
         without dismissing the dialog — a dismiss would actively close the
@@ -4527,20 +4568,41 @@ class TestInvitationManagement:
         ):
             assert needle in _INVITATION_ACTION_JS, f"missing: {needle!r}"
 
-    def test_click_withdraw_confirm_js_filters_modal_dismiss(self):
-        """Regression guard: the withdraw-confirm JS must filter out the
-        artdeco-modal__dismiss close X. Without that filter, clicking the
-        ``last visible button`` in dialogs that render the close X after
-        the action bar (or the dialog opens with only the close button
-        focused) would close the dialog without performing the withdraw.
+    def test_click_withdraw_confirm_js_strategy_layers(self):
+        """Regression guard: the withdraw-confirm JS must keep its three
+        documented strategy layers. Past misroutes:
+
+        * Without the artdeco-modal__dismiss filter, a "last visible
+          button" position fallback can land on the close X and dismiss
+          the dialog without performing the withdraw.
+        * Matching 'confirm' as an attr substring misroutes onto the
+          Cancel button when LinkedIn names it "modal-confirm-cancel" or
+          similar — observed live, caused verification_failed.
+        * Without the artdeco-button--primary class strategy, accounts
+          where withdraw isn't in the data-control-name fall through to
+          the position fallback even when the design system already
+          identifies the primary action.
         """
         from linkedin_mcp_server.scraping.extractor import _CLICK_WITHDRAW_CONFIRM_JS
 
+        # Close X must be filtered structurally.
         assert "artdeco-modal__dismiss" in _CLICK_WITHDRAW_CONFIRM_JS
-        # Must prefer stable engineering attrs before falling back to position.
-        assert "'withdraw'" in _CLICK_WITHDRAW_CONFIRM_JS
-        assert "'confirm'" in _CLICK_WITHDRAW_CONFIRM_JS
+
+        # Strategy 1: narrow attr match on 'withdraw'.
+        assert "'attr_withdraw'" in _CLICK_WITHDRAW_CONFIRM_JS
+        assert "includes('withdraw')" in _CLICK_WITHDRAW_CONFIRM_JS
+
+        # Strategy 2: design-system primary class.
+        assert "'design_system_primary'" in _CLICK_WITHDRAW_CONFIRM_JS
+        assert "artdeco-button--primary" in _CLICK_WITHDRAW_CONFIRM_JS
+
+        # Strategy 3: position fallback as last resort.
         assert "strategy = 'position'" in _CLICK_WITHDRAW_CONFIRM_JS
+
+        # Diagnostics: every return path must expose dialog_buttons so
+        # misroutes are visible in the tool result without extra logging.
+        assert "dialog_buttons:" in _CLICK_WITHDRAW_CONFIRM_JS
+        assert "clicked_button:" in _CLICK_WITHDRAW_CONFIRM_JS
 
     async def test_act_on_invitation_verification_failed(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
