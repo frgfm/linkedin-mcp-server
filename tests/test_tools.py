@@ -34,6 +34,7 @@ def _make_mock_extractor(scrape_result: dict) -> MagicMock:
     mock.search_conversations = AsyncMock(return_value=scrape_result)
     mock.send_message = AsyncMock(return_value=scrape_result)
     mock.get_pending_invitations = AsyncMock(return_value=scrape_result)
+    mock.act_on_invitation = AsyncMock(return_value=scrape_result)
     mock.get_my_profile = AsyncMock(return_value=scrape_result)
     mock.search_companies = AsyncMock(return_value=scrape_result)
     mock.get_company_employees = AsyncMock(return_value=scrape_result)
@@ -1269,15 +1270,75 @@ class TestNetworkTools:
         with pytest.raises(ValidationError, match="limit"):
             await mcp.call_tool("get_pending_invitations", {"limit": 101})
 
-    async def test_invitation_action_tools_are_not_registered(self):
+    async def test_invitation_action_tools_are_registered(self):
         from linkedin_mcp_server.tools.network import register_network_tools
 
         mcp = FastMCP("test")
         register_network_tools(mcp)
 
-        assert await mcp.get_tool("accept_invitation") is None
-        assert await mcp.get_tool("reject_invitation") is None
-        assert await mcp.get_tool("withdraw_invitation") is None
+        assert await mcp.get_tool("ignore_connection_request") is not None
+        assert await mcp.get_tool("withdraw_invitation") is not None
+        # The public surface intentionally does not expose accept — the
+        # tool only ignores. (Accept remains available internally via
+        # extractor.act_on_invitation for connect_with_person's
+        # auto-accept path.)
+        assert await mcp.get_tool("respond_to_invitation") is None
+
+    async def test_ignore_connection_request_success(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/in/alice/",
+            "status": "ignored",
+            "message": "Invitation ignored.",
+            "action": "ignore",
+            "linkedin_username": "alice",
+            "performed": True,
+            "profile_url": "/in/alice/",
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "ignore_connection_request")
+        result = await tool_fn(
+            linkedin_username="alice",
+            ctx=mock_context,
+            extractor=mock_extractor,
+        )
+
+        assert result["action"] == "ignore"
+        assert result["status"] == "ignored"
+        mock_extractor.act_on_invitation.assert_awaited_once_with("alice", "ignore")
+
+    async def test_withdraw_invitation_success(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/mynetwork/invitation-manager/sent/",
+            "status": "withdrawn",
+            "message": "Invitation withdrawn.",
+            "action": "withdraw",
+            "linkedin_username": "bob",
+            "performed": True,
+            "profile_url": "/in/bob/",
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.network import register_network_tools
+
+        mcp = FastMCP("test")
+        register_network_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "withdraw_invitation")
+        result = await tool_fn(
+            linkedin_username="bob",
+            ctx=mock_context,
+            extractor=mock_extractor,
+        )
+
+        assert result["status"] == "withdrawn"
+        assert result["action"] == "withdraw"
+        mock_extractor.act_on_invitation.assert_awaited_once_with("bob", "withdraw")
 
     async def test_get_connections_success(self, mock_context):
         expected = {
@@ -1371,6 +1432,8 @@ class TestToolTimeouts:
             "send_message",
             "get_pending_invitations",
             "get_connections",
+            "ignore_connection_request",
+            "withdraw_invitation",
             "get_feed",
             "close_session",
         )
@@ -1404,6 +1467,8 @@ class TestToolTimeouts:
             "send_message",
             "get_pending_invitations",
             "get_connections",
+            "ignore_connection_request",
+            "withdraw_invitation",
             "get_feed",
             "close_session",
         )

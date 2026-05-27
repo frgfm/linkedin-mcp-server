@@ -253,6 +253,199 @@ _OPEN_MORE_BUTTON_JS = (
 """
 )
 
+# Click the Pending control on the recipient's profile to open the
+# withdraw-confirm dialog. The Pending state is rendered as the labeled
+# action <a> inside the action root (see _ACTION_SIGNALS_JS comment block);
+# clicking it is what LinkedIn's UI does when the user clicks "Pending" on
+# a profile where they have an outstanding outgoing invitation. Caller
+# verifies that the labeled anchor really is Pending (and not e.g. Message)
+# by reading the connection state first via detect_connection_state.
+_CLICK_PENDING_WITHDRAW_JS = (
+    r"""
+(() => {
+"""
+    + _FIND_ACTION_ROOT_FN_JS
+    + r"""
+  const main = document.querySelector('main');
+  if (!main) return { found: false, clicked: false, reason: 'no_main' };
+  const actionRoot = findActionRoot(main);
+  if (!actionRoot) {
+    return { found: false, clicked: false, reason: 'no_action_root' };
+  }
+  const anchor = actionRoot.querySelector('a[aria-label][href]');
+  if (!anchor) {
+    return { found: false, clicked: false, reason: 'no_labeled_anchor' };
+  }
+  anchor.click();
+  return { found: true, clicked: true };
+})
+"""
+)
+
+# Click the Withdraw button inside the confirm dialog opened by clicking
+# Pending. Three layered strategies, in order:
+#   1. attr 'withdraw' — narrow, never matches Cancel.
+#      (We deliberately do NOT match 'confirm' as an attr substring:
+#       LinkedIn names the Cancel button with attrs like
+#       "modal-confirm-cancel" or "confirm-dialog-cancel" — using
+#       'confirm' as a needle silently misroutes the click onto Cancel.)
+#   2. artdeco-button--primary class — LinkedIn's stable design-system
+#      class for "this is the primary action of the modal". Locale-
+#      independent. This is the most reliable signal once the close X is
+#      out of the way.
+#   3. Position: last visible non-dismiss button. Safe fallback when both
+#      attribute-based strategies miss.
+#
+# The dialog selector prefers .artdeco-modal (LinkedIn's design-system
+# class) and excludes aria-hidden containers — a defensive guard against
+# matching dormant dialog wrappers that remain in the DOM after closing.
+#
+# The close X (.artdeco-modal__dismiss) is filtered before scoring, so no
+# strategy can ever land on it.
+#
+# Every return path includes a diagnostic enumeration of the dialog's
+# visible buttons (`dialog_buttons`) and the chosen target
+# (`clicked_button`) — surfaced through to the tool result so misroutes
+# are visible without re-running with extra logging.
+_CLICK_WITHDRAW_CONFIRM_JS = r"""
+() => {
+  const visible = el => {
+    if (el.disabled) return false;
+    const rects = el.getClientRects ? el.getClientRects() : [];
+    return rects.length > 0;
+  };
+  const stableAttrs = el => [
+    el.getAttribute('data-control-name'),
+    el.getAttribute('data-tracking-control-name'),
+    el.getAttribute('data-test-id'),
+    el.getAttribute('data-testid'),
+    el.getAttribute('data-view-name'),
+    el.getAttribute('name'),
+    el.getAttribute('id'),
+  ].filter(Boolean).join(' ').toLowerCase();
+  const describe = el => ({
+    tag: el.tagName.toLowerCase(),
+    aria_label: el.getAttribute('aria-label'),
+    text: ((el.innerText || el.textContent || '').trim()).slice(0, 80),
+    data_control: el.getAttribute('data-control-name'),
+    data_test:
+      el.getAttribute('data-test-id') || el.getAttribute('data-testid'),
+    data_view: el.getAttribute('data-view-name'),
+    classes:
+      typeof el.className === 'string' ? el.className.slice(0, 120) : null,
+  });
+  // Icon-only buttons (close X, dismiss chevrons, etc.) have an
+  // aria-label but no visible text node. The withdraw/cancel actions
+  // always carry a visible text label — filter icon-only buttons so we
+  // never land on the close X even when LinkedIn obfuscates its class
+  // name to a hash like `_94255844 _06957f2c`.
+  const isTextBearing = b =>
+    ((b.innerText || b.textContent || '').trim()).length > 0;
+  const actionButtonsIn = dialog =>
+    Array.from(dialog.querySelectorAll('button, [role="button"]'))
+      .filter(visible)
+      .filter(b => !b.classList.contains('artdeco-modal__dismiss'))
+      .filter(isTextBearing);
+
+  // LinkedIn often has multiple open dialogs in the DOM at once
+  // (coachmarks, a11y skip-link wrappers, the actual modal). Score
+  // candidates by the count of text-bearing action buttons and pick
+  // the richest — that is, the one with actionable choices like
+  // Withdraw + Cancel, never the chrome shell with only an X.
+  const candidates = [
+    ...document.querySelectorAll(
+      '.artdeco-modal[role="dialog"]:not([aria-hidden="true"])'
+    ),
+    ...document.querySelectorAll('dialog[open]'),
+    ...document.querySelectorAll('[role="dialog"]:not([aria-hidden="true"])'),
+  ].filter(d => {
+    const rects = d.getClientRects ? d.getClientRects() : [];
+    return rects.length > 0;
+  });
+  const seen = new Set();
+  const unique = [];
+  for (const d of candidates) {
+    if (seen.has(d)) continue;
+    seen.add(d);
+    unique.push(d);
+  }
+
+  const scored = unique
+    .map(d => ({ dialog: d, buttons: actionButtonsIn(d) }))
+    .sort((a, b) => b.buttons.length - a.buttons.length);
+
+  const dialogEnumeration = scored.map(({ dialog, buttons }) => ({
+    button_count: buttons.length,
+    classes:
+      typeof dialog.className === 'string'
+        ? dialog.className.slice(0, 120)
+        : null,
+    aria_label: dialog.getAttribute('aria-label'),
+    aria_labelledby: dialog.getAttribute('aria-labelledby'),
+  }));
+
+  if (scored.length === 0) {
+    return {
+      found: false,
+      clicked: false,
+      reason: 'no_dialog',
+      candidate_dialogs: dialogEnumeration,
+    };
+  }
+
+  const pick = scored[0];
+  const buttons = pick.buttons;
+  const enumeration = buttons.map(describe);
+
+  if (buttons.length === 0) {
+    // The richest dialog has no text-bearing actions yet — the modal
+    // body has not rendered. The Python caller should retry.
+    return {
+      found: true,
+      clicked: false,
+      reason: 'no_buttons',
+      dialog_buttons: enumeration,
+      candidate_dialogs: dialogEnumeration,
+    };
+  }
+
+  let target = buttons.find(b => stableAttrs(b).includes('withdraw'));
+  let strategy = target ? 'attr_withdraw' : null;
+  if (!target) {
+    target = buttons.find(b =>
+      b.classList.contains('artdeco-button--primary')
+    );
+    if (target) strategy = 'design_system_primary';
+  }
+  if (!target) {
+    target = buttons[buttons.length - 1];
+    strategy = 'position';
+  }
+
+  target.click();
+  return {
+    found: true,
+    clicked: true,
+    button_count: buttons.length,
+    match_strategy: strategy,
+    clicked_button: describe(target),
+    dialog_buttons: enumeration,
+    candidate_dialogs: dialogEnumeration,
+  };
+}
+"""
+
+# Reads <main>'s rendered innerText. Used for state-detection text
+# scans (e.g. _has_incoming_request_text) that need fresh top-card text
+# without the cost of a full scrape_person section extraction.
+_READ_MAIN_INNERTEXT_JS = r"""
+() => {
+  const main = document.querySelector('main');
+  return main ? (main.innerText || main.textContent || '') : '';
+}
+"""
+
+
 _INVITATION_CARDS_JS = r"""
 ({ kind, limit }) => {
   const root = document.querySelector('main') || document.body;
@@ -551,110 +744,174 @@ _INVITATION_CARDS_JS = r"""
 }
 """
 
-_INVITATION_CARD_PRESENT_JS = r"""
-({ username }) => {
-  const root = document.querySelector('main') || document.body;
-  if (!root) return false;
-  const usernameFromHref = href => {
-    try {
-      const url = new URL(href, location.origin);
-      const match = url.pathname.match(/^\/in\/([^/?#]+)\/?/);
-      return match ? decodeURIComponent(match[1]) : '';
-    } catch {
-      return '';
-    }
-  };
-  return Array.from(root.querySelectorAll('a[href*="/in/"]')).some(anchor => {
-    return usernameFromHref(anchor.getAttribute('href') || anchor.href) === username;
-  });
-}
+# Click Accept or Ignore on the recipient's profile page for an incoming
+# invitation. LinkedIn renders both buttons inside the same top-card action
+# root used by withdraw/connect — found via the compose-anchor walk
+# (_FIND_ACTION_ROOT_FN_JS).
+#
+# Layered strategies, in order:
+#   1. attr substring — match 'accept' / 'ignore' on stable engineering
+#      attributes. Narrow, never matches the other action.
+#   2. design-system class — Accept is rendered with
+#      `artdeco-button--primary` (it's the primary CTA); Ignore is the
+#      non-primary text-bearing sibling. Locale-independent.
+#   3. position — documented UX layout. The action row consistently lists
+#      [Ignore, Accept] on profile pages (matches the invitation manager
+#      card order). Used only when both attribute strategies miss.
+#
+# Buttons inside the action root are filtered to text-bearing, visible
+# elements — drops the More menu opener (icon-only aria-expanded button)
+# and the Message anchor (we use the compose anchor to find the root, so
+# it is not a candidate). Diagnostics (`action_buttons`, `clicked_button`,
+# `match_strategy`) are surfaced in every return path so misroutes are
+# visible from the tool result without re-running with extra logging.
+_CLICK_INCOMING_ACTION_JS = (
+    r"""
+((args) => {
+  const { action, target_labels, other_labels } = args;
 """
+    + _FIND_ACTION_ROOT_FN_JS
+    + r"""
+  const main = document.querySelector('main');
+  if (!main) return { found: false, clicked: false, reason: 'no_main' };
 
-_INVITATION_ACCEPT_ACTION_JS = r"""
-({ username }) => {
-  const root = document.querySelector('main') || document.body;
-  if (!root) {
-    return { found: false, clicked: false, reason: 'no_root' };
-  }
-
-  const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
-  const usernameFromHref = href => {
-    try {
-      const url = new URL(href, location.origin);
-      const match = url.pathname.match(/^\/in\/([^/?#]+)\/?/);
-      return match ? decodeURIComponent(match[1]) : '';
-    } catch {
-      return '';
-    }
-  };
   const visible = el => {
+    if (el.disabled) return false;
     const rects = el.getClientRects ? el.getClientRects() : [];
-    return !el.disabled && rects.length > 0;
+    return rects.length > 0;
   };
-  const actionAttrs = el => [
+  const isTextBearing = b =>
+    ((b.innerText || b.textContent || '').trim()).length > 0;
+  const buttonText = b =>
+    ((b.innerText || b.textContent || '').trim()).toLowerCase();
+  const stableAttrs = el => [
     el.getAttribute('data-control-name'),
+    el.getAttribute('data-tracking-control-name'),
     el.getAttribute('data-test-id'),
     el.getAttribute('data-testid'),
     el.getAttribute('data-view-name'),
+    el.getAttribute('name'),
     el.getAttribute('id'),
   ].filter(Boolean).join(' ').toLowerCase();
+  const describe = el => ({
+    tag: el.tagName.toLowerCase(),
+    aria_label: el.getAttribute('aria-label'),
+    text: ((el.innerText || el.textContent || '').trim()).slice(0, 80),
+    data_control: el.getAttribute('data-control-name'),
+    data_test:
+      el.getAttribute('data-test-id') || el.getAttribute('data-testid'),
+    data_view: el.getAttribute('data-view-name'),
+    classes:
+      typeof el.className === 'string' ? el.className.slice(0, 120) : null,
+  });
 
-  let card = null;
-  let profileUrl = '';
-  for (const anchor of root.querySelectorAll('a[href*="/in/"]')) {
-    const foundUsername = usernameFromHref(anchor.getAttribute('href') || anchor.href);
-    if (foundUsername !== username) continue;
-    profileUrl = `/in/${foundUsername}/`;
-    card =
-      anchor.closest('[role="listitem"]') ||
-      anchor.closest('li') ||
-      anchor.closest('article') ||
-      anchor.closest('[data-view-name]') ||
-      anchor.closest('section') ||
-      anchor.parentElement;
-    break;
-  }
-  if (!card) {
-    return { found: false, clicked: false, reason: 'not_found' };
-  }
+  const targetSet = new Set(
+    (target_labels || []).map(s => s.toLowerCase())
+  );
+  const otherSet = new Set(
+    (other_labels || []).map(s => s.toLowerCase())
+  );
 
-  const buttons = Array.from(
-    card.querySelectorAll('button, [role="button"], a[aria-label][href]')
+  // --- Strategy 0: locale-table label scan over the entire <main> ----------
+  // LinkedIn does not always render a Message button alongside an incoming
+  // request, so a compose-anchor walk (findActionRoot) can return null
+  // even when Accept + Ignore are clearly in the DOM. This first pass
+  // sidesteps that: scan every visible text-bearing <button> in main and
+  // pick the one whose normalized text matches one of the target action's
+  // labels from INCOMING_REQUEST_LABELS. Per CLAUDE.md, this is the
+  // sanctioned text-fallback path — gated through the same locale table
+  // already used by detect_connection_state.
+  const mainButtons = Array.from(
+    main.querySelectorAll('button, [role="button"]')
   )
     .filter(visible)
-    .filter(button => !button.matches('a[href*="/in/"]'))
-    .filter(button => button.getAttribute('data-testid') !== 'expandable-text-button')
-    .filter(button => !button.closest('[data-testid="expandable-text-box"]'))
-    .filter(button => button.matches('a[href]') || !button.closest('a[href]'));
-  if (buttons.length === 0) {
-    return {
-      found: true,
-      clicked: false,
-      reason: 'action_unavailable',
-      profile_url: profileUrl,
-      action_count: 0,
-      text: normalize(card.innerText || card.textContent),
-    };
+    .filter(isTextBearing)
+    .filter(b => !b.hasAttribute('aria-expanded'));
+
+  const mainEnumeration = mainButtons.map(describe);
+  let target = null;
+  let strategy = null;
+
+  if (targetSet.size > 0) {
+    target = mainButtons.find(b => targetSet.has(buttonText(b)));
+    if (target) strategy = 'label_text';
   }
 
-  let target = buttons.find(button => {
-    const attrs = actionAttrs(button);
-    return attrs.includes('accept') || attrs.includes('confirm');
-  });
+  // --- Strategies 1-3: structural fallbacks scoped to the action root ------
+  // If the label scan misses (locale not in the table, or LinkedIn
+  // changed the label slightly), fall back to action-root structural
+  // detection so we still have a chance of clicking the right button.
+  let rootButtons = [];
   if (!target) {
-    target = buttons[buttons.length - 1];
+    const actionRoot = findActionRoot(main);
+    if (actionRoot) {
+      rootButtons = Array.from(actionRoot.querySelectorAll('button'))
+        .filter(visible)
+        .filter(isTextBearing)
+        .filter(b => !b.hasAttribute('aria-expanded'));
+
+      // Exclude buttons whose text matches the *other* action's labels —
+      // protects against accidentally clicking Ignore when we wanted Accept.
+      const candidates = otherSet.size > 0
+        ? rootButtons.filter(b => !otherSet.has(buttonText(b)))
+        : rootButtons;
+
+      // 1) Stable engineering attr substring.
+      const token = action === 'accept' ? 'accept' : 'ignore';
+      target = candidates.find(b => stableAttrs(b).includes(token));
+      if (target) strategy = 'attr_' + action;
+
+      // 2) Design-system class: Accept is primary, Ignore is the non-primary
+      //    text-bearing sibling.
+      if (!target && candidates.length >= 2) {
+        if (action === 'accept') {
+          target = candidates.find(b =>
+            b.classList.contains('artdeco-button--primary')
+          );
+        } else {
+          target = candidates.find(b =>
+            !b.classList.contains('artdeco-button--primary')
+          );
+        }
+        if (target) strategy = 'design_system_class';
+      }
+
+      // 3) Position fallback: documented UX layout [Ignore, Accept].
+      if (!target && candidates.length === 2) {
+        target = candidates[action === 'accept' ? 1 : 0];
+        strategy = 'position';
+      }
+    }
+  }
+
+  const rootEnumeration = rootButtons.map(describe);
+
+  if (!target) {
+    return {
+      found: false,
+      clicked: false,
+      reason: targetSet.size === 0 && rootButtons.length === 0
+        ? 'no_action_root'
+        : 'action_unavailable',
+      main_buttons: mainEnumeration,
+      action_buttons: rootEnumeration,
+      target_labels: Array.from(targetSet),
+    };
   }
 
   target.click();
   return {
     found: true,
     clicked: true,
-    profile_url: profileUrl,
-    action_count: buttons.length,
-    text: normalize(card.innerText || card.textContent),
+    button_count: (strategy === 'label_text' ? mainButtons : rootButtons).length,
+    match_strategy: strategy,
+    clicked_button: describe(target),
+    action_buttons: strategy === 'label_text' ? mainEnumeration : rootEnumeration,
+    main_buttons: mainEnumeration,
   };
-}
+})
 """
+)
 
 _EXPAND_INVITATION_NOTES_JS = r"""
 () => {
@@ -800,25 +1057,33 @@ def _connection_result(
     return result
 
 
-def _incoming_invitation_accept_result(
+def _invitation_action_result(
     url: str,
     status: str,
     message: str,
     *,
+    action: str,
     linkedin_username: str,
     profile_url: str = "",
     performed: bool = False,
+    action_count: int | None = None,
+    match_strategy: str | None = None,
 ) -> dict[str, Any]:
-    """Build the internal response for incoming-request acceptance."""
+    """Build the response for an invitation action (accept / ignore / withdraw)."""
     result: dict[str, Any] = {
         "url": url,
         "status": status,
         "message": message,
+        "action": action,
         "linkedin_username": linkedin_username,
         "performed": performed,
     }
     if profile_url:
         result["profile_url"] = profile_url
+    if action_count is not None:
+        result["action_count"] = action_count
+    if match_strategy:
+        result["match_strategy"] = match_strategy
     return result
 
 
@@ -2451,10 +2716,7 @@ class LinkedInExtractor:
         surfaces the raw text without depending on that shape.
         """
         try:
-            return await self._page.evaluate(
-                "() => { const m = document.querySelector('main');"
-                " return m ? (m.innerText || '') : ''; }"
-            )
+            return await self._page.evaluate(_READ_MAIN_INNERTEXT_JS)
         except Exception as e:
             logger.debug("Re-read of <main> innerText failed: %s", e)
             return ""
@@ -2471,6 +2733,32 @@ class LinkedInExtractor:
         if "main_profile" not in profile.get("sections", {}):
             return ""
         return await self._read_main_innertext()
+
+    async def _load_profile_for_state(
+        self, username: str
+    ) -> tuple[str, ActionSignals]:
+        """Lightweight loader for invitation-action write paths.
+
+        Returns ``(page_text, signals)`` — exactly what
+        :func:`detect_connection_state` consumes — without going through
+        :meth:`scrape_person`'s full section-extraction + references
+        pipeline. Used by ``_withdraw_outgoing_invitation`` and
+        ``_respond_to_incoming_invitation`` because those flows only
+        need to classify the current relationship state before clicking
+        an action button; the structured ``main_profile`` payload that
+        ``scrape_person`` builds is unused on the mutation path.
+
+        Decoupling these write paths from ``scrape_person`` also avoids
+        coupling them to future ``main_profile`` extraction changes —
+        the contract here is purely raw ``<main>`` innerText + ARIA
+        signals.
+        """
+        url = f"https://www.linkedin.com/in/{username}/"
+        await self._navigate_to_page(url)
+        await self._wait_for_main_text(log_context=f"Profile {username}")
+        text = await self._read_main_innertext()
+        signals = await self._read_action_signals(username)
+        return text, signals
 
     async def _read_action_signals(self, username: str) -> ActionSignals:
         """Read locale-independent structural signals for a profile's
@@ -4567,100 +4855,493 @@ class LinkedInExtractor:
                 break
         return cards
 
+    # Accept/ignore use the received invitation manager. Withdraw bypasses the
+    # invitation manager entirely (see _withdraw_outgoing_invitation) because
+    # the sent page is paginated and accounts with many outgoing requests can
+    # require many scrolls to surface a specific recipient — the profile page
+    # is one navigation and exposes the Pending control directly.
+    _INVITATION_ACTIONS: frozenset[str] = frozenset({"accept", "ignore", "withdraw"})
+    _INCOMING_SUCCESS_STATUS: dict[str, str] = {
+        "accept": "accepted",
+        "ignore": "ignored",
+    }
+
+    async def act_on_invitation(
+        self,
+        linkedin_username: str,
+        action: Literal["accept", "ignore", "withdraw"],
+    ) -> dict[str, Any]:
+        """Accept, ignore, or withdraw a pending invitation.
+
+        All three actions navigate to the counterparty's profile page and
+        click the relevant top-card action button. Withdraw uses the
+        Pending anchor (labeled <a> in the action root); accept/ignore
+        use the Accept / Ignore buttons LinkedIn renders in the action
+        root when the target has sent us an invitation. Profile
+        navigation sidesteps the invitation-manager pagination cost for
+        accounts with many outstanding requests in either direction.
+        """
+        if action not in self._INVITATION_ACTIONS:
+            raise ValueError(
+                f"Unknown invitation action: {action!r} "
+                f"(expected one of: {sorted(self._INVITATION_ACTIONS)})"
+            )
+
+        if action == "withdraw":
+            return await self._withdraw_outgoing_invitation(linkedin_username)
+        return await self._respond_to_incoming_invitation(linkedin_username, action)
+
     async def _accept_incoming_invitation(
         self,
         linkedin_username: str,
     ) -> dict[str, Any]:
-        """Accept a received invitation from the invitation manager for connect flow."""
+        """Accept a received invitation. Thin wrapper used by ``connect_with_person``."""
+        return await self.act_on_invitation(linkedin_username, "accept")
+
+    async def _withdraw_outgoing_invitation(
+        self,
+        linkedin_username: str,
+    ) -> dict[str, Any]:
+        """Withdraw an outgoing invitation via the recipient's profile page.
+
+        One navigation: load ``/in/{username}/``, confirm the connection state
+        is ``pending``, click the Pending action anchor (labeled <a> in the
+        action root — locale-independent signal documented in
+        :func:`_read_action_signals`), then click the primary button in the
+        confirm dialog. Avoids the sent-invitations-manager pagination cost
+        for accounts with many outstanding requests.
+        """
+        from linkedin_mcp_server.scraping.connection import detect_connection_state
+
         username = _normalize_invitation_username(linkedin_username)
-        url = _invitation_manager_url("received")
+        url = f"https://www.linkedin.com/in/{username}/"
         profile_url = f"/in/{username}/" if username else ""
+
         if not username:
-            return _incoming_invitation_accept_result(
+            return _invitation_action_result(
                 url,
                 "not_found",
                 "LinkedIn username is required.",
+                action="withdraw",
                 linkedin_username=username,
                 profile_url=profile_url,
             )
 
-        await self._navigate_to_page(url)
-        await detect_rate_limit(self._page)
-        await self._wait_for_main_text(log_context="Invitations (received)")
-        await handle_modal_close(self._page)
-        await self._scroll_main_scrollable_region(
-            position="bottom", attempts=3, pause_time=0.5
-        )
-        await self._expand_invitation_note_toggles()
-
-        clicked = await self._click_incoming_invitation_accept(username=username)
-        profile_url = str(clicked.get("profile_url") or profile_url)
-        if not clicked.get("found"):
-            return _incoming_invitation_accept_result(
+        # Lean gating: this is a write path that only needs the top-card
+        # text (for the locale-table fallbacks in detect_connection_state)
+        # and the action signals — not the full section extraction
+        # pipeline. Avoid scrape_person's scroll + structured-extraction
+        # + references cost; navigate, wait for main, read fresh
+        # innerText + signals directly.
+        page_text, signals = await self._load_profile_for_state(username)
+        if not page_text:
+            return _invitation_action_result(
                 url,
                 "not_found",
-                f"No received invitation was found for {username}.",
-                linkedin_username=username,
-                profile_url=profile_url,
-            )
-        if not clicked.get("clicked"):
-            return _incoming_invitation_accept_result(
-                url,
-                "action_unavailable",
-                f"LinkedIn did not expose a usable accept action for {username}.",
+                f"Could not load profile for {username}.",
+                action="withdraw",
                 linkedin_username=username,
                 profile_url=profile_url,
             )
 
-        await asyncio.sleep(0.75)
-        if await self._invitation_card_present(username):
-            return _incoming_invitation_accept_result(
+        state = detect_connection_state(page_text, signals)
+        if state == "already_connected":
+            return _invitation_action_result(
                 url,
-                "verification_failed",
-                "Clicked accept, but the invitation card was still visible.",
+                "already_connected",
+                f"{username} is already a 1st-degree connection; nothing to withdraw.",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+        if state != "pending":
+            return _invitation_action_result(
+                url,
+                "not_found",
+                f"No outgoing connection request found for {username} (state={state}).",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+
+        try:
+            click_result = await self._page.evaluate(_CLICK_PENDING_WITHDRAW_JS)
+        except Exception:
+            logger.debug("Pending anchor click failed", exc_info=True)
+            click_result = {"found": False, "clicked": False}
+        if not (isinstance(click_result, dict) and click_result.get("clicked")):
+            return _invitation_action_result(
+                url,
+                "action_unavailable",
+                "Could not find or click the Pending control on the profile.",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+
+        if not await self._dialog_is_open(timeout=5000):
+            return _invitation_action_result(
+                url,
+                "action_unavailable",
+                "Pending was clicked but the confirm dialog did not open.",
+                action="withdraw",
                 linkedin_username=username,
                 profile_url=profile_url,
                 performed=True,
             )
 
-        return _incoming_invitation_accept_result(
-            url,
-            "accepted",
-            "Invitation accepted.",
-            linkedin_username=username,
-            profile_url=profile_url,
-            performed=True,
-        )
-
-    async def _click_incoming_invitation_accept(
-        self,
-        *,
-        username: str,
-    ) -> dict[str, Any]:
-        """Click a received invitation accept action without localized text."""
+        # The dialog is open, but `_dialog_is_open` only checks for *any*
+        # role=dialog node — LinkedIn's chrome layer can have empty
+        # coachmark/wrapper dialogs in the DOM that match the selector
+        # before our actual modal body mounts. Poll until at least one
+        # candidate dialog contains a text-bearing, non-dismiss action
+        # button (Withdraw / Cancel). This avoids clicking the close X
+        # of a wrapper dialog that has only icon buttons.
         try:
-            result = await self._page.evaluate(
-                _INVITATION_ACCEPT_ACTION_JS,
-                {"username": username},
+            await self._page.wait_for_function(
+                """() => {
+                  const visible = el => {
+                    if (el.disabled) return false;
+                    const rects = el.getClientRects
+                      ? el.getClientRects() : [];
+                    return rects.length > 0;
+                  };
+                  const dialogs = [
+                    ...document.querySelectorAll(
+                      '.artdeco-modal[role="dialog"]:not([aria-hidden="true"])'
+                    ),
+                    ...document.querySelectorAll('dialog[open]'),
+                    ...document.querySelectorAll(
+                      '[role="dialog"]:not([aria-hidden="true"])'
+                    ),
+                  ];
+                  for (const d of dialogs) {
+                    const rects = d.getClientRects ? d.getClientRects() : [];
+                    if (rects.length === 0) continue;
+                    const buttons = Array.from(
+                      d.querySelectorAll('button, [role="button"]')
+                    )
+                      .filter(visible)
+                      .filter(b =>
+                        !b.classList.contains('artdeco-modal__dismiss')
+                      )
+                      .filter(b =>
+                        ((b.innerText || b.textContent || '').trim()).length
+                          > 0
+                      );
+                    if (buttons.length >= 1) return true;
+                  }
+                  return false;
+                }""",
+                timeout=5000,
             )
-        except Exception:
-            logger.debug("Invitation action click failed", exc_info=True)
-            return {"found": False, "clicked": False}
-        return (
-            result if isinstance(result, dict) else {"found": False, "clicked": False}
+        except PlaywrightTimeoutError:
+            logger.debug(
+                "Withdraw confirm action buttons never rendered for %s",
+                username,
+            )
+
+        # Confirm via the targeted withdraw JS helper. Playwright's actionability
+        # checks race
+        # with the modal mount animation here (the same reason send_message
+        # clicks Send via JS). Do not call _dismiss_dialog on failure: if
+        # the confirm click didn't land, dismissing would actively close the
+        # dialog without withdrawing. Let LinkedIn time out the modal.
+        #
+        # Retry loop: LinkedIn streams the modal body (Withdraw + Cancel
+        # buttons) asynchronously after the dialog wrapper mounts. The JS
+        # helper refuses to click when only icon-only buttons (the close
+        # X) are visible — it returns `reason: 'no_buttons'` after filtering
+        # text-bearing candidates. We re-evaluate every 500 ms until the
+        # action buttons render or we exhaust the budget. 6 × 500 ms ≈ 3 s
+        # on top of the 5 s wait_for_function above gives ~8 s total for
+        # the modal body to mount, which has been enough on all profiles
+        # observed in testing while keeping the failure path fast.
+        confirm_result: dict[str, Any] = {"found": False, "clicked": False}
+        for attempt in range(6):
+            try:
+                evaluated = await self._page.evaluate(_CLICK_WITHDRAW_CONFIRM_JS)
+            except Exception:
+                logger.debug(
+                    "Withdraw confirm click failed (attempt %d)",
+                    attempt,
+                    exc_info=True,
+                )
+                evaluated = None
+            if isinstance(evaluated, dict):
+                confirm_result = evaluated
+                # Success or a non-retryable failure (e.g. no_dialog) — stop.
+                if confirm_result.get("clicked"):
+                    break
+                if confirm_result.get("reason") != "no_buttons":
+                    break
+            await asyncio.sleep(0.5)
+
+        def _attach_confirm_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+            """Surface dialog enumeration so misroutes are visible without
+            re-running with extra logging."""
+            for key in (
+                "match_strategy",
+                "clicked_button",
+                "dialog_buttons",
+                "candidate_dialogs",
+            ):
+                value = confirm_result.get(key)
+                if value is not None:
+                    result[key] = value
+            return result
+
+        # Log the strategy + every visible button in the dialog so the
+        # next layout change is debuggable from server logs alone.
+        logger.info(
+            "Withdraw confirm result for %s: strategy=%s clicked=%s buttons=%s",
+            username,
+            confirm_result.get("match_strategy"),
+            confirm_result.get("clicked_button"),
+            confirm_result.get("dialog_buttons"),
         )
 
-    async def _invitation_card_present(self, username: str) -> bool:
-        try:
-            return bool(
-                await self._page.evaluate(
-                    _INVITATION_CARD_PRESENT_JS,
-                    {"username": username},
+        if not confirm_result.get("clicked"):
+            return _attach_confirm_diagnostics(
+                _invitation_action_result(
+                    url,
+                    "action_unavailable",
+                    "Could not click the Withdraw confirm button in the dialog.",
+                    action="withdraw",
+                    linkedin_username=username,
+                    profile_url=profile_url,
+                    performed=True,
                 )
             )
+
+        try:
+            await self._page.wait_for_selector(
+                _DIALOG_SELECTOR, state="hidden", timeout=5000
+            )
+        except PlaywrightTimeoutError:
+            logger.debug("Withdraw confirm dialog did not close")
+
+        verified_signals = await self._read_action_signals(username)
+        verified_state = detect_connection_state(page_text, verified_signals)
+        if verified_state == "pending":
+            return _attach_confirm_diagnostics(
+                _invitation_action_result(
+                    url,
+                    "verification_failed",
+                    f"Clicked withdraw, but {username} still shows as pending.",
+                    action="withdraw",
+                    linkedin_username=username,
+                    profile_url=profile_url,
+                    performed=True,
+                )
+            )
+
+        return _attach_confirm_diagnostics(
+            _invitation_action_result(
+                url,
+                "withdrawn",
+                "Invitation withdrawn.",
+                action="withdraw",
+                linkedin_username=username,
+                profile_url=profile_url,
+                performed=True,
+            )
+        )
+
+    async def _respond_to_incoming_invitation(
+        self,
+        linkedin_username: str,
+        action: Literal["accept", "ignore"],
+    ) -> dict[str, Any]:
+        """Accept or ignore an incoming invitation via the sender's profile.
+
+        Mirrors ``_withdraw_outgoing_invitation``. Navigate to ``/in/{user}/``,
+        verify the connection state is ``incoming_request`` (LinkedIn renders
+        Accept + Ignore in the top-card action root when the target has sent
+        us an invitation), and click the matching button via the layered
+        strategies in :data:`_CLICK_INCOMING_ACTION_JS` (stable attrs →
+        design-system primary class → documented [Ignore, Accept] position).
+        Verification re-reads the connection state — after Accept it should
+        flip to ``already_connected``; after Ignore the incoming-request
+        signal should disappear.
+
+        Profile navigation sidesteps invitation-manager pagination — same
+        rationale as withdraw.
+        """
+        from linkedin_mcp_server.scraping.connection import detect_connection_state
+
+        success_status = self._INCOMING_SUCCESS_STATUS[action]
+        username = _normalize_invitation_username(linkedin_username)
+        url = f"https://www.linkedin.com/in/{username}/"
+        profile_url = f"/in/{username}/" if username else ""
+
+        if not username:
+            return _invitation_action_result(
+                url,
+                "not_found",
+                "LinkedIn username is required.",
+                action=action,
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+
+        # Lean gating: write path; same rationale as
+        # _withdraw_outgoing_invitation. Avoid scrape_person's full
+        # section-extraction pipeline.
+        page_text, signals = await self._load_profile_for_state(username)
+        if not page_text:
+            return _invitation_action_result(
+                url,
+                "not_found",
+                f"Could not load profile for {username}.",
+                action=action,
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+        state = detect_connection_state(page_text, signals)
+        if state == "already_connected":
+            # Accept on an already-connected profile is a no-op success;
+            # ignore on the same is meaningless — both states return the
+            # same short-circuit message.
+            return _invitation_action_result(
+                url,
+                "already_connected",
+                f"{username} is already a 1st-degree connection; "
+                f"no incoming invitation to {action}.",
+                action=action,
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+        if state != "incoming_request":
+            return _invitation_action_result(
+                url,
+                "not_found",
+                f"No incoming connection request found for {username} "
+                f"(state={state}).",
+                action=action,
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+
+        # Pass the locale-gated label table to the JS so it can match
+        # buttons by visible text (the strongest signal — works even when
+        # the compose-anchor walk fails because LinkedIn renders the
+        # incoming-request top-card without a Message button).
+        from linkedin_mcp_server.scraping.connection import (
+            INCOMING_REQUEST_LABELS,
+        )
+
+        accept_labels = [pair[0] for pair in INCOMING_REQUEST_LABELS.values()]
+        ignore_labels = [pair[1] for pair in INCOMING_REQUEST_LABELS.values()]
+        target_labels = accept_labels if action == "accept" else ignore_labels
+        other_labels = ignore_labels if action == "accept" else accept_labels
+
+        try:
+            click_result = await self._page.evaluate(
+                _CLICK_INCOMING_ACTION_JS,
+                {
+                    "action": action,
+                    "target_labels": target_labels,
+                    "other_labels": other_labels,
+                },
+            )
         except Exception:
-            logger.debug("Invitation card verification failed", exc_info=True)
-            return False
+            logger.debug(
+                "Incoming-invitation %s click failed", action, exc_info=True
+            )
+            click_result = {"found": False, "clicked": False}
+        if not isinstance(click_result, dict):
+            click_result = {"found": False, "clicked": False}
+
+        def _attach_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+            for key in (
+                "match_strategy",
+                "clicked_button",
+                "action_buttons",
+                "main_buttons",
+                "button_count",
+            ):
+                value = click_result.get(key)
+                if value is not None:
+                    if key == "button_count" and isinstance(value, int):
+                        result["action_count"] = value
+                    else:
+                        result[key] = value
+            return result
+
+        logger.info(
+            "Incoming-invitation %s click for %s: strategy=%s clicked=%s buttons=%s",
+            action,
+            username,
+            click_result.get("match_strategy"),
+            click_result.get("clicked_button"),
+            click_result.get("action_buttons"),
+        )
+
+        if not click_result.get("clicked"):
+            return _attach_diagnostics(
+                _invitation_action_result(
+                    url,
+                    "action_unavailable",
+                    f"Could not click the {action} button on {username}'s profile.",
+                    action=action,
+                    linkedin_username=username,
+                    profile_url=profile_url,
+                )
+            )
+
+        # Verify the click landed by polling fresh page state. The DOM
+        # does not update synchronously after click() — LinkedIn streams
+        # the Accept/Ignore button removal — so we must re-read text and
+        # signals on each attempt. Critically, we *re-fetch* main's
+        # innerText: the original page_text variable is a frozen snapshot
+        # from the first scrape, and reusing it would make
+        # detect_connection_state return incoming_request forever
+        # because _has_incoming_request_text is text-only and would
+        # always see the stale Accept/Ignore lines.
+        #
+        # Budget: ~5 s (10 × 0.5 s) — empirically enough on every profile
+        # observed in testing. Fast path: first iteration after the
+        # immediate state flip exits the loop in <1 s.
+        verified_state: str = "incoming_request"
+        for _ in range(10):
+            try:
+                fresh_text = await self._page.evaluate(_READ_MAIN_INNERTEXT_JS)
+            except Exception:
+                fresh_text = ""
+            if not isinstance(fresh_text, str):
+                fresh_text = ""
+            verified_signals = await self._read_action_signals(username)
+            verified_state = detect_connection_state(fresh_text, verified_signals)
+            if verified_state != "incoming_request":
+                break
+            await asyncio.sleep(0.5)
+
+        if verified_state == "incoming_request":
+            return _attach_diagnostics(
+                _invitation_action_result(
+                    url,
+                    "verification_failed",
+                    f"Clicked {action}, but {username} still shows an "
+                    f"incoming invitation.",
+                    action=action,
+                    linkedin_username=username,
+                    profile_url=profile_url,
+                    performed=True,
+                )
+            )
+
+        return _attach_diagnostics(
+            _invitation_action_result(
+                url,
+                success_status,
+                f"Invitation {success_status}.",
+                action=action,
+                linkedin_username=username,
+                profile_url=profile_url,
+                performed=True,
+            )
+        )
 
     async def _extract_root_content(
         self,

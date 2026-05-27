@@ -97,3 +97,81 @@ def register_network_tools(
                 raise_tool_error(relogin_exc, "get_connections")
         except Exception as e:
             raise_tool_error(e, "get_connections")  # NoReturn
+
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="Ignore Connection Request",
+        annotations={"destructiveHint": True, "openWorldHint": True},
+        tags={"network", "actions"},
+        exclude_args=["extractor"],
+    )
+    async def ignore_connection_request(
+        linkedin_username: str,
+        ctx: Context,
+        extractor: Any | None = None,
+    ) -> dict[str, Any]:
+        """
+        Ignore a received LinkedIn connection request.
+
+        Navigates to ``/in/{linkedin_username}/``, verifies the page is
+        showing an incoming connection request, and clicks the Ignore
+        button in the top-card action row. The Ignore button is
+        identified via a locale-table label scan (per
+        ``INCOMING_REQUEST_LABELS``) with structural fallbacks
+        (engineering attrs → design-system class → documented position).
+
+        Status: ``ignored`` | ``not_found`` | ``already_connected``
+        | ``action_unavailable`` | ``verification_failed``.
+        """
+        try:
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="ignore_connection_request"
+            )
+            logger.info("Ignoring connection request: %s", linkedin_username)
+            result = await extractor.act_on_invitation(linkedin_username, "ignore")
+            return result
+        except AuthenticationError as e:
+            try:
+                await handle_auth_error(e, ctx)
+            except Exception as relogin_exc:
+                raise_tool_error(relogin_exc, "ignore_connection_request")
+        except Exception as e:
+            raise_tool_error(e, "ignore_connection_request")  # NoReturn
+
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="Withdraw Invitation",
+        annotations={"destructiveHint": True, "openWorldHint": True},
+        tags={"network", "actions"},
+        exclude_args=["extractor"],
+    )
+    async def withdraw_invitation(
+        linkedin_username: str,
+        ctx: Context,
+        extractor: Any | None = None,
+    ) -> dict[str, Any]:
+        """
+        Withdraw an outgoing LinkedIn connection request.
+
+        Navigates to ``/in/{linkedin_username}/``, verifies the page is
+        showing an outgoing-pending state, clicks the Pending control,
+        and confirms in the withdraw modal. Sidesteps the sent-page
+        pagination cost for accounts with many outstanding requests.
+
+        Status: ``withdrawn`` | ``not_found`` | ``already_connected``
+        | ``action_unavailable`` | ``verification_failed``.
+        """
+        try:
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="withdraw_invitation"
+            )
+            logger.info("Withdrawing invitation: %s", linkedin_username)
+            result = await extractor.act_on_invitation(linkedin_username, "withdraw")
+            return result
+        except AuthenticationError as e:
+            try:
+                await handle_auth_error(e, ctx)
+            except Exception as relogin_exc:
+                raise_tool_error(relogin_exc, "withdraw_invitation")
+        except Exception as e:
+            raise_tool_error(e, "withdraw_invitation")  # NoReturn
