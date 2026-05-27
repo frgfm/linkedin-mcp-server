@@ -96,6 +96,73 @@ class Member(TypedDict):
     is_self: Required[bool]
 
 
+class Experience(TypedDict, total=False):
+    """One experience entry parsed from the main profile page.
+
+    ``title`` and ``organization`` are emitted as best-effort from the
+    first two lines of the entry's innerText; both keys are omitted when
+    LinkedIn renders the entry without them (rare). All other fields are
+    optional and follow LinkedIn's render order when present:
+    ``dates`` is a literal string ("Jan 2023 - Present"), ``location``
+    is comma-separated geo, ``description`` is the multi-line body
+    after the date line.
+    """
+
+    title: str
+    organization: str
+    organization_url: str
+    dates: str
+    location: str
+    description: str
+
+
+class Education(TypedDict, total=False):
+    """One education entry parsed from the main profile page.
+
+    ``school`` is the only field LinkedIn always renders; everything
+    else is best-effort. ``degree`` and ``field_of_study`` come from
+    the line below the school name (``Degree, Field`` separator).
+    ``dates`` is a literal LinkedIn string.
+    """
+
+    school: str
+    school_url: str
+    degree: str
+    field_of_study: str
+    dates: str
+    description: str
+
+
+class MainProfile(TypedDict):
+    """Structured payload returned for the ``main_profile`` section.
+
+    Every key is always present. Top-line text fields (``name``,
+    ``headline``, ``location``, ``profile_picture_url``,
+    ``main_organization``, ``main_education``, ``about``) carry
+    ``None`` when LinkedIn doesn't render the corresponding signal.
+    Counts carry ``None`` when the rendered value isn't an exact
+    integer — "500+ connections" → ``None``, "237 connections" →
+    ``237``. ``experience`` / ``education`` carry empty lists when
+    the profile has no entries (or the sections fail to hydrate).
+
+    Locale caveat: count parsing and the "Present" date sentinel
+    assume en-US (BrowserManager forces en-US).
+    """
+
+    name: str | None
+    headline: str | None
+    location: str | None
+    profile_picture_url: str | None
+    connection_count: int | None
+    follower_count: int | None
+    mutual_connection_count: int | None
+    main_organization: str | None
+    main_education: str | None
+    about: str | None
+    experience: list[Experience]
+    education: list[Education]
+
+
 _GENERIC_LABELS = {
     "show all",
     "follow",

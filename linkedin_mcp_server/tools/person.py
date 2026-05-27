@@ -63,10 +63,20 @@ def register_person_tools(
                 other sections, request heavy sections in a separate call.
 
         Returns:
-            Dict with url, sections (name -> raw text), and optional references.
-            Sections may be absent if extraction yielded no content for that page.
-            Includes unknown_sections list when unrecognised names are passed.
-            The LLM should parse the raw text in each section.
+            Dict with url, sections (name -> raw text or structured payload),
+            and optional references. Sections may be absent if extraction
+            yielded no content for that page. Includes unknown_sections
+            list when unrecognised names are passed.
+
+            The main_profile section is structured (not raw text) with these
+            keys: name, headline, location, profile_picture_url,
+            connection_count, follower_count, mutual_connection_count,
+            main_organization, main_education, about, experience, education.
+            Text fields are None when LinkedIn doesn't render them; counts
+            are None when LinkedIn shows a non-exact value (e.g. "500+"
+            connections). The experience/education lists contain structured
+            entries (title/organization/dates/...). All other sections still
+            return raw innerText for the LLM to parse.
         """
         try:
             extractor = extractor or await get_ready_extractor(
@@ -330,8 +340,13 @@ def register_person_tools(
             max_scrolls: Maximum pagination attempts per section (same as get_person_profile).
 
         Returns:
-            Dict with url, sections (name -> raw text), and optional references.
-            The url field reflects the resolved profile URL, revealing the real username.
+            Dict with url, sections (name -> raw text or structured payload),
+            and optional references. The url field reflects the resolved
+            profile URL, revealing the real username.
+
+            The main_profile section is structured (see get_person_profile
+            docstring for the field list); all other sections return raw
+            innerText.
         """
         try:
             extractor = extractor or await get_ready_extractor(

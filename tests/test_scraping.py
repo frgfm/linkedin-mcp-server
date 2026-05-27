@@ -609,6 +609,10 @@ class TestScrapePersonUrls:
 
     async def test_scrape_person_returns_section_errors(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
+        # main_profile now returns a structured dict via extract_main_profile
+        # (see scraping/main_profile.py). Patch it out so we don't depend on
+        # the parser's internals — this test is about section orchestration.
+        sentinel_profile = {"name": "profile text"}
         with (
             patch.object(
                 extractor,
@@ -620,13 +624,18 @@ class TestScrapePersonUrls:
                 ],
             ),
             patch(
+                "linkedin_mcp_server.scraping.extractor.extract_main_profile",
+                new_callable=AsyncMock,
+                return_value=sentinel_profile,
+            ),
+            patch(
                 "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
                 new_callable=AsyncMock,
             ),
         ):
             result = await extractor.scrape_person("testuser", {"posts"})
 
-        assert result["sections"]["main_profile"] == "profile text"
+        assert result["sections"]["main_profile"] == sentinel_profile
         assert (
             result["section_errors"]["posts"]["issue_template_path"] == "/tmp/issue.md"
         )
@@ -970,25 +979,51 @@ class TestDetectConnectionState:
 
 
 class TestConnectWithPerson:
+    @contextmanager
     def _mock_scrape(
-        self, profile_text: str, *, follow_up_text: str | None = None
-    ) -> AsyncMock:
-        """Return a mock for scrape_person.
+        self,
+        extractor: LinkedInExtractor,
+        profile_text: str,
+        *,
+        follow_up_text: str | None = None,
+    ):
+        """Patch both ``scrape_person`` and ``_read_main_innertext``.
 
-        When ``follow_up_text`` is given, the second call returns that text
-        — used to simulate verification re-reads after an action.
+        ``scrape_person`` now returns a structured dict for
+        ``main_profile`` (see ``scraping/main_profile.py``); the
+        connect flow re-reads the raw ``<main>`` innerText via
+        ``_read_main_innertext`` for
+        :func:`detect_connection_state`'s locale fallback. This
+        helper installs both patches at once so connect-flow tests
+        only need to swap their old ``patch.object(extractor,
+        "scrape_person", ...)`` line for ``self._mock_scrape(
+        extractor, text, ...)``.
+
+        When ``follow_up_text`` is given, both mocks are configured
+        for two sequential calls (initial state + post-action
+        verification).
         """
-        first = {
+        sentinel_profile = {"name": "stub"}
+        first_section = {
             "url": "https://www.linkedin.com/in/testuser/",
-            "sections": {"main_profile": profile_text},
+            "sections": {"main_profile": sentinel_profile},
         }
         if follow_up_text is None:
-            return AsyncMock(return_value=first)
-        second = {
-            "url": "https://www.linkedin.com/in/testuser/",
-            "sections": {"main_profile": follow_up_text},
-        }
-        return AsyncMock(side_effect=[first, second])
+            scrape_mock = AsyncMock(return_value=first_section)
+            text_mock = AsyncMock(return_value=profile_text)
+        else:
+            second_section = {
+                "url": "https://www.linkedin.com/in/testuser/",
+                "sections": {"main_profile": sentinel_profile},
+            }
+            scrape_mock = AsyncMock(side_effect=[first_section, second_section])
+            text_mock = AsyncMock(side_effect=[profile_text, follow_up_text])
+
+        with (
+            patch.object(extractor, "scrape_person", scrape_mock),
+            patch.object(extractor, "_read_main_innertext", text_mock),
+        ):
+            yield
 
     @staticmethod
     def _signals(
@@ -1013,11 +1048,7 @@ class TestConnectWithPerson:
         post_text = "Jane\n\n· 3rd\n\nEngineer\n\nMessage\nPending\nMore\nAbout\n"
 
         with (
-            patch.object(
-                extractor,
-                "scrape_person",
-                self._mock_scrape(text, follow_up_text=post_text),
-            ),
+            self._mock_scrape(extractor, text, follow_up_text=post_text),
             patch.object(
                 extractor,
                 "_read_action_signals",
@@ -1056,9 +1087,7 @@ class TestConnectWithPerson:
         text = "Jane\n\n· 3rd\n\nEngineer\n\nConnect\nMore\nAbout\n"
 
         with (
-            patch.object(
-                extractor, "scrape_person", self._mock_scrape(text, follow_up_text=text)
-            ),
+            self._mock_scrape(extractor, text, follow_up_text=text),
             patch.object(
                 extractor,
                 "_read_action_signals",
@@ -1086,7 +1115,7 @@ class TestConnectWithPerson:
         text = "Jane\n\n· 3rd\n\nEngineer\n\nConnect\nMore\nAbout\n"
 
         with (
-            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
+            self._mock_scrape(extractor, text),
             patch.object(
                 extractor,
                 "_read_action_signals",
@@ -1109,7 +1138,7 @@ class TestConnectWithPerson:
         text = "Collin\n\n· 1st\n\nEngineer\n\nMessage\nMore\nAbout\n"
 
         with (
-            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
+            self._mock_scrape(extractor, text),
             patch.object(
                 extractor,
                 "_read_action_signals",
@@ -1127,7 +1156,7 @@ class TestConnectWithPerson:
         text = "Daniel\n\nEdit profile\n"
 
         with (
-            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
+            self._mock_scrape(extractor, text),
             patch.object(
                 extractor,
                 "_read_action_signals",
@@ -1150,11 +1179,7 @@ class TestConnectWithPerson:
         post = "Christian\n\n· 2nd\n\nFounder\n\nMessage\nPending\nMore\n"
 
         with (
-            patch.object(
-                extractor,
-                "scrape_person",
-                self._mock_scrape(pre, follow_up_text=post),
-            ),
+            self._mock_scrape(extractor, pre, follow_up_text=post),
             patch.object(
                 extractor,
                 "_read_action_signals",
@@ -1208,7 +1233,7 @@ class TestConnectWithPerson:
         text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMessage\nMore\n"
 
         with (
-            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
+            self._mock_scrape(extractor, text),
             patch.object(
                 extractor,
                 "_read_action_signals",
@@ -1248,7 +1273,7 @@ class TestConnectWithPerson:
         text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMessage\n"
 
         with (
-            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
+            self._mock_scrape(extractor, text),
             patch.object(
                 extractor,
                 "_read_action_signals",
@@ -1282,7 +1307,7 @@ class TestConnectWithPerson:
         text = "Frank\n\n· 3rd\n\nFounder\n\nMessage\nPending\nMore\n"
 
         with (
-            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
+            self._mock_scrape(extractor, text),
             patch.object(
                 extractor,
                 "_read_action_signals",
@@ -1309,11 +1334,7 @@ class TestConnectWithPerson:
         post = "Aklasur\n\n· 1st\n\nDhaka\n\nMessage\nMore\nAbout\n"
 
         with (
-            patch.object(
-                extractor,
-                "scrape_person",
-                self._mock_scrape(pre, follow_up_text=post),
-            ),
+            self._mock_scrape(extractor, pre, follow_up_text=post),
             patch.object(
                 extractor,
                 "_read_action_signals",
@@ -1343,11 +1364,7 @@ class TestConnectWithPerson:
         pre = "Aklasur\n\n--\n\nDhaka\n\nAccept\nIgnore\nMore\nAbout\n"
 
         with (
-            patch.object(
-                extractor,
-                "scrape_person",
-                self._mock_scrape(pre, follow_up_text=pre),
-            ),
+            self._mock_scrape(extractor, pre, follow_up_text=pre),
             patch.object(
                 extractor,
                 "_read_action_signals",
@@ -1376,7 +1393,7 @@ class TestConnectWithPerson:
         text = "Public Figure\n\n· 3rd+\n\nCEO\n\nFollow\nMore\nAbout\n"
 
         with (
-            patch.object(extractor, "scrape_person", self._mock_scrape(text)),
+            self._mock_scrape(extractor, text),
             patch.object(
                 extractor,
                 "_read_action_signals",
@@ -3213,6 +3230,10 @@ class TestMainProfileAlreadyLoaded:
 
         from linkedin_mcp_server.scraping.extractor import _RATE_LIMITED_MSG
 
+        # main_profile success path now stores a structured dict (see
+        # scraping/main_profile.py); mock the structured extractor with a
+        # sentinel so this test remains focused on the rate-limit fallback.
+        sentinel_profile = {"name": "retry succeeded"}
         with (
             patch.object(
                 extractor,
@@ -3227,6 +3248,11 @@ class TestMainProfileAlreadyLoaded:
                 return_value=extracted("retry succeeded"),
             ) as extract_page,
             patch(
+                "linkedin_mcp_server.scraping.extractor.extract_main_profile",
+                new_callable=AsyncMock,
+                return_value=sentinel_profile,
+            ),
+            patch(
                 "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
                 new_callable=AsyncMock,
             ),
@@ -3237,7 +3263,7 @@ class TestMainProfileAlreadyLoaded:
 
         loaded.assert_awaited_once()
         extract_page.assert_awaited_once()
-        assert result["sections"]["main_profile"] == "retry succeeded"
+        assert result["sections"]["main_profile"] == sentinel_profile
 
 
 class TestScrapeCompanyCallbacks:
