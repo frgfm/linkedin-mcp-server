@@ -42,6 +42,7 @@ from linkedin_mcp_server.scraping.conversation import (
     normalize_profile_url,
     parse_day_heading,
 )
+from linkedin_mcp_server.scraping.main_profile import extract_main_profile
 
 from .fields import COMPANY_SECTIONS, PERSON_SECTIONS
 
@@ -2266,7 +2267,11 @@ class LinkedInExtractor:
         """
         requested = requested | {"main_profile"}
         base_url = f"https://www.linkedin.com/in/{username}"
-        sections: dict[str, str] = {}
+        # main_profile is the only section that returns a structured
+        # dict instead of raw text (see scraping/main_profile.py and the
+        # CLAUDE.md "Tool Return Format" exception note alongside
+        # get_conversation). Hence Any here.
+        sections: dict[str, Any] = {}
         references: dict[str, list[Reference]] = {}
         section_errors: dict[str, dict[str, Any]] = {}
         profile_urn: str | None = None
@@ -2287,6 +2292,15 @@ class LinkedInExtractor:
                     await asyncio.sleep(_NAV_DELAY)
 
                 url = base_url + suffix
+                # main_profile needs a deeper scroll budget than the
+                # default 5 so the experience/education entry lists
+                # finish hydrating before extract_main_profile reads
+                # them. Honor an explicit user override.
+                section_max_scrolls = (
+                    8
+                    if section_name == "main_profile" and max_scrolls is None
+                    else max_scrolls
+                )
                 try:
                     can_reuse_main = (
                         section_name == "main_profile"
@@ -2298,7 +2312,7 @@ class LinkedInExtractor:
                         extracted = await self._extract_loaded_section(
                             url,
                             section_name=section_name,
-                            max_scrolls=max_scrolls,
+                            max_scrolls=section_max_scrolls,
                         )
                         if extracted.text == _RATE_LIMITED_MSG:
                             logger.info(
@@ -2308,7 +2322,7 @@ class LinkedInExtractor:
                             extracted = await self.extract_page(
                                 url,
                                 section_name=section_name,
-                                max_scrolls=max_scrolls,
+                                max_scrolls=section_max_scrolls,
                             )
                     elif is_overlay:
                         extracted = await self._extract_overlay(
@@ -2318,11 +2332,21 @@ class LinkedInExtractor:
                         extracted = await self.extract_page(
                             url,
                             section_name=section_name,
-                            max_scrolls=max_scrolls,
+                            max_scrolls=section_max_scrolls,
                         )
 
                     if extracted.text and extracted.text != _RATE_LIMITED_MSG:
-                        sections[section_name] = extracted.text
+                        if section_name == "main_profile":
+                            # Replace the raw innerText with the
+                            # structured payload. The raw extraction
+                            # above is still needed for references
+                            # and to surface rate-limit / chrome-only
+                            # responses; we just don't store its text.
+                            sections[section_name] = await extract_main_profile(
+                                self._page
+                            )
+                        else:
+                            sections[section_name] = extracted.text
                         if extracted.references:
                             references[section_name] = extracted.references
                     elif extracted.error:
@@ -2397,6 +2421,24 @@ class LinkedInExtractor:
             max_scrolls=max_scrolls,
             main_profile_already_loaded=True,
         )
+
+    async def _read_main_innertext(self) -> str:
+        """Re-read the current page's ``<main>`` innerText.
+
+        Used by ``connect_with_person`` to feed
+        :func:`detect_connection_state`, which needs the raw top-card
+        text for its locale-table Accept/Ignore fallback. ``scrape_person``
+        stores ``main_profile`` as a structured dict; this helper
+        surfaces the raw text without depending on that shape.
+        """
+        try:
+            return await self._page.evaluate(
+                "() => { const m = document.querySelector('main');"
+                " return m ? (m.innerText || '') : ''; }"
+            )
+        except Exception as e:
+            logger.debug("Re-read of <main> innerText failed: %s", e)
+            return ""
 
     async def _read_action_signals(self, username: str) -> ActionSignals:
         """Read locale-independent structural signals for a profile's
@@ -2531,7 +2573,15 @@ class LinkedInExtractor:
         url = f"https://www.linkedin.com/in/{username}/"
 
         profile = await self.scrape_person(username, {"main_profile"})
-        page_text = profile.get("sections", {}).get("main_profile", "")
+        # main_profile is now a structured dict (see scraping/main_profile.py),
+        # so re-read the raw <main> innerText for detect_connection_state's
+        # locale-table Accept/Ignore fallback. Existence-check on the
+        # section key still gates the "Could not read" early return.
+        if "main_profile" not in profile.get("sections", {}):
+            return _connection_result(
+                url, "unavailable", "Could not read profile page."
+            )
+        page_text = await self._read_main_innertext()
         if not page_text:
             return _connection_result(
                 url, "unavailable", "Could not read profile page."
@@ -2575,7 +2625,11 @@ class LinkedInExtractor:
                     profile=page_text,
                 )
             verified = await self.scrape_person(username, {"main_profile"})
-            verified_text = verified.get("sections", {}).get("main_profile", "")
+            verified_text = (
+                await self._read_main_innertext()
+                if "main_profile" in verified.get("sections", {})
+                else ""
+            )
             verified_signals = await self._read_action_signals(username)
             verified_state = detect_connection_state(verified_text, verified_signals)
             if verified_state != "already_connected":
@@ -2641,7 +2695,11 @@ class LinkedInExtractor:
             )
 
         verified = await self.scrape_person(username, {"main_profile"})
-        verified_text = verified.get("sections", {}).get("main_profile", "")
+        verified_text = (
+            await self._read_main_innertext()
+            if "main_profile" in verified.get("sections", {})
+            else ""
+        )
         verified_signals = await self._read_action_signals(username)
         verified_state = detect_connection_state(verified_text, verified_signals)
 
