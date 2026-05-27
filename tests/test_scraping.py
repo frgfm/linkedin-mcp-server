@@ -4527,6 +4527,21 @@ class TestInvitationManagement:
         ):
             assert needle in _INVITATION_ACTION_JS, f"missing: {needle!r}"
 
+    def test_click_withdraw_confirm_js_filters_modal_dismiss(self):
+        """Regression guard: the withdraw-confirm JS must filter out the
+        artdeco-modal__dismiss close X. Without that filter, clicking the
+        ``last visible button`` in dialogs that render the close X after
+        the action bar (or the dialog opens with only the close button
+        focused) would close the dialog without performing the withdraw.
+        """
+        from linkedin_mcp_server.scraping.extractor import _CLICK_WITHDRAW_CONFIRM_JS
+
+        assert "artdeco-modal__dismiss" in _CLICK_WITHDRAW_CONFIRM_JS
+        # Must prefer stable engineering attrs before falling back to position.
+        assert "'withdraw'" in _CLICK_WITHDRAW_CONFIRM_JS
+        assert "'confirm'" in _CLICK_WITHDRAW_CONFIRM_JS
+        assert "strategy = 'position'" in _CLICK_WITHDRAW_CONFIRM_JS
+
     async def test_act_on_invitation_verification_failed(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
         stack, _ = self._patch_invitation_pipeline(extractor)
