@@ -416,14 +416,36 @@ class TestNormalizeMainProfile:
 
 
 class TestExtractMainProfile:
-    async def test_calls_expand_then_extract(self) -> None:
-        """Verify expansion sweep runs before the extraction script."""
+    async def test_scroll_sweep_then_expand_then_extract(self) -> None:
+        """The extractor runs an incremental scroll sweep, then a
+        per-section scroll-into-view, then expand, then extract.
+        """
         raw = _alexandrelebrun_raw()
         call_order: list[str] = []
+        # Simulate the page reaching a stable scrollHeight after 3 steps
+        # so the incremental sweep exits promptly. Each step returns
+        # an increasing y until clamped.
+        step_returns = [
+            {"y": 400, "height": 2000, "h2_count": 1},
+            {"y": 800, "height": 2000, "h2_count": 2},
+            {"y": 1200, "height": 2000, "h2_count": 3},
+            {"y": 1600, "height": 2000, "h2_count": 3},
+            {"y": 2000, "height": 2000, "h2_count": 3},
+        ]
+        step_iter = iter(step_returns)
 
         async def fake_evaluate(script: str, *args: Any) -> Any:
-            # The expand script has no return-key markers; the extract
-            # script returns a dict containing ``top_card_text``.
+            # Four script kinds:
+            # - incremental scroll step: window.scrollTo(0, ...)
+            # - per-section scroll: scrollIntoView(...)
+            # - expand: aria-expanded clicks
+            # - extract: returns dict with top_card_text
+            if "window.scrollTo" in script:
+                call_order.append("scroll_step")
+                return next(step_iter, {"y": 2000, "height": 2000, "h2_count": 3})
+            if "scrollIntoView" in script:
+                call_order.append("scroll_section")
+                return True
             if "aria-expanded" in script and "top_card_text" not in script:
                 call_order.append("expand")
                 return []
@@ -438,7 +460,17 @@ class TestExtractMainProfile:
 
         result = await extract_main_profile(page)
 
-        assert call_order == ["expand", "extract"]
+        # Incremental sweep runs at least a few steps, then exactly one
+        # scroll-section call per labeled section (about/experience/
+        # education), then expand, then extract.
+        assert call_order[-5:] == [
+            "scroll_section",
+            "scroll_section",
+            "scroll_section",
+            "expand",
+            "extract",
+        ]
+        assert call_order.count("scroll_step") >= 3
         assert result["name"] == "Alex LeBrun"
         assert len(result["experience"]) == 5
 
@@ -448,6 +480,13 @@ class TestExtractMainProfile:
         calls: list[str] = []
 
         async def fake_evaluate(script: str, *args: Any) -> Any:
+            if "window.scrollTo" in script:
+                calls.append("scroll_step")
+                # Report immediate stability so the loop exits fast.
+                return {"y": 0, "height": 0, "h2_count": 0}
+            if "scrollIntoView" in script:
+                calls.append("scroll_section")
+                return False  # heading not found; skip hydration pause
             if "aria-expanded" in script and "top_card_text" not in script:
                 calls.append("expand")
                 raise RuntimeError("stale element")
@@ -459,7 +498,14 @@ class TestExtractMainProfile:
 
         result = await extract_main_profile(page)
 
-        assert calls == ["expand", "extract"]
+        # Tail must end with the section scrolls + expand + extract.
+        assert calls[-5:] == [
+            "scroll_section",
+            "scroll_section",
+            "scroll_section",
+            "expand",
+            "extract",
+        ]
         assert result["name"] == "Alex LeBrun"
 
     async def test_handles_null_evaluate_result(self) -> None:

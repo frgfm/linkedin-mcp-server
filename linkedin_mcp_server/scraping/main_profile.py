@@ -30,6 +30,7 @@ sections (raw text from ``/in/<user>/details/…``) to recover the data.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any
@@ -220,13 +221,19 @@ _EXTRACT_SCRIPT = r"""
         // tree to the nearest ancestor that "looks like an entry
         // container" — either a direct <li> child of the section's
         // main list, or the first ancestor whose innerText is at least
-        // 30 chars. De-dup on the entry container so multi-role
-        // companies (one anchor per role under the same parent) only
-        // contribute one entry.
+        // 30 chars.
+        //
+        // De-dup at two layers: by the chosen DOM container (so
+        // multi-role companies whose roles share a parent container
+        // only contribute one entry), AND by the container's
+        // innerText (LinkedIn's accessibility markup duplicates each
+        // entry between a visible and a visually-hidden copy that the
+        // walker may resolve to *different* containers).
         const extractEntries = (sectionEl, anchorSelector) => {
             if (!sectionEl) return [];
             const anchors = Array.from(sectionEl.querySelectorAll(anchorSelector));
-            const seen = new Set();
+            const seenNode = new Set();
+            const seenText = new Set();
             const entries = [];
             for (const a of anchors) {
                 // Walk up to the nearest <li> ancestor that's a direct
@@ -252,10 +259,13 @@ _EXTRACT_SCRIPT = r"""
                     }
                 }
                 if (!chosen) continue;
-                if (seen.has(chosen)) continue;
-                seen.add(chosen);
+                if (seenNode.has(chosen)) continue;
+                seenNode.add(chosen);
+                const text = (chosen.innerText || '').trim();
+                if (seenText.has(text)) continue;
+                seenText.add(text);
                 entries.push({
-                    text: (chosen.innerText || '').trim(),
+                    text: text,
                     anchor_href: a.getAttribute('href'),
                 });
             }
@@ -348,14 +358,10 @@ def parse_mutual_connection_count(mutual_text: str | None) -> int | None:
         before = mutual_text[: match.start()]
         before = re.sub(r"\s*\band\b\s*$", "", before, flags=re.IGNORECASE).strip()
         before = before.rstrip(",").strip()
-        named = (
-            [n.strip() for n in before.split(",") if n.strip()] if before else []
-        )
+        named = [n.strip() for n in before.split(",") if n.strip()] if before else []
         return others + len(named)
 
-    plural_match = re.search(
-        r"\bare\s+mutual\s+connection", mutual_text, re.IGNORECASE
-    )
+    plural_match = re.search(r"\bare\s+mutual\s+connection", mutual_text, re.IGNORECASE)
     if plural_match:
         before = mutual_text[: plural_match.start()].strip()
         parts = [
@@ -471,7 +477,9 @@ def _parse_top_card_lines(top_card_text: str | None) -> dict[str, str | None]:
     if cursor < len(lines):
         loc_line = lines[cursor]
         if loc_line.lower() != _CONTACT_INFO_MARKER_EN_US.lower():
-            loc_line = re.split(r"\s*[·•]\s*Contact info", loc_line, flags=re.IGNORECASE)[0].strip()
+            loc_line = re.split(
+                r"\s*[·•]\s*Contact info", loc_line, flags=re.IGNORECASE
+            )[0].strip()
             if loc_line:
                 result["location"] = loc_line
             cursor += 1
@@ -486,11 +494,7 @@ def _parse_top_card_lines(top_card_text: str | None) -> dict[str, str | None]:
     # main_organization: next line that doesn't look like a count.
     def _is_count_line(line: str) -> bool:
         lower = line.lower()
-        return (
-            "follower" in lower
-            or "connection" in lower
-            or "mutual" in lower
-        )
+        return "follower" in lower or "connection" in lower or "mutual" in lower
 
     if cursor < len(lines) and not _is_count_line(lines[cursor]):
         result["main_organization"] = lines[cursor]
@@ -686,20 +690,171 @@ def normalize_main_profile(raw: dict[str, Any] | None) -> MainProfile:
     }
 
 
+# Incremental scroll step. LinkedIn's current profile layout makes the
+# window itself non-scrollable; the actual scroll container is either
+# ``<main>`` itself (when ``main.scrollHeight > main.clientHeight``) or
+# an ancestor with ``overflow: auto|scroll``. This JS picks whichever
+# container is actually scrollable, advances it by ``stepPx``, and
+# reports its new position + height so the Python caller can decide
+# when to stop. Falls back to ``window.scrollTo`` when no overflow
+# container is found (older / lighter LinkedIn layouts).
+_SCROLL_STEP_JS = r"""
+    (stepPx) => {
+        const main = document.querySelector('main');
+        let target = null;
+        // Walk from <main> upward to find the first ancestor with
+        // overflow content. Most LinkedIn layouts make <main> itself
+        // the scroll container; some wrap it in a flex parent.
+        let node = main;
+        while (node && node !== document.body && node !== document.documentElement) {
+            if (node.scrollHeight > node.clientHeight + 1) {
+                const cs = window.getComputedStyle(node);
+                if (cs.overflowY === 'auto' || cs.overflowY === 'scroll'
+                    || node === main) {
+                    target = node;
+                    break;
+                }
+            }
+            node = node.parentElement;
+        }
+        if (target) {
+            const maxScroll = target.scrollHeight - target.clientHeight;
+            target.scrollTop = Math.min(target.scrollTop + stepPx, maxScroll);
+            return {
+                y: target.scrollTop,
+                height: target.scrollHeight,
+                client: target.clientHeight,
+                source: 'container',
+            };
+        }
+        // Fallback: scroll the window.
+        const root = document.scrollingElement || document.documentElement;
+        const targetY = Math.min(
+            window.scrollY + stepPx,
+            root.scrollHeight - window.innerHeight
+        );
+        window.scrollTo(0, targetY);
+        return {
+            y: window.scrollY,
+            height: root.scrollHeight,
+            client: window.innerHeight,
+            source: 'window',
+        };
+    }
+"""
+
+# Scroll a single labeled section's <h2> heading into view (used after
+# the incremental sweep so the section content sits in the viewport
+# when the extractor reads it — sometimes content rendered via lazy
+# Suspense only fully hydrates while the heading is visible).
+_SCROLL_TO_SECTION_JS = r"""
+    (label) => {
+        const main = document.querySelector('main');
+        if (!main) return false;
+        const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+        const labelLower = label.toLowerCase();
+        const sections = Array.from(main.querySelectorAll('section'));
+        for (const s of sections) {
+            const heading = s.querySelector('h2');
+            if (!heading) continue;
+            if (clean(heading.textContent).toLowerCase() !== labelLower) continue;
+            try { heading.scrollIntoView({block: 'center', behavior: 'instant'}); }
+            catch (e) { heading.scrollIntoView(); }
+            return true;
+        }
+        return false;
+    }
+"""
+
+# Pause budgets. ``_INCREMENTAL_PAUSE`` is short because most lazy-load
+# observers fire within a few hundred ms; ``_HYDRATION_PAUSE_SECONDS``
+# is the longer pause after a section heading is scrolled into view, to
+# let Experience / Education entry lists finish their Suspense boundary.
+_INCREMENTAL_PAUSE_SECONDS = 0.35
+_HYDRATION_PAUSE_SECONDS = 0.8
+# Step distance for the incremental scroll. Roughly one half-viewport
+# at the default 720px height — small enough that every section's
+# top edge crosses the viewport at least once.
+_SCROLL_STEP_PX = 400
+# Maximum number of incremental scroll steps. A typical profile page
+# (with About / Featured / Activity / etc.) saturates well under 25,
+# but a tall profile with many lazy sections may need more.
+_MAX_SCROLL_STEPS = 30
+
+
 async def extract_main_profile(page: Page) -> MainProfile:
     """Pull the structured main-profile payload from the current page.
 
-    The caller is responsible for navigating to the profile root and
-    waiting for the page to hydrate (scroll budget exhausted, lazy
-    sections loaded). This function expands the "see more" / "show
-    more" toggles in the about / experience / education sections via
-    a single ``aria-expanded="false"`` sweep, then runs the in-page
-    extractor and normalizes its output.
+    The caller is responsible for navigating to the profile root.
+    This function then:
+
+    1. **Incremental scroll sweep.** ``scrape_person``'s
+       ``scroll_to_bottom`` jumps to the bottom in a few large steps,
+       which is enough for the LinkedIn top card and About section but
+       skips past the intersection-observer thresholds for sections
+       further down the page (notably Experience / Education on
+       profiles where LinkedIn renders them inline). We re-walk the
+       page in small steps, pausing after each, until either the
+       scrollHeight stabilizes or the budget is exhausted.
+    2. **Per-section scroll-into-view.** For each labeled section we
+       know about, position its ``<h2>`` heading near viewport center
+       and pause again so any Suspense boundary inside the section
+       (entry lists, "see more" copy) finishes hydrating.
+    3. **Expand toggles.** Click every ``aria-expanded="false"`` button
+       inside the About / Experience / Education sections — the
+       locale-independent way to surface "see more" copy.
+    4. **Extract + normalize.** Run the in-page script and normalize.
     """
+    # 1. Incremental scroll sweep. Pause after each step so observers
+    #    + Suspense boundaries can fire.
+    last_height = -1
+    stable_steps = 0
+    for _ in range(_MAX_SCROLL_STEPS):
+        try:
+            step = await page.evaluate(_SCROLL_STEP_JS, _SCROLL_STEP_PX)
+        except Exception as e:
+            logger.debug("incremental scroll step failed: %s", e)
+            break
+        if not isinstance(step, dict):
+            # ``page.evaluate`` returned a non-dict (e.g. a test mock
+            # or a page that lost its scrolling element). Treat as
+            # "no progress" and stop sweeping.
+            break
+        await asyncio.sleep(_INCREMENTAL_PAUSE_SECONDS)
+        height = int(step.get("height") or 0)
+        y = int(step.get("y") or 0)
+        client = int(step.get("client") or 0)
+        # Stop once we've reached the bottom of the container AND its
+        # scrollHeight stopped growing for two consecutive steps (a
+        # single stable read can be a transient gap between Suspense
+        # renders). ``y + client >= height`` is the "at bottom" check
+        # whether the target is <main>'s overflow or the window.
+        if height == last_height:
+            stable_steps += 1
+        else:
+            stable_steps = 0
+            last_height = height
+        if stable_steps >= 2 and y + client + 1 >= height:
+            break
+
+    # 2. Per-section scroll-into-view.
+    for label_set in _SECTION_LABELS_EN_US.values():
+        for label in label_set:
+            try:
+                found = await page.evaluate(_SCROLL_TO_SECTION_JS, label)
+            except Exception as e:
+                logger.debug("scroll-to-section %r failed: %s", label, e)
+                continue
+            if found:
+                await asyncio.sleep(_HYDRATION_PAUSE_SECONDS)
+                break  # alt labels for this section are equivalent
+
+    # 3. Expand "see more" / "show more" toggles. Best-effort.
     try:
         await page.evaluate(_EXPAND_BUTTONS_JS, _SECTION_LABELS_EN_US)
     except Exception as e:
         logger.debug("see-more expansion failed (continuing): %s", e)
 
+    # 4. Pull the structured payload.
     raw = await page.evaluate(_EXTRACT_SCRIPT, _SECTION_LABELS_EN_US)
     return normalize_main_profile(raw)
