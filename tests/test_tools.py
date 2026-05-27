@@ -1276,16 +1276,20 @@ class TestNetworkTools:
         mcp = FastMCP("test")
         register_network_tools(mcp)
 
-        assert await mcp.get_tool("respond_to_invitation") is not None
+        assert await mcp.get_tool("ignore_connection_request") is not None
         assert await mcp.get_tool("withdraw_invitation") is not None
+        # The public surface intentionally does not expose accept — the
+        # tool only ignores. (Accept remains available internally via
+        # extractor.act_on_invitation for connect_with_person's
+        # auto-accept path.)
+        assert await mcp.get_tool("respond_to_invitation") is None
 
-    @pytest.mark.parametrize("action", ["accept", "ignore"])
-    async def test_respond_to_invitation_success(self, mock_context, action):
+    async def test_ignore_connection_request_success(self, mock_context):
         expected = {
-            "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/",
-            "status": "accepted" if action == "accept" else "ignored",
-            "message": "Invitation handled.",
-            "action": action,
+            "url": "https://www.linkedin.com/in/alice/",
+            "status": "ignored",
+            "message": "Invitation ignored.",
+            "action": "ignore",
             "linkedin_username": "alice",
             "performed": True,
             "profile_url": "/in/alice/",
@@ -1297,31 +1301,16 @@ class TestNetworkTools:
         mcp = FastMCP("test")
         register_network_tools(mcp)
 
-        tool_fn = await get_tool_fn(mcp, "respond_to_invitation")
+        tool_fn = await get_tool_fn(mcp, "ignore_connection_request")
         result = await tool_fn(
             linkedin_username="alice",
-            action=action,
             ctx=mock_context,
             extractor=mock_extractor,
         )
 
-        assert result["action"] == action
-        assert result["status"] == ("accepted" if action == "accept" else "ignored")
-        mock_extractor.act_on_invitation.assert_awaited_once_with("alice", action)
-
-    async def test_respond_to_invitation_rejects_invalid_action(self):
-        from pydantic import ValidationError
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        with pytest.raises(ValidationError, match="action"):
-            await mcp.call_tool(
-                "respond_to_invitation",
-                {"linkedin_username": "alice", "action": "withdraw"},
-            )
+        assert result["action"] == "ignore"
+        assert result["status"] == "ignored"
+        mock_extractor.act_on_invitation.assert_awaited_once_with("alice", "ignore")
 
     async def test_withdraw_invitation_success(self, mock_context):
         expected = {

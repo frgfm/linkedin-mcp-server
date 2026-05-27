@@ -114,8 +114,8 @@
       "description": "List the authenticated user's most recently added 1st-degree LinkedIn connections (name, profile URL, headline, connected_on ISO date)"
     },
     {
-      "name": "respond_to_invitation",
-      "description": "Accept or ignore a received LinkedIn connection request by username"
+      "name": "ignore_connection_request",
+      "description": "Ignore a received LinkedIn connection request by username"
     },
     {
       "name": "withdraw_invitation",

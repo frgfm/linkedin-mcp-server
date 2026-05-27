@@ -100,46 +100,43 @@ def register_network_tools(
 
     @mcp.tool(
         timeout=tool_timeout,
-        title="Respond to Invitation",
+        title="Ignore Connection Request",
         annotations={"destructiveHint": True, "openWorldHint": True},
         tags={"network", "actions"},
         exclude_args=["extractor"],
     )
-    async def respond_to_invitation(
+    async def ignore_connection_request(
         linkedin_username: str,
-        action: Literal["accept", "ignore"],
         ctx: Context,
         extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
-        Accept or ignore a received LinkedIn connection request.
+        Ignore a received LinkedIn connection request.
 
-        Navigates to ``/mynetwork/invitation-manager/received/``, finds the
-        card for ``linkedin_username``, and clicks the requested action button.
-        Identification uses stable engineering attributes (``data-control-name``
-        etc), not localized button text.
+        Navigates to ``/in/{linkedin_username}/``, verifies the page is
+        showing an incoming connection request, and clicks the Ignore
+        button in the top-card action row. The Ignore button is
+        identified via a locale-table label scan (per
+        ``INCOMING_REQUEST_LABELS``) with structural fallbacks
+        (engineering attrs → design-system class → documented position).
 
-        Status: ``accepted`` | ``ignored`` | ``not_found`` | ``action_unavailable``
-        | ``verification_failed``.
+        Status: ``ignored`` | ``not_found`` | ``already_connected``
+        | ``action_unavailable`` | ``verification_failed``.
         """
         try:
             extractor = extractor or await get_ready_extractor(
-                ctx, tool_name="respond_to_invitation"
+                ctx, tool_name="ignore_connection_request"
             )
-            logger.info(
-                "Responding to invitation: %s (action=%s)",
-                linkedin_username,
-                action,
-            )
-            result = await extractor.act_on_invitation(linkedin_username, action)
+            logger.info("Ignoring connection request: %s", linkedin_username)
+            result = await extractor.act_on_invitation(linkedin_username, "ignore")
             return result
         except AuthenticationError as e:
             try:
                 await handle_auth_error(e, ctx)
             except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "respond_to_invitation")
+                raise_tool_error(relogin_exc, "ignore_connection_request")
         except Exception as e:
-            raise_tool_error(e, "respond_to_invitation")  # NoReturn
+            raise_tool_error(e, "ignore_connection_request")  # NoReturn
 
     @mcp.tool(
         timeout=tool_timeout,
