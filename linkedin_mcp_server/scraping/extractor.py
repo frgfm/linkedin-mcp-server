@@ -309,21 +309,6 @@ _CLICK_PENDING_WITHDRAW_JS = (
 # are visible without re-running with extra logging.
 _CLICK_WITHDRAW_CONFIRM_JS = r"""
 () => {
-  const candidateDialogs = [
-    ...document.querySelectorAll(
-      '.artdeco-modal[role="dialog"]:not([aria-hidden="true"])'
-    ),
-    ...document.querySelectorAll('dialog[open]'),
-    ...document.querySelectorAll('[role="dialog"]:not([aria-hidden="true"])'),
-  ];
-  const dialog = candidateDialogs.find(d => {
-    const rects = d.getClientRects ? d.getClientRects() : [];
-    return rects.length > 0;
-  });
-  if (!dialog) {
-    return { found: false, clicked: false, reason: 'no_dialog' };
-  }
-
   const visible = el => {
     if (el.disabled) return false;
     const rects = el.getClientRects ? el.getClientRects() : [];
@@ -349,20 +334,78 @@ _CLICK_WITHDRAW_CONFIRM_JS = r"""
     classes:
       typeof el.className === 'string' ? el.className.slice(0, 120) : null,
   });
+  // Icon-only buttons (close X, dismiss chevrons, etc.) have an
+  // aria-label but no visible text node. The withdraw/cancel actions
+  // always carry a visible text label — filter icon-only buttons so we
+  // never land on the close X even when LinkedIn obfuscates its class
+  // name to a hash like `_94255844 _06957f2c`.
+  const isTextBearing = b =>
+    ((b.innerText || b.textContent || '').trim()).length > 0;
+  const actionButtonsIn = dialog =>
+    Array.from(dialog.querySelectorAll('button, [role="button"]'))
+      .filter(visible)
+      .filter(b => !b.classList.contains('artdeco-modal__dismiss'))
+      .filter(isTextBearing);
 
-  const buttons = Array.from(
-    dialog.querySelectorAll('button, [role="button"]')
-  )
-    .filter(visible)
-    .filter(b => !b.classList.contains('artdeco-modal__dismiss'));
+  // LinkedIn often has multiple open dialogs in the DOM at once
+  // (coachmarks, a11y skip-link wrappers, the actual modal). Score
+  // candidates by the count of text-bearing action buttons and pick
+  // the richest — that is, the one with actionable choices like
+  // Withdraw + Cancel, never the chrome shell with only an X.
+  const candidates = [
+    ...document.querySelectorAll(
+      '.artdeco-modal[role="dialog"]:not([aria-hidden="true"])'
+    ),
+    ...document.querySelectorAll('dialog[open]'),
+    ...document.querySelectorAll('[role="dialog"]:not([aria-hidden="true"])'),
+  ].filter(d => {
+    const rects = d.getClientRects ? d.getClientRects() : [];
+    return rects.length > 0;
+  });
+  const seen = new Set();
+  const unique = [];
+  for (const d of candidates) {
+    if (seen.has(d)) continue;
+    seen.add(d);
+    unique.push(d);
+  }
+
+  const scored = unique
+    .map(d => ({ dialog: d, buttons: actionButtonsIn(d) }))
+    .sort((a, b) => b.buttons.length - a.buttons.length);
+
+  const dialogEnumeration = scored.map(({ dialog, buttons }) => ({
+    button_count: buttons.length,
+    classes:
+      typeof dialog.className === 'string'
+        ? dialog.className.slice(0, 120)
+        : null,
+    aria_label: dialog.getAttribute('aria-label'),
+    aria_labelledby: dialog.getAttribute('aria-labelledby'),
+  }));
+
+  if (scored.length === 0) {
+    return {
+      found: false,
+      clicked: false,
+      reason: 'no_dialog',
+      candidate_dialogs: dialogEnumeration,
+    };
+  }
+
+  const pick = scored[0];
+  const buttons = pick.buttons;
   const enumeration = buttons.map(describe);
 
   if (buttons.length === 0) {
+    // The richest dialog has no text-bearing actions yet — the modal
+    // body has not rendered. The Python caller should retry.
     return {
       found: true,
       clicked: false,
       reason: 'no_buttons',
       dialog_buttons: enumeration,
+      candidate_dialogs: dialogEnumeration,
     };
   }
 
@@ -387,6 +430,7 @@ _CLICK_WITHDRAW_CONFIRM_JS = r"""
     match_strategy: strategy,
     clicked_button: describe(target),
     dialog_buttons: enumeration,
+    candidate_dialogs: dialogEnumeration,
   };
 }
 """
@@ -4973,6 +5017,57 @@ class LinkedInExtractor:
                 linkedin_username=username,
                 profile_url=profile_url,
                 performed=True,
+            )
+
+        # The dialog is open, but `_dialog_is_open` only checks for *any*
+        # role=dialog node — LinkedIn's chrome layer can have empty
+        # coachmark/wrapper dialogs in the DOM that match the selector
+        # before our actual modal body mounts. Poll until at least one
+        # candidate dialog contains a text-bearing, non-dismiss action
+        # button (Withdraw / Cancel). This avoids clicking the close X
+        # of a wrapper dialog that has only icon buttons.
+        try:
+            await self._page.wait_for_function(
+                """() => {
+                  const visible = el => {
+                    if (el.disabled) return false;
+                    const rects = el.getClientRects
+                      ? el.getClientRects() : [];
+                    return rects.length > 0;
+                  };
+                  const dialogs = [
+                    ...document.querySelectorAll(
+                      '.artdeco-modal[role="dialog"]:not([aria-hidden="true"])'
+                    ),
+                    ...document.querySelectorAll('dialog[open]'),
+                    ...document.querySelectorAll(
+                      '[role="dialog"]:not([aria-hidden="true"])'
+                    ),
+                  ];
+                  for (const d of dialogs) {
+                    const rects = d.getClientRects ? d.getClientRects() : [];
+                    if (rects.length === 0) continue;
+                    const buttons = Array.from(
+                      d.querySelectorAll('button, [role="button"]')
+                    )
+                      .filter(visible)
+                      .filter(b =>
+                        !b.classList.contains('artdeco-modal__dismiss')
+                      )
+                      .filter(b =>
+                        ((b.innerText || b.textContent || '').trim()).length
+                          > 0
+                      );
+                    if (buttons.length >= 1) return true;
+                  }
+                  return false;
+                }""",
+                timeout=5000,
+            )
+        except PlaywrightTimeoutError:
+            logger.debug(
+                "Withdraw confirm action buttons never rendered for %s",
+                username,
             )
 
         # Confirm via the targeted withdraw JS helper. Playwright's actionability
