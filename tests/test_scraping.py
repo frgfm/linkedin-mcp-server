@@ -957,6 +957,23 @@ class TestDetectConnectionState:
             == "incoming_request"
         )
 
+    def test_incoming_request_takes_priority_over_pending_anchor(self):
+        # Live-observed regression: some incoming-request profiles also
+        # render a labeled <a> in the action root (e.g. the Message link
+        # carrying aria-label, or another action-area anchor). Before
+        # this fix, the pending check ran first and returned "pending",
+        # which caused respond_to_invitation to bail out with not_found
+        # even though Accept + Ignore were clearly visible. The Accept
+        # + Ignore text pair must dominate.
+        text = "Mothess\n\n--\n\nAccept\nIgnore\nMessage"
+        assert (
+            detect_connection_state(
+                text,
+                self._signals(compose_in_root=True, labeled_anchor=True),
+            )
+            == "incoming_request"
+        )
+
     def test_connectable_takes_priority_over_text_signals(self):
         # vanityName invite anchor wins even if the page also has
         # text that would otherwise match a fallback.

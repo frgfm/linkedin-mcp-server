@@ -110,12 +110,18 @@ def detect_connection_state(
 
     1. ``self_profile`` — edit-intro anchor (URL).
     2. ``connectable`` — vanityName invite anchor (URL).
-    3. ``pending`` — labeled action ``<a>`` in the action root (the
-       Pending control LinkedIn renders for invitations awaiting
-       response).
-    4. ``incoming_request`` — locale-table text fallback. The one
-       AGENTS.md-sanctioned text-based signal; extend
+    3. ``incoming_request`` — locale-table text fallback (Accept + Ignore
+       both line-bounded in the top-card prefix). Checked *before*
+       ``pending`` because the text signal requires two specific labels
+       to coincide and is more discriminating than the labeled-anchor
+       presence signal: many profiles render a labeled ``<a>`` in the
+       action root for unrelated reasons (e.g. the Message link with
+       ``aria-label``), but Accept + Ignore line-bounded together only
+       appears for an actual incoming invitation. Extend
        :data:`INCOMING_REQUEST_LABELS` to add locales.
+    4. ``pending`` — labeled action ``<a>`` in the action root (the
+       Pending control LinkedIn renders for outgoing invitations
+       awaiting response).
     5. ``already_connected`` — compose anchor present in action root and
        no labeled action button. (1st-degree connections render Message
        as the primary action; there is no Follow/Connect button.)
@@ -131,10 +137,10 @@ def detect_connection_state(
         return "self_profile"
     if signals.has_invite_anchor:
         return "connectable"
-    if signals.has_labeled_action_anchor:
-        return "pending"
     if _has_incoming_request_text(profile_text):
         return "incoming_request"
+    if signals.has_labeled_action_anchor:
+        return "pending"
     if signals.has_compose_anchor_in_action_root:
         if signals.has_labeled_action_button:
             return "follow_only"
