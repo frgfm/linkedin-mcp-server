@@ -5076,18 +5076,45 @@ class LinkedInExtractor:
         # clicks Send via JS). Do not call _dismiss_dialog on failure: if
         # the confirm click didn't land, dismissing would actively close the
         # dialog without withdrawing. Let LinkedIn time out the modal.
-        try:
-            confirm_result = await self._page.evaluate(_CLICK_WITHDRAW_CONFIRM_JS)
-        except Exception:
-            logger.debug("Withdraw confirm click failed", exc_info=True)
-            confirm_result = {"found": False, "clicked": False}
-        if not isinstance(confirm_result, dict):
-            confirm_result = {"found": False, "clicked": False}
+        #
+        # Retry loop: LinkedIn streams the modal body (Withdraw + Cancel
+        # buttons) asynchronously after the dialog wrapper mounts. The JS
+        # helper refuses to click when only icon-only buttons (the close
+        # X) are visible — it returns `reason: 'no_buttons'` after filtering
+        # text-bearing candidates. We re-evaluate every 500 ms until the
+        # action buttons render or we exhaust the budget. 6 × 500 ms ≈ 3 s
+        # on top of the 5 s wait_for_function above gives ~8 s total for
+        # the modal body to mount, which has been enough on all profiles
+        # observed in testing while keeping the failure path fast.
+        confirm_result: dict[str, Any] = {"found": False, "clicked": False}
+        for attempt in range(6):
+            try:
+                evaluated = await self._page.evaluate(_CLICK_WITHDRAW_CONFIRM_JS)
+            except Exception:
+                logger.debug(
+                    "Withdraw confirm click failed (attempt %d)",
+                    attempt,
+                    exc_info=True,
+                )
+                evaluated = None
+            if isinstance(evaluated, dict):
+                confirm_result = evaluated
+                # Success or a non-retryable failure (e.g. no_dialog) — stop.
+                if confirm_result.get("clicked"):
+                    break
+                if confirm_result.get("reason") != "no_buttons":
+                    break
+            await asyncio.sleep(0.5)
 
         def _attach_confirm_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
             """Surface dialog enumeration so misroutes are visible without
             re-running with extra logging."""
-            for key in ("match_strategy", "clicked_button", "dialog_buttons"):
+            for key in (
+                "match_strategy",
+                "clicked_button",
+                "dialog_buttons",
+                "candidate_dialogs",
+            ):
                 value = confirm_result.get(key)
                 if value is not None:
                     result[key] = value
