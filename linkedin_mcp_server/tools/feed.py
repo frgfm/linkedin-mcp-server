@@ -47,11 +47,16 @@ def register_feed_tools(
         Args:
             ctx: FastMCP context for progress reporting
             num_posts: Number of posts to fetch (1-50, default 10).
-                       Posts are loaded in batches of ~5 as the page scrolls,
-                       so the actual count may slightly exceed the target.
+                       Posts are loaded in batches of ~5 as the page scrolls.
 
         Returns:
-            Dict with url, sections (name -> raw text), and optional keys:
+            Dict with url, sections, and optional keys:
+            - sections["feed"]: list of structured posts. Each entry is
+              {url, post_age, author: {name, profile_url, headline, degree},
+              content, is_promoted, media, reactions_count, comment_count,
+              repost_count}. ``url``/``profile_url`` are relative paths;
+              ``media`` is null or {type: link|image|video, url}; counts are
+              null when LinkedIn renders none. See FeedPost in link_metadata.py.
             - references["feed"]: list of {kind: "feed_post", url, ...}
               entries. URLs are relative paths and may carry either
               ``/feed/update/<urn>/`` (DOM-anchor-derived) or
@@ -60,9 +65,8 @@ def register_feed_tools(
             - section_errors: present when the feed is rate-limited or
               extraction fails.
 
-            Truncated posts are not auto-expanded; full text for any post
-            is reachable via its permalink in references["feed"]. The LLM
-            should parse sections["feed"] for post bodies.
+            Truncated post bodies are not auto-expanded; full text for any
+            post is reachable via its ``url`` permalink.
         """
         try:
             extractor = extractor or await get_ready_extractor(
@@ -77,20 +81,22 @@ def register_feed_tools(
             extracted = await extractor.extract_feed(num_posts=num_posts)
 
             url = "https://www.linkedin.com/feed/"
-            sections: dict[str, str] = {}
+            sections: dict[str, Any] = {}
             references: dict[str, list[Reference]] = {}
             section_errors: dict[str, dict[str, Any]] = {}
-            if extracted.text and extracted.text != _RATE_LIMITED_MSG:
-                sections["feed"] = extracted.text
-                if extracted.references:
-                    references["feed"] = extracted.references
-            elif extracted.text == _RATE_LIMITED_MSG:
+            if extracted.text == _RATE_LIMITED_MSG:
                 section_errors["feed"] = {
                     "error_type": "rate_limit",
                     "error_message": extracted.text,
                 }
             elif extracted.error:
                 section_errors["feed"] = extracted.error
+            else:
+                # sections["feed"] is the structured FeedPost list (possibly
+                # empty); the raw-innerText blob is no longer surfaced.
+                sections["feed"] = extracted.posts
+                if extracted.references:
+                    references["feed"] = extracted.references
 
             await ctx.report_progress(progress=100, total=100, message="Complete")
 

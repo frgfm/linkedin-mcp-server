@@ -163,6 +163,67 @@ class MainProfile(TypedDict):
     education: list[Education]
 
 
+class FeedAuthor(TypedDict):
+    """Author block for one feed post.
+
+    ``name`` and ``profile_url`` come from the post's actor anchor —
+    a ``/in/<slug>`` link for people, a ``/company/<slug>`` (or
+    ``/showcase/``, ``/school/``) link for Pages. ``profile_url`` is a
+    relative path (the ``references`` convention). ``headline`` is the
+    actor's subline (a person's tagline, or a Page's "<N> followers"
+    text). ``degree`` is the connection-distance badge — ``"1st"``,
+    ``"2nd"``, ``"3rd+"`` — parsed structurally (bullet + ordinal),
+    ``None`` for Pages, promoted posts, and self-authored posts.
+    """
+
+    name: str | None
+    profile_url: str | None
+    headline: str | None
+    degree: str | None
+
+
+class FeedMedia(TypedDict):
+    """Primary media attached to a feed post.
+
+    Only the first detected attachment is surfaced (priority:
+    ``video`` > ``link`` > ``image``). ``url`` is the media source for
+    images/videos (absolute ``media.licdn.com`` URL) or the link-card
+    destination for ``link`` (surfaced as-is — ``lnkd.in`` shortlinks
+    are not expanded).
+    """
+
+    type: Literal["link", "image", "video"]
+    url: str
+
+
+class FeedPost(TypedDict):
+    """Structured payload for one entry in the ``feed`` section.
+
+    Replaces the previous single raw-innerText blob: ``sections["feed"]``
+    is now a ``list[FeedPost]``. ``url`` is a relative permalink
+    (``/feed/update/<urn>/`` or ``/posts/<slug>``) or ``None`` when no
+    permalink is exposed. ``post_age`` is the short relative-age string
+    matching the invitation format ("21min", "15h", "1d", "2mo") or
+    ``None``. ``is_promoted`` flags sponsored posts. ``media`` is
+    ``None`` when the post has no attachment. Engagement counts are
+    ``None`` when LinkedIn renders no count (a silent post).
+
+    Locale caveat: ``is_promoted`` and the engagement-count text
+    fallback assume en-US (BrowserManager forces en-US). ``degree`` and
+    ``post_age`` parsing are structural / numeric and locale-robust.
+    """
+
+    url: str | None
+    post_age: str | None
+    author: FeedAuthor
+    content: str | None
+    is_promoted: bool
+    media: FeedMedia | None
+    reactions_count: int | None
+    comment_count: int | None
+    repost_count: int | None
+
+
 _GENERIC_LABELS = {
     "show all",
     "follow",
