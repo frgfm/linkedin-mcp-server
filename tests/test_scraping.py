@@ -6264,3 +6264,64 @@ class TestConnectionList:
         # Headline / date selection must not depend on class names.
         assert "className" not in _CONNECTION_CARDS_JS
         assert "[class" not in _CONNECTION_CARDS_JS
+
+
+class TestExtractFeedPosts:
+    """The JS -> Python boundary of the feed post extractor.
+
+    Covers the failure surface (``page.evaluate`` raising or returning a
+    non-list) and the valid-post limit, which the JS extractor and
+    ``_normalize_feed_post`` cannot exercise on their own.
+    """
+
+    def _raw_post(self, name: str = "Alice") -> dict:
+        return {
+            "url": "/feed/update/urn:li:activity:1/",
+            "post_age": "5h",
+            "author": {
+                "name": name,
+                "profile_url": "/in/alice/",
+                "headline": "Engineer",
+                "degree": "1st",
+            },
+            "content": "hello",
+            "is_promoted": False,
+            "media": None,
+            "reactions_count": 2,
+            "comment_count": 0,
+            "repost_count": 0,
+        }
+
+    async def test_evaluate_exception_returns_empty(self, mock_page):
+        """A failing page.evaluate is swallowed → [] (not propagated)."""
+        mock_page.evaluate = AsyncMock(side_effect=RuntimeError("boom"))
+        extractor = LinkedInExtractor(mock_page)
+        assert await extractor._extract_feed_posts(10) == []
+
+    async def test_non_list_result_returns_empty(self, mock_page):
+        """A malformed (non-list) JS result degrades to []."""
+        mock_page.evaluate = AsyncMock(return_value={"not": "a list"})
+        extractor = LinkedInExtractor(mock_page)
+        assert await extractor._extract_feed_posts(10) == []
+
+    async def test_respects_limit(self, mock_page):
+        raws = [self._raw_post(f"P{i}") for i in range(5)]
+        mock_page.evaluate = AsyncMock(return_value=raws)
+        extractor = LinkedInExtractor(mock_page)
+        posts = await extractor._extract_feed_posts(2)
+        assert [p["author"]["name"] for p in posts] == ["P0", "P1"]
+
+    async def test_chrome_cards_not_counted_toward_limit(self, mock_page):
+        """Cards that normalize to None must not consume the limit budget."""
+        chrome = {"url": None, "content": None, "author": {"name": None}}
+        raws = [
+            chrome,
+            self._raw_post("A"),
+            chrome,
+            self._raw_post("B"),
+            self._raw_post("C"),
+        ]
+        mock_page.evaluate = AsyncMock(return_value=raws)
+        extractor = LinkedInExtractor(mock_page)
+        posts = await extractor._extract_feed_posts(2)
+        assert [p["author"]["name"] for p in posts] == ["A", "B"]

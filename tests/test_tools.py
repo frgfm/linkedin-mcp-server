@@ -11,6 +11,7 @@ from linkedin_mcp_server.scraping.extractor import (
     _RATE_LIMITED_MSG,
     _normalize_feed_post,
 )
+from linkedin_mcp_server.scraping.link_metadata import FeedPost
 
 
 async def get_tool_fn(
@@ -1032,7 +1033,7 @@ class TestGetCompanyEmployeesTool:
 class TestFeedTools:
     async def test_get_feed_success(self, mock_context):
         """sections["feed"] is the structured FeedPost list, not raw text."""
-        posts = [
+        posts: list[FeedPost] = [
             {
                 "url": "/feed/update/urn:li:activity:1/",
                 "post_age": "21min",
@@ -1063,6 +1064,10 @@ class TestFeedTools:
         tool_fn = await get_tool_fn(mcp, "get_feed")
         result = await tool_fn(mock_context, extractor=mock_extractor)
         assert result["url"] == "https://www.linkedin.com/feed/"
+        # the tool must populate the section key (guards against the else
+        # branch being dropped) ...
+        assert "feed" in result["sections"]
+        # ... and surface the structured list verbatim.
         assert result["sections"]["feed"] == posts
         assert result["sections"]["feed"][0]["author"]["degree"] == "1st"
         assert "posts" not in result

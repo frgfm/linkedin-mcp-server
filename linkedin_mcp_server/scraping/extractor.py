@@ -770,8 +770,11 @@ _FEED_POSTS_JS = r"""
   };
   const absUrl = href => { try { return new URL(href, location.origin).href; } catch { return null; } };
   const isExternal = href => {
-    try { const u = new URL(href, location.origin); return !!u.host && !u.host.toLowerCase().endsWith('linkedin.com'); }
-    catch { return false; }
+    try {
+      const h = new URL(href, location.origin).host.toLowerCase();
+      // endsWith('linkedin.com') alone would treat notlinkedin.com as internal.
+      return !!h && h !== 'linkedin.com' && !h.endsWith('.linkedin.com');
+    } catch { return false; }
   };
   const bestAnchorText = a => {
     const t = normalize(a.textContent);
@@ -894,11 +897,27 @@ _FEED_POSTS_JS = r"""
       if (m) { degree = m[1].toLowerCase(); degreeIdx = i; break; }
     }
 
+    // The actor header sits above the degree/age line. Skip past any
+    // social-proof header ("<Reactor> likes this" — which LinkedIn may split
+    // across two lines, "<Reactor>" then "likes this") so the reactor's name
+    // can't be mistaken for the author or headline. Proof is matched only in
+    // this header window, never the footer's "N others reacted".
+    const ageLineIdx = lines.findIndex(
+      L => AGE_RE.test(L) && (/[•·]/.test(L) || L.length <= 24)
+    );
+    const headerEnd = degreeIdx >= 0
+      ? degreeIdx
+      : (ageLineIdx >= 0 ? ageLineIdx : Math.min(6, lines.length));
+    let headerStart = 0;
+    for (let i = 0; i < headerEnd; i++) {
+      if (SOCIAL_PROOF_RE.test(lines[i])) headerStart = i + 1;
+    }
+
     // ---- author name from lines: the name sits just above the degree badge,
-    // else the first identity-ish line after any social-proof header ----
+    // else the first identity-ish line after the social-proof header ----
     let authorName = null;
     if (degreeIdx > 0) {
-      for (let i = degreeIdx - 1; i >= 0; i--) {
+      for (let i = degreeIdx - 1; i >= headerStart; i--) {
         const L = lines[i];
         if (!L || NOISE.has(L) || buttonTexts.has(L) || BADGE_RE.test(L)) continue;
         if (SOCIAL_PROOF_RE.test(L)) break;
@@ -906,7 +925,8 @@ _FEED_POSTS_JS = r"""
       }
     }
     if (!authorName) {
-      for (const L of lines) {
+      for (let i = headerStart; i < lines.length; i++) {
+        const L = lines[i];
         if (NOISE.has(L) || buttonTexts.has(L) || BADGE_RE.test(L)) continue;
         if (SOCIAL_PROOF_RE.test(L) || DEGREE_RE.test(L) || FOLLOWERS_RE.test(L)) continue;
         if (AGE_RE.test(L) && /[•·]/.test(L)) continue;
@@ -937,11 +957,14 @@ _FEED_POSTS_JS = r"""
     if (isPage) {
       headline = lines.find(L => FOLLOWERS_RE.test(L)) || null;
     } else {
-      for (const L of lines) {
+      // Bound to the header window [headerStart, age) so neither a split
+      // social-proof reactor name above nor the post body below can leak in.
+      const headlineEnd = ageLineIdx >= 0 ? ageLineIdx : lines.length;
+      for (let i = headerStart; i < headlineEnd; i++) {
+        const L = lines[i];
         if (nameNorm && (L === nameNorm || L.startsWith(nameNorm))) continue;
         if (NOISE.has(L) || buttonTexts.has(L) || BADGE_RE.test(L)) continue;
         if (DEGREE_RE.test(L) || SOCIAL_PROOF_RE.test(L) || FOLLOWERS_RE.test(L)) continue;
-        if (AGE_RE.test(L) && /[•·]/.test(L)) continue;
         headline = L; break;
       }
     }
@@ -952,7 +975,7 @@ _FEED_POSTS_JS = r"""
     let url = null;
     const permA = anchors.find(x => /^\/feed\/update\/[^/?#]+/.test(x.path))
                || anchors.find(x => /^\/posts\/[^/?#]+/.test(x.path));
-    if (permA) url = permA.path.split('?')[0];
+    if (permA) url = permA.path.split('?')[0].split('#')[0];
     if (!url) {
       const m = urn.match(/urn:li:(?:activity|ugcPost|share):\d+/i);
       if (m) url = `/feed/update/${m[0]}/`;
@@ -965,7 +988,7 @@ _FEED_POSTS_JS = r"""
       /^\d[\d,.\s]*\s+(?:reactions?|comments?|reposts?)$/i.test(L) ||
       /\breacted$/i.test(L) || L === 'Like' || L === 'Comment' || L === 'Repost' || L === 'Send');
     let startIdx = 0;
-    const ageIdx = lines.findIndex(L => AGE_RE.test(L) && (/[•·]/.test(L) || L.length <= 24));
+    const ageIdx = ageLineIdx;  // computed once in the header window above
     if (ageIdx >= 0) {
       startIdx = ageIdx + 1;
     } else {
@@ -1758,9 +1781,16 @@ _NOISE_LINES: list[re.Pattern[str]] = [
 class ExtractedSection:
     """Text and compact references extracted from a loaded LinkedIn section.
 
-    ``posts`` is populated only by ``extract_feed``: a list of structured
-    ``FeedPost`` dicts that replaces the raw-innerText ``text`` blob for
-    the feed. All other sections leave it empty and use ``text``.
+    ``posts`` is populated only by ``extract_feed`` (do not set it in other
+    extractors): a list of structured ``FeedPost`` dicts that replaces the
+    raw-innerText ``text`` blob for the feed. All other sections leave
+    ``posts`` empty and carry their content in ``text``.
+
+    Feed sentinel: the feed path sets ``text=""`` deliberately and puts its
+    payload in ``posts``. Consumers must branch on the section, not on
+    ``if extracted.text`` — an empty ``text`` is not "no content" for the
+    feed. The rate-limit path still uses ``text`` (``_RATE_LIMITED_MSG``),
+    so ``tools/feed.py`` checks that before reading ``posts``.
     """
 
     text: str
@@ -1841,6 +1871,11 @@ def _build_feed_references(
     return dedupe_references(refs, cap=50)
 
 
+# Units must stay in sync with the JS ``ageToken`` helper in _FEED_POSTS_JS
+# (min/h/d/w/mo/y). These tokens are en-US — the JS ``AGE_RE`` reads en-US unit
+# letters and the digit is locale-independent, but the unit set assumes the
+# BrowserManager en-US lock. Add a unit on one side without the other and the
+# JS emits a token this guard rejects → post_age silently becomes None.
 _FEED_AGE_RE = re.compile(r"^\d+(?:min|h|d|w|mo|y)$")
 _FEED_DEGREE_RE = re.compile(r"^(\d(?:st|nd|rd))\+?$")
 
@@ -2612,8 +2647,11 @@ class LinkedInExtractor:
             )
             return ExtractedSection(text=_RATE_LIMITED_MSG, references=[])
         # innerText is no longer surfaced for the feed — sections["feed"] is now
-        # the structured post list. _extract_root_content still runs above so the
-        # soft-rate-limit check and DOM-anchor references work unchanged.
+        # the structured post list, and ExtractedSection.text is left "" (the
+        # feed sentinel; see the dataclass docstring). The _extract_root_content
+        # pass above is NOT redundant: it supplies both the DOM-anchor references
+        # (_build_feed_references) and the chrome-only signal behind soft-rate-
+        # limit detection — neither is recoverable from the post extractor alone.
         references = _build_feed_references(raw_result["references"], captured_urls)
         posts = await self._extract_feed_posts(num_posts)
         return ExtractedSection(text="", references=references, posts=posts)
@@ -2638,8 +2676,10 @@ class LinkedInExtractor:
             post = _normalize_feed_post(raw)
             if post is not None:
                 posts.append(post)
-            if len(posts) >= limit:
-                break
+                # Stop as soon as we have enough *valid* posts; chrome cards
+                # that normalize to None must not count toward the limit.
+                if len(posts) >= limit:
+                    break
         return posts
 
     async def extract_page(
@@ -3146,7 +3186,9 @@ class LinkedInExtractor:
             return ""
         return await self._read_main_innertext()
 
-    async def _load_profile_for_state(self, username: str) -> tuple[str, ActionSignals]:
+    async def _load_profile_for_state(
+        self, username: str
+    ) -> tuple[str, ActionSignals]:
         """Lightweight loader for invitation-action write paths.
 
         Returns ``(page_text, signals)`` — exactly what
@@ -5626,7 +5668,8 @@ class LinkedInExtractor:
             return _invitation_action_result(
                 url,
                 "not_found",
-                f"No incoming connection request found for {username} (state={state}).",
+                f"No incoming connection request found for {username} "
+                f"(state={state}).",
                 action=action,
                 linkedin_username=username,
                 profile_url=profile_url,
@@ -5655,7 +5698,9 @@ class LinkedInExtractor:
                 },
             )
         except Exception:
-            logger.debug("Incoming-invitation %s click failed", action, exc_info=True)
+            logger.debug(
+                "Incoming-invitation %s click failed", action, exc_info=True
+            )
             click_result = {"found": False, "clicked": False}
         if not isinstance(click_result, dict):
             click_result = {"found": False, "clicked": False}

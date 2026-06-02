@@ -19,7 +19,7 @@ from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
 from linkedin_mcp_server.error_handler import raise_tool_error
 from linkedin_mcp_server.scraping.extractor import _RATE_LIMITED_MSG
-from linkedin_mcp_server.scraping.link_metadata import Reference
+from linkedin_mcp_server.scraping.link_metadata import FeedPost, Reference
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,9 @@ def register_feed_tools(
             extracted = await extractor.extract_feed(num_posts=num_posts)
 
             url = "https://www.linkedin.com/feed/"
-            sections: dict[str, Any] = {}
+            # Only ever holds sections["feed"] -> list[FeedPost]; typed precisely
+            # rather than dict[str, Any] so a stray value can't slip in.
+            sections: dict[str, list[FeedPost]] = {}
             references: dict[str, list[Reference]] = {}
             section_errors: dict[str, dict[str, Any]] = {}
             if extracted.text == _RATE_LIMITED_MSG:

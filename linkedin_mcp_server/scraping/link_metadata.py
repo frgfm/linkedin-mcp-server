@@ -171,9 +171,11 @@ class FeedAuthor(TypedDict):
     ``/showcase/``, ``/school/``) link for Pages. ``profile_url`` is a
     relative path (the ``references`` convention). ``headline`` is the
     actor's subline (a person's tagline, or a Page's "<N> followers"
-    text). ``degree`` is the connection-distance badge — ``"1st"``,
-    ``"2nd"``, ``"3rd+"`` — parsed structurally (bullet + ordinal),
-    ``None`` for Pages, promoted posts, and self-authored posts.
+    text — the Page form is matched on the en-US word "followers", safe
+    under the BrowserManager en-US lock). ``degree`` is the
+    connection-distance badge — ``"1st"``, ``"2nd"``, ``"3rd+"`` —
+    detected structurally (bullet + ordinal); the ordinal suffix itself
+    is en-US. ``None`` for Pages, promoted posts, and self-authored posts.
     """
 
     name: str | None
@@ -208,9 +210,12 @@ class FeedPost(TypedDict):
     ``None`` when the post has no attachment. Engagement counts are
     ``None`` when LinkedIn renders no count (a silent post).
 
-    Locale caveat: ``is_promoted`` and the engagement-count text
-    fallback assume en-US (BrowserManager forces en-US). ``degree`` and
-    ``post_age`` parsing are structural / numeric and locale-robust.
+    Locale caveat: ``is_promoted`` and the engagement-count text fallback
+    assume en-US (BrowserManager forces en-US). ``degree`` and
+    ``post_age`` are structural/numeric in *form* — the digit and the
+    "named reactor + N others" arithmetic are locale-independent — but the
+    ordinal suffix ("st"/"nd"/"rd") and age-unit tokens (h/d/w/mo/…) are
+    en-US, safe under the same lock.
     """
 
     url: str | None
