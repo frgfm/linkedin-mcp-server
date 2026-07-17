@@ -53,10 +53,10 @@ logger = logging.getLogger(__name__)
 
 WaitUntil = Literal["commit", "domcontentloaded", "load", "networkidle"]
 
-# Delay between page navigations to avoid rate limiting
+# Pacing between page navigations
 _NAV_DELAY = 2.0
 
-# Backoff before retrying a rate-limited page
+# Backoff before retrying a temporarily blocked page
 _RATE_LIMIT_RETRY_DELAY = 5.0
 
 # Returned as section text when LinkedIn rate-limits the page
@@ -101,6 +101,9 @@ _SORT_BY_MAP = {"date": "DD", "relevance": "R"}
 _NETWORK_TOKENS = ("F", "S", "O")
 
 _DIALOG_SELECTOR = 'dialog[open], [role="dialog"]'
+_DIALOG_PREMIUM_LINK_SELECTOR = (
+    'dialog[open] a[href*="/premium/"], [role="dialog"] a[href*="/premium/"]'
+)
 _DIALOG_TEXTAREA_SELECTOR = '[role="dialog"] textarea, dialog textarea'
 
 _MESSAGING_COMPOSE_LINK_SELECTOR = 'main a[href*="/messaging/compose/"]'
@@ -154,6 +157,74 @@ function findActionRoot(main) {
 }
 """
 
+# Shared JS function that fingerprints the incoming-request action row.
+# Incoming-request profiles render no Message button in the top card, so
+# findActionRoot (compose-anchor walk) cannot locate their action row and
+# would mis-anchor on sidebar mutual-connection cards instead. This walk
+# anchors on button[aria-expanded] (the More button) and validates the
+# smallest multi-button ancestor against the fingerprint verified live
+# 2026-06-11 on two German-locale incoming-request profiles:
+#
+#   [button aria-label (Accept)] [button aria-label (Ignore)]
+#   [button aria-expanded, no aria-label (More)]
+#
+# All checks are attribute presence and structural counts per the
+# AGENTS.md Scraping Rules — no label values are read. Every guard kills
+# a known false positive: total-button-count === 3 and labeled === 2
+# exclude video-player control bars (play/mute/captions all carry
+# aria-label); the unlabeled-expander check excludes player settings
+# expanders (the profile More button never carries aria-label); the
+# DOM-order guard excludes bars with trailing labeled buttons; the
+# compose/invite/labeled-anchor exclusions kill follow_only, pending,
+# connected top cards and sidebar cards. The scan continues over ALL
+# expander candidates because cover-video profiles render the player's
+# expander before the top-card row in DOM order.
+#
+# The search is scoped to the top card — the first <section> of <main>
+# (falling back to main's first child, then main). Profile pages render
+# the action row in the top card; feed, "people also viewed", and other
+# widgets live in later sections. Without the scope an unrelated widget
+# elsewhere in main with the same button shape could be misclassified and
+# its first labeled button clicked.
+#
+# Inlined into _ACTION_SIGNALS_JS and _CLICK_INCOMING_ACCEPT_JS so a
+# single change to the fingerprint propagates to both call sites.
+_FIND_INCOMING_ACTION_ROW_FN_JS = r"""
+function findIncomingActionRow(main) {
+  const scope = main.querySelector('section') || main.firstElementChild || main;
+  const matches = [];
+  for (const expander of scope.querySelectorAll('button[aria-expanded]')) {
+    let el = expander.parentElement;
+    while (el && el !== scope && el !== main) {
+      if (el.querySelectorAll('button').length >= 2) {
+        const buttons = el.querySelectorAll('button');
+        const labeled = el.querySelectorAll('button[aria-label]');
+        const expanders = el.querySelectorAll('button[aria-expanded]');
+        if (
+          buttons.length === 3 &&
+          labeled.length === 2 &&
+          expanders.length === 1 &&
+          !expanders[0].hasAttribute('aria-label') &&
+          expanders[0].compareDocumentPosition(labeled[1]) &
+            Node.DOCUMENT_POSITION_PRECEDING &&
+          !el.querySelector('a[href*="/messaging/compose/"]') &&
+          !el.querySelector('a[href*="/preload/custom-invite/"]') &&
+          !el.querySelector('a[aria-label]')
+        ) {
+          matches.push(el);
+        }
+        break;
+      }
+      el = el.parentElement;
+    }
+  }
+  // Require a unique match: a profile's top card has exactly one action
+  // row. Ambiguity (two rows matching the shape) is treated as no match so
+  // the irreversible Accept click never fires on a guessed control.
+  return matches.length === 1 ? matches[0] : null;
+}
+"""
+
 # Locale-independent connection-state probe. Returns four booleans;
 # per AGENTS.md Scraping Rules, every signal is based on URL patterns
 # or ARIA-attribute *presence* — never on label text values.
@@ -176,6 +247,11 @@ function findActionRoot(main) {
 #   back to the profile URL) carrying aria-label like "Pending, click to
 #   withdraw…". The Message anchor has only aria-disabled, so a labeled
 #   anchor is the locale-independent Pending signal.
+# - hasIncomingActionRow: the incoming-request fingerprint matched (see
+#   _FIND_INCOMING_ACTION_ROW_FN_JS). Computed independently of
+#   findActionRoot, which cannot locate the top-card row on incoming
+#   profiles (no compose anchor there) and would mis-anchor on sidebar
+#   cards.
 #
 # The username is CSS-escaped before interpolation into attribute
 # selectors to defend against malformed inputs containing characters
@@ -185,6 +261,7 @@ _ACTION_SIGNALS_JS = (
 ((username) => {
 """
     + _FIND_ACTION_ROOT_FN_JS
+    + _FIND_INCOMING_ACTION_ROW_FN_JS
     + r"""
   const main = document.querySelector('main');
   if (!main) return null;
@@ -224,6 +301,7 @@ _ACTION_SIGNALS_JS = (
     hasEditIntro,
     hasLabeledActionButton,
     hasLabeledActionAnchor,
+    hasIncomingActionRow: !!findIncomingActionRow(main),
   };
 })
 """
@@ -278,6 +356,28 @@ _CLICK_PENDING_WITHDRAW_JS = (
   }
   anchor.click();
   return { found: true, clicked: true };
+})
+"""
+)
+
+# Click Accept on an incoming-request profile. Accept is the FIRST labeled
+# button in the fingerprinted row — primary actions render first in
+# top-card action rows (Connect/Message lead on other profile states; the
+# inverse of dialogs, where the primary button renders last). Clicking the
+# second button would silently and irreversibly Ignore the request, so the
+# click only fires when the full fingerprint matched.
+_CLICK_INCOMING_ACCEPT_JS = (
+    r"""
+(() => {
+"""
+    + _FIND_INCOMING_ACTION_ROW_FN_JS
+    + r"""
+  const main = document.querySelector('main');
+  if (!main) return false;
+  const row = findIncomingActionRow(main);
+  if (!row) return false;
+  row.querySelectorAll('button[aria-label]')[0].click();
+  return true;
 })
 """
 )
@@ -1608,6 +1708,117 @@ def _truncate_linkedin_noise(text: str) -> str:
     return text[:earliest].strip()
 
 
+# Messaging-page chrome around an opened conversation thread. innerText on
+# /messaging/thread/ pages carries no URL or attribute signal separating the
+# inbox sidebar from the thread, so the boundaries are matched on visible
+# strings — guarded by an explicit per-locale table (CLAUDE.md → Scraping
+# Rules). BrowserManager forces the context locale to en-US (core/browser.py),
+# so the "en" entry is the operative one; a locale without a table entry
+# passes through unstripped.
+@dataclass(frozen=True)
+class _MessagingChromeTable:
+    # Sidebar pagination control; the last line of the inbox sidebar. Pins
+    # the thread header so quoted UI text inside messages can't move the
+    # start boundary.
+    sidebar_end: str
+    # Screen-reader label on the options dropdown; appears once per sidebar
+    # entry and once in the opened thread's header. The thread's own line is
+    # the first occurrence after ``sidebar_end``.
+    thread_header_prefix: str
+    # First control of the trailing message-composer block.
+    composer_start: str
+    # Standalone controls of the composer block, matched exactly. At least
+    # one must follow a ``composer_start`` candidate to confirm it is the
+    # real composer rather than a message quoting the label. Controls whose
+    # text embeds the participant name (the Attach lines) are deliberately
+    # excluded: they would need prefix matching, and any prefix match lets
+    # quoted control text with a suffix confirm a false boundary.
+    composer_companions: tuple[str, ...]
+
+
+# How far below a composer-label candidate a companion control may sit and
+# still count as the same block. The observed block spans 6 lines; the slack
+# covers extra controls LinkedIn injects (e.g. "Press Enter to Send").
+_COMPOSER_COMPANION_WINDOW = 8
+
+_MESSAGING_CHROME_STRINGS: dict[str, _MessagingChromeTable] = {
+    "en": _MessagingChromeTable(
+        sidebar_end="Load more conversations",
+        thread_header_prefix="Open the options list in your conversation with",
+        composer_start="Maximize compose field",
+        composer_companions=(
+            "Open GIF Keyboard",
+            "Open Emoji Keyboard",
+            "Open send options",
+        ),
+    ),
+}
+
+
+def strip_conversation_chrome(text: str, locale: str = "en") -> str:
+    """Trim messaging chrome around an opened conversation thread.
+
+    A conversation page's innerText embeds the thread between three chrome
+    blocks: the messaging header, the inbox sidebar (which previews *other*
+    conversations), and the trailing message composer. Drops everything
+    through the thread-header line and everything from the composer onward.
+    Each boundary independently falls back to keeping the text when its
+    marker is absent (unknown locale, layout change), so a failed match
+    leaks chrome rather than dropping messages.
+    """
+    table = _MESSAGING_CHROME_STRINGS.get(locale)
+    if table is None:
+        return text
+
+    lines = text.splitlines()
+
+    # End boundary: the last composer-label line, accepted only when an
+    # exact companion control follows within the next few lines. The real
+    # composer block is contiguous (label + controls observed within 6
+    # lines), so a nearby companion confirms chrome, while a message that
+    # quotes the label — or control text with any suffix — falls through to
+    # the missing-marker fallback. A verbatim multi-line reproduction of the
+    # block inside a message remains indistinguishable from the block itself;
+    # that ambiguity is inherent to text-only stripping.
+    end = len(lines)
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip() != table.composer_start:
+            continue
+        if any(
+            lines[j].strip() in table.composer_companions
+            for j in range(i + 1, min(i + 1 + _COMPOSER_COMPANION_WINDOW, len(lines)))
+        ):
+            end = i
+        break
+
+    # Start boundary: the sidebar's pagination line, when present, pins the
+    # real thread header as the first options line after it; quoted UI text
+    # inside messages can no longer pull the boundary into the thread. The
+    # sidebar omits the pagination control when there are few conversations —
+    # then fall back to the last options line before the composer.
+    start = 0
+    sidebar_end = next(
+        (i for i in range(end) if lines[i].strip() == table.sidebar_end), None
+    )
+    if sidebar_end is not None:
+        header = next(
+            (
+                i
+                for i in range(sidebar_end + 1, end)
+                if lines[i].strip().startswith(table.thread_header_prefix)
+            ),
+            None,
+        )
+        start = (header + 1) if header is not None else sidebar_end + 1
+    else:
+        for i in range(end - 1, -1, -1):
+            if lines[i].strip().startswith(table.thread_header_prefix):
+                start = i + 1
+                break
+
+    return "\n".join(lines[start:end]).strip()
+
+
 class LinkedInExtractor:
     """Extracts LinkedIn page content via navigate-scroll-innerText pattern."""
 
@@ -1935,6 +2146,50 @@ class LinkedInExtractor:
         except PlaywrightTimeoutError:
             pass
 
+    async def _get_premium_upsell_message(self, *, timeout: int = 2500) -> str | None:
+        """Return the raw LinkedIn Premium upsell dialog text when visible.
+
+        LinkedIn intercepts invite-with-note flows with an upsell modal when
+        the free personalized-note quota is exhausted. The detector itself is
+        locale-independent: the modal links to ``/premium/...``. The returned
+        message is the dialog text as rendered by LinkedIn, not a synthesized
+        explanation.
+        """
+        locator = self._page.locator(_DIALOG_PREMIUM_LINK_SELECTOR).first
+        try:
+            await locator.wait_for(state="visible", timeout=timeout)
+        except PlaywrightTimeoutError:
+            return None
+        except Exception:
+            try:
+                if not await locator.is_visible():
+                    return None
+            except Exception:
+                return None
+
+        try:
+            message = await self._page.evaluate(
+                """() => {
+                    const link = document.querySelector(
+                        'dialog[open] a[href*="/premium/"], [role="dialog"] a[href*="/premium/"]'
+                    );
+                    const dialog = link?.closest('dialog,[role="dialog"]');
+                    return dialog?.innerText || dialog?.textContent || link?.innerText || '';
+                }"""
+            )
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        except Exception:
+            logger.debug("Could not read Premium upsell dialog text", exc_info=True)
+
+        try:
+            link_text = await locator.inner_text()
+            if link_text.strip():
+                return link_text.strip()
+        except Exception:
+            pass
+        return "LinkedIn Premium upsell modal detected."
+
     async def _open_more_menu(self) -> bool:
         """Open the profile's More (three-dot) menu in a locale-independent way.
 
@@ -1962,6 +2217,23 @@ class LinkedInExtractor:
             return True
         except PlaywrightTimeoutError:
             logger.debug("More menu did not appear after click")
+            return False
+
+    async def _click_incoming_accept(self) -> bool:
+        """Click Accept on an incoming-request profile, locale-independently.
+
+        Delegates to ``_CLICK_INCOMING_ACCEPT_JS``: the click fires only
+        when the full incoming-row fingerprint matches, and it targets the
+        FIRST labeled button (Accept renders before Ignore — primary
+        actions lead in top-card rows). Clicking the second button would
+        silently and irreversibly Ignore the request; the strict
+        fingerprint plus the caller's verify-after-click are the
+        mitigations. Returns True iff the click landed.
+        """
+        try:
+            return bool(await self._page.evaluate(_CLICK_INCOMING_ACCEPT_JS))
+        except Exception:
+            logger.debug("Incoming accept click via JS failed", exc_info=True)
             return False
 
     async def _locator_is_visible(self, selector: str, *, timeout: int = 2000) -> bool:
@@ -2734,9 +3006,7 @@ class LinkedInExtractor:
             return ""
         return await self._read_main_innertext()
 
-    async def _load_profile_for_state(
-        self, username: str
-    ) -> tuple[str, ActionSignals]:
+    async def _load_profile_for_state(self, username: str) -> tuple[str, ActionSignals]:
         """Lightweight loader for invitation-action write paths.
 
         Returns ``(page_text, signals)`` — exactly what
@@ -2782,6 +3052,7 @@ class LinkedInExtractor:
                 has_edit_intro_anchor=False,
                 has_labeled_action_button=False,
                 has_labeled_action_anchor=False,
+                has_incoming_action_row=False,
             )
         return ActionSignals(
             has_invite_anchor=bool(data.get("hasInvite")),
@@ -2789,20 +3060,31 @@ class LinkedInExtractor:
             has_edit_intro_anchor=bool(data.get("hasEditIntro")),
             has_labeled_action_button=bool(data.get("hasLabeledActionButton")),
             has_labeled_action_anchor=bool(data.get("hasLabeledActionAnchor")),
+            has_incoming_action_row=bool(data.get("hasIncomingActionRow")),
         )
 
-    async def _submit_invite_dialog(self, note: str | None) -> tuple[bool, bool]:
+    async def _submit_invite_dialog(
+        self, note: str | None
+    ) -> tuple[bool, bool, str | None]:
         """Submit the invite dialog opened by the custom-invite deeplink.
 
-        Returns (submitted, note_sent). All interaction uses structural
-        selectors and positional indexing — no localized text matching.
-        Owns dialog cleanup: the dialog is dismissed on every failure path,
-        callers must not dismiss again.
+        Returns ``(submitted, note_sent, note_limit_message)``.
+
+        ``note_sent`` reports *delivery*, not textarea fill — it stays
+        False on any failure path, including the Premium upsell that
+        LinkedIn shows when the free personalized-note quota is exhausted.
+        ``note_limit_message`` is the raw LinkedIn Premium dialog text when
+        the upsell was detected; in that case ``submitted`` is False, the
+        dialog is dismissed, and callers should surface that text directly.
+
+        All interaction uses structural selectors and positional indexing
+        — no localized text matching. Owns dialog cleanup: the dialog is
+        dismissed on every failure path, callers must not dismiss again.
         """
         if not await self._dialog_is_open(timeout=5000):
-            return False, False
+            return False, False, None
 
-        note_sent = False
+        note_filled = False
         if note:
             textarea_count = await self._page.locator(_DIALOG_TEXTAREA_SELECTOR).count()
             if textarea_count == 0:
@@ -2834,11 +3116,21 @@ class LinkedInExtractor:
                         )
                     except PlaywrightTimeoutError:
                         logger.debug("Note textarea did not appear")
+                    note_limit_message = await self._get_premium_upsell_message()
+                    if note_limit_message is not None:
+                        logger.info("Premium upsell blocked opening invite note editor")
+                        await self._dismiss_dialog()
+                        return False, False, note_limit_message
 
-            note_sent = await self._fill_dialog_textarea(note)
-            if not note_sent:
+            note_filled = await self._fill_dialog_textarea(note)
+            if not note_filled:
+                note_limit_message = await self._get_premium_upsell_message()
+                if note_limit_message is not None:
+                    logger.info("Premium upsell blocked filling invite note")
+                    await self._dismiss_dialog()
+                    return False, False, note_limit_message
                 await self._dismiss_dialog()
-                return False, False
+                return False, False, None
 
         sent = await self._click_dialog_primary_button()
         if not sent:
@@ -2857,8 +3149,33 @@ class LinkedInExtractor:
                 except Exception:
                     logger.debug("Keyboard submit fallback failed", exc_info=True)
             if not sent:
+                # The Send click can also fail because LinkedIn swapped the
+                # invite dialog for the Premium upsell at submit time — the
+                # original primary button is then detached or pointer-event
+                # covered, so the click raises or times out. Check for the
+                # upsell here so we surface the raw note-limit message
+                # instead of dismissing silently and returning
+                # connect_unavailable.
+                if note:
+                    note_limit_message = await self._get_premium_upsell_message()
+                    if note_limit_message is not None:
+                        logger.info(
+                            "Premium upsell modal intercepted invite submit click"
+                        )
+                        await self._dismiss_dialog()
+                        return False, False, note_limit_message
                 await self._dismiss_dialog()
-                return False, note_sent
+                return False, False, None
+
+        # LinkedIn may swap the invite dialog for a Premium upsell when the
+        # free note quota is exhausted. The textarea was filled but the
+        # invite was not delivered — surface LinkedIn's raw dialog text.
+        if note:
+            note_limit_message = await self._get_premium_upsell_message()
+            if note_limit_message is not None:
+                logger.info("Premium upsell modal intercepted invite submit")
+                await self._dismiss_dialog()
+                return False, False, note_limit_message
 
         try:
             await self._page.wait_for_selector(
@@ -2867,7 +3184,58 @@ class LinkedInExtractor:
         except PlaywrightTimeoutError:
             logger.debug("Invite dialog did not close after submit")
 
-        return True, note_sent
+        return True, note_filled, None
+
+    async def _probe_invite_note_limit(self) -> str | None:
+        """Open the note editor only to read a Premium note-quota message.
+
+        This is used when the profile did not expose the normal invite anchor.
+        Navigating to the custom-invite deeplink and opening the note editor is
+        non-destructive, but submitting would weaken the write gate for
+        follow-only/unavailable profiles. Therefore this helper never clicks
+        the primary Send button: it returns the raw LinkedIn Premium dialog
+        text if LinkedIn shows it while opening the note editor, then
+        dismisses the dialog.
+        """
+        if not await self._dialog_is_open(timeout=5000):
+            return None
+        note_limit_message = await self._get_premium_upsell_message(timeout=500)
+        if note_limit_message is not None:
+            await self._dismiss_dialog()
+            return note_limit_message
+
+        try:
+            textarea_count = await self._page.locator(_DIALOG_TEXTAREA_SELECTOR).count()
+        except Exception:
+            textarea_count = 0
+        if textarea_count > 0:
+            await self._dismiss_dialog()
+            return None
+
+        buttons = self._page.locator(
+            f"{_DIALOG_SELECTOR} button, {_DIALOG_SELECTOR} [role='button']"
+        )
+        try:
+            btn_count = await buttons.count()
+        except Exception:
+            btn_count = 0
+        if btn_count >= 3:
+            try:
+                await buttons.nth(btn_count - 2).click()
+            except Exception:
+                logger.debug("Could not open invite note editor", exc_info=True)
+            try:
+                await self._page.wait_for_selector(
+                    _DIALOG_TEXTAREA_SELECTOR,
+                    state="visible",
+                    timeout=3000,
+                )
+            except PlaywrightTimeoutError:
+                logger.debug("Note textarea did not appear during quota probe")
+
+        note_limit_message = await self._get_premium_upsell_message()
+        await self._dismiss_dialog()
+        return note_limit_message
 
     async def connect_with_person(
         self,
@@ -2883,7 +3251,9 @@ class LinkedInExtractor:
         `aria-expanded` for the More-menu opener). The deeplink-submit
         path is gated strictly on `has_invite_anchor=True` *after* the
         optional More-menu retry, so Pending and follow-only profiles
-        cannot trigger a write. Sending itself uses the
+        cannot trigger a write. If a note was requested but no invite
+        anchor is visible, the custom-invite deeplink may still be opened
+        only as a non-submitting note-quota probe. Sending itself uses the
         ``/preload/custom-invite/?vanityName=`` deeplink, which works
         whether the user-visible Connect button is in the action bar
         or buried under the More menu.
@@ -2908,7 +3278,7 @@ class LinkedInExtractor:
             )
 
         signals = await self._read_action_signals(username)
-        state = detect_connection_state(page_text, signals)
+        state = detect_connection_state(signals)
         logger.info(
             "Connection signals for %s: state=%s signals=%s", username, state, signals
         )
@@ -2936,18 +3306,36 @@ class LinkedInExtractor:
             )
 
         if state == "incoming_request":
-            action_result = await self._accept_incoming_invitation(username)
-            if action_result["status"] != "accepted":
+            # Accept clicks the first labeled button in the fingerprinted
+            # row. There is deliberately no locale-text fallback: clicking
+            # a button matched by exact text anywhere in the page risks
+            # hitting the wrong control (or the Ignore button in another
+            # locale), and accepting/ignoring is irreversible. When the
+            # fingerprint does not match we report send_failed rather than
+            # guess.
+            clicked = await self._click_incoming_accept()
+            if not clicked:
                 return _connection_result(
                     url,
                     "send_failed",
-                    f"Could not accept incoming invitation: {action_result['message']}",
+                    "Could not accept incoming invitation: structural click failed.",
                     profile=page_text,
                 )
-            verified = await self.scrape_person(username, {"main_profile"})
-            verified_text = await self._main_innertext_if_present(verified)
-            verified_signals = await self._read_action_signals(username)
-            verified_state = detect_connection_state(verified_text, verified_signals)
+            # LinkedIn propagates the accepted state asynchronously; an
+            # immediate re-read can still render the old top card and
+            # would report send_failed for a successful accept (observed
+            # live 2026-06-11). Verify with one settle retry.
+            verified_text = ""
+            verified_state = None
+            for attempt in range(2):
+                if attempt:
+                    await asyncio.sleep(3.0)
+                verified = await self.scrape_person(username, {"main_profile"})
+                verified_text = verified.get("sections", {}).get("main_profile", "")
+                verified_signals = await self._read_action_signals(username)
+                verified_state = detect_connection_state(verified_signals)
+                if verified_state == "already_connected":
+                    break
             if verified_state != "already_connected":
                 return _connection_result(
                     url,
@@ -2981,13 +3369,33 @@ class LinkedInExtractor:
                     logger.debug("Escape after More-menu reread failed", exc_info=True)
                 logger.info("Post-More signals for %s: signals=%s", username, signals)
 
-        # Write-gate: the deeplink fires only when we have a vanityName
-        # invite anchor at this point. A `follow_only` outcome with no
-        # invite anchor (Pending profile, restricted profile, or
-        # genuinely follow-only) returns connect_unavailable without
-        # navigating to the invite URL — protects against accidental
-        # re-invitation of Pending profiles.
+        invite_url = (
+            "https://www.linkedin.com/preload/custom-invite/"
+            f"?vanityName={quote_plus(username)}"
+        )
+
+        # Write-gate: submit only when LinkedIn exposed the vanityName invite
+        # anchor. When a note is requested without that anchor, open the
+        # deeplink only as a non-submitting probe so we can report the Premium
+        # note-quota block without accidentally sending from a follow-only or
+        # otherwise unavailable profile.
         if not signals.has_invite_anchor:
+            if note:
+                logger.info(
+                    "No visible invite anchor for %s; probing custom-invite deeplink "
+                    "because a personalized note was requested",
+                    username,
+                )
+                await self._navigate_to_page(invite_url)
+                note_limit_message = await self._probe_invite_note_limit()
+                if note_limit_message is not None:
+                    return _connection_result(
+                        url,
+                        "custom_note_limit_reached",
+                        note_limit_message,
+                        note_sent=False,
+                        profile=page_text,
+                    )
             return _connection_result(
                 url,
                 "connect_unavailable",
@@ -2995,13 +3403,19 @@ class LinkedInExtractor:
                 profile=page_text,
             )
 
-        invite_url = (
-            "https://www.linkedin.com/preload/custom-invite/"
-            f"?vanityName={quote_plus(username)}"
-        )
         await self._navigate_to_page(invite_url)
 
-        submitted, note_sent = await self._submit_invite_dialog(note)
+        submitted, note_sent, note_limit_message = await self._submit_invite_dialog(
+            note
+        )
+        if note_limit_message is not None:
+            return _connection_result(
+                url,
+                "custom_note_limit_reached",
+                note_limit_message,
+                note_sent=False,
+                profile=page_text,
+            )
         if not submitted:
             return _connection_result(
                 url,
@@ -3013,7 +3427,7 @@ class LinkedInExtractor:
         verified = await self.scrape_person(username, {"main_profile"})
         verified_text = await self._main_innertext_if_present(verified)
         verified_signals = await self._read_action_signals(username)
-        verified_state = detect_connection_state(verified_text, verified_signals)
+        verified_state = detect_connection_state(verified_signals)
 
         if verified_signals.has_invite_anchor:
             return _connection_result(
@@ -3514,37 +3928,75 @@ class LinkedInExtractor:
     async def _resolve_conversation_thread_urls(self, display_name: str) -> list[str]:
         """Return all thread URLs whose participant name matches display_name.
 
-        Uses URL-driven search (`/messaging/?searchTerm=…`) plus click-to-capture
+        Enumerates the plain messaging inbox (`/messaging/`) plus click-to-capture
         because LinkedIn renders the messaging sidebar with no anchor hrefs, no
         data-thread attributes, and no embedded URNs — clicking each row and
         reading the resulting SPA URL is the only available extraction path.
+        The inbox is used rather than `?searchTerm=` because LinkedIn's
+        messaging search frequently returns "We didn't find anything" for a
+        participant whose thread is plainly present in the inbox (issue #434).
+        ``name_filter`` is passed to the enumerator so only the matching row is
+        clicked — clicking a row may mark it read, so unrelated threads stay
+        untouched.
 
         Matches by case-insensitive equality on the cleaned participant name
         derived from the row's aria-label, which tolerates duplicate threads
         with the same participant. Browser locale is forced to en-US so the
         verb prefix strips reliably; in any other locale the comparison fails
         cleanly with "Could not find a conversation" rather than returning
-        a wrong-thread match.
+        a wrong-thread match. If the inbox scan finds nothing (a thread buried
+        below the scrolled rows), it falls back to the `?searchTerm=` search as
+        a last resort.
+
+        For a participant with multiple threads, the returned set — and thus
+        ``index`` selection in the caller — covers the threads visible in the
+        scanned inbox; the search fallback only runs when the inbox scan is
+        empty. Open a buried duplicate thread directly via ``thread_id``
+        (enumerate IDs with ``search_conversations``).
         """
-        search_url = (
+        target_name = display_name.strip().lower()
+
+        def _match(refs: list[Reference]) -> list[str]:
+            # name_filter already gated the clicks; this enforces the same
+            # exact-equality match Python-side and tolerates duplicate threads.
+            return [
+                f"https://www.linkedin.com{ref['url']}"
+                for ref in refs
+                if (ref.get("text") or "").strip().lower() == target_name
+            ]
+
+        # Primary path: enumerate the plain inbox. Reliable for the recent
+        # threads that the verify-after-send workflow needs (issue #434).
+        await self._navigate_to_page("https://www.linkedin.com/messaging/")
+        await detect_rate_limit(self._page)
+        await self._wait_for_main_text(log_context="Messaging inbox")
+        await handle_modal_close(self._page)
+        await self._scroll_main_scrollable_region(
+            position="bottom", attempts=2, pause_time=0.5
+        )
+        urls = _match(
+            await self._extract_conversation_thread_refs(
+                limit=None, context="inbox", name_filter=display_name
+            )
+        )
+        if urls:
+            return urls
+
+        # Fallback: LinkedIn's messaging search. Unreliable (often returns
+        # "We didn't find anything" even for present threads, see #434), so it
+        # runs only when the inbox scan came up empty — e.g. a thread buried
+        # below the scrolled inbox window.
+        await self._navigate_to_page(
             f"https://www.linkedin.com/messaging/?searchTerm={quote_plus(display_name)}"
         )
-        await self._navigate_to_page(search_url)
         await detect_rate_limit(self._page)
         await handle_modal_close(self._page)
         await self._wait_for_main_text(log_context="Messaging search results")
-
-        refs = await self._extract_conversation_thread_refs(
-            limit=None, context="search"
+        return _match(
+            await self._extract_conversation_thread_refs(
+                limit=None, context="search", name_filter=display_name
+            )
         )
-        target_name = display_name.strip().lower()
-        urls: list[str] = []
-        for ref in refs:
-            ref_text = (ref.get("text") or "").strip().lower()
-            if not ref_text or ref_text != target_name:
-                continue
-            urls.append(f"https://www.linkedin.com{ref['url']}")
-        return urls
 
     async def _open_conversation_by_username(
         self, linkedin_username: str, index: int = 0
@@ -4200,7 +4652,7 @@ class LinkedInExtractor:
         )
 
     async def _extract_conversation_thread_refs(
-        self, limit: int | None, context: str
+        self, limit: int | None, context: str, *, name_filter: str | None = None
     ) -> list[Reference]:
         """Click each visible conversation item and capture the thread URL.
 
@@ -4213,6 +4665,12 @@ class LinkedInExtractor:
         ``data-thread-id`` attributes, and no embedded URNs — clicking each
         row and reading the SPA URL is the only reliable extraction path.
         Pass ``limit=None`` to capture every visible row.
+
+        When ``name_filter`` is provided, every row's aria-label is still read
+        but only rows whose cleaned participant name equals it (case-insensitive)
+        are clicked; non-matching rows are skipped without clicking. Clicking a
+        row may mark it as read, so the filter keeps the read-marking side effect
+        scoped to the requested participant when resolving by username.
         """
         # The conversation list mounts after main text settles, so wait
         # explicitly for at least one label rather than relying on
@@ -4249,17 +4707,28 @@ class LinkedInExtractor:
         # The aria-label value flows through unmodified — Python strips any
         # known locale prefix to derive a clean participant name for refs.
         conversations: list[dict[str, str]] = await self._page.evaluate(
-            """async ({ limit }) => {
+            """async ({ limit, nameFilter }) => {
                 const labels = Array.from(document.querySelectorAll(
                     'main li label[aria-label]'
                 ));
                 const cap = (limit == null)
                     ? labels.length
                     : Math.min(labels.length, limit);
+                // Normalize the optional participant filter the same way the
+                // Python prefix-strip does (en-US "Select conversation with"
+                // verb, collapsed whitespace) so the JS-side comparison
+                // matches. Only the matching row is clicked — clicking marks a
+                // row read, so unrelated threads must not be clicked.
+                const wanted = (nameFilter || '')
+                    .replace(/\\s+/g, ' ').trim().toLowerCase();
                 const results = [];
                 for (let i = 0; i < cap; i++) {
                     const label = labels[i];
                     const ariaLabel = label.getAttribute('aria-label') || '';
+                    const rowName = ariaLabel
+                        .replace(/^Select conversation with\\s+/i, '')
+                        .replace(/\\s+/g, ' ').trim().toLowerCase();
+                    if (wanted && rowName !== wanted) continue;
                     const clickTarget = label.closest('li')
                         ?.querySelector('div[class*="listitem__link"]');
                     if (!clickTarget) continue;
@@ -4284,7 +4753,7 @@ class LinkedInExtractor:
                 }
                 return results;
             }""",
-            {"limit": limit},
+            {"limit": limit, "nameFilter": name_filter},
         )
         refs: list[Reference] = []
         for conv in conversations:
@@ -4944,7 +5413,7 @@ class LinkedInExtractor:
                 profile_url=profile_url,
             )
 
-        state = detect_connection_state(page_text, signals)
+        state = detect_connection_state(signals)
         if state == "already_connected":
             return _invitation_action_result(
                 url,
@@ -5122,7 +5591,7 @@ class LinkedInExtractor:
             logger.debug("Withdraw confirm dialog did not close")
 
         verified_signals = await self._read_action_signals(username)
-        verified_state = detect_connection_state(page_text, verified_signals)
+        verified_state = detect_connection_state(verified_signals)
         if verified_state == "pending":
             return _attach_confirm_diagnostics(
                 _invitation_action_result(
@@ -5198,7 +5667,7 @@ class LinkedInExtractor:
                 linkedin_username=username,
                 profile_url=profile_url,
             )
-        state = detect_connection_state(page_text, signals)
+        state = detect_connection_state(signals)
         if state == "already_connected":
             # Accept on an already-connected profile is a no-op success;
             # ignore on the same is meaningless — both states return the
@@ -5216,8 +5685,7 @@ class LinkedInExtractor:
             return _invitation_action_result(
                 url,
                 "not_found",
-                f"No incoming connection request found for {username} "
-                f"(state={state}).",
+                f"No incoming connection request found for {username} (state={state}).",
                 action=action,
                 linkedin_username=username,
                 profile_url=profile_url,
@@ -5246,9 +5714,7 @@ class LinkedInExtractor:
                 },
             )
         except Exception:
-            logger.debug(
-                "Incoming-invitation %s click failed", action, exc_info=True
-            )
+            logger.debug("Incoming-invitation %s click failed", action, exc_info=True)
             click_result = {"found": False, "clicked": False}
         if not isinstance(click_result, dict):
             click_result = {"found": False, "clicked": False}
@@ -5312,7 +5778,7 @@ class LinkedInExtractor:
             if not isinstance(fresh_text, str):
                 fresh_text = ""
             verified_signals = await self._read_action_signals(username)
-            verified_state = detect_connection_state(fresh_text, verified_signals)
+            verified_state = detect_connection_state(verified_signals)
             if verified_state != "incoming_request":
                 break
             await asyncio.sleep(0.5)
