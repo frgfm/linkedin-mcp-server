@@ -58,7 +58,7 @@ for section_name, (suffix, is_overlay) in PERSON_SECTIONS.items():
 {"url": str, "sections": {name: raw_text}, "references": {section: [{kind, url, text?, context?, value?}, ...]}}
 # When unknown section names are provided:
 {"url": str, "sections": {name: raw_text}, "unknown_sections": [name, ...]}
-# search_jobs also returns:
+# search_jobs and get_saved_jobs also return:
 {"url": str, "sections": {name: raw_text}, "job_ids": [id, ...]}
 # get_conversation is the lone exception: sections is structured, not raw_text.
 # `sender` is an integer index into `members`; members[0].is_self is the auth user.

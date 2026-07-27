@@ -54,9 +54,11 @@ This MCP server is **free** and **open source**, supported by [**Unipile**](http
 | `search_companies` | Search for companies on LinkedIn by keywords | working |
 | `get_company_employees` | List employees at a company from the /people/ page, with optional keyword filter | working |
 | `search_jobs` | Search for jobs with keywords and location filters | working |
+| `get_saved_jobs` | List job postings saved by the authenticated user | working |
 | `search_people` | Search for people by keywords, location, connection degree (1st/2nd/3rd), and current company | [#526](https://github.com/stickerdaniel/linkedin-mcp-server/issues/526) |
 | `get_job_details` | Get detailed information about a specific job posting | working |
 | `get_feed` | Get recent posts from the authenticated user's home feed | working |
+| `search_posts` | Search posts/content globally by keyword (the "Posts" tab) with an optional recency filter (past-24h/past-week/past-month) | working |
 | `close_session` | Close browser session and clean up resources | working |
 
 `get_pending_invitations` returns `{url, invitations}`. Received invitations
@@ -133,10 +135,14 @@ When you set up or maintain this server, verify its entry in the MCP client conf
 - `--tool-timeout SECONDS` - Per-tool MCP execution timeout in seconds (default: 180.0). Increase further for heavy scrapes / cold-start Chromium / slow networks.
 - `--login-timeout SECONDS` - Manual login wait timeout in seconds (default: 1800; 0 = no limit). How long the `--login` browser waits for you to finish signing in.
 - `--login-inline-wait SECONDS` - Bounded inline wait for a tool call to resume after login completes, in seconds (default: 25, max 45; 0 = return immediately).
+- `--browser-wait SECONDS` - How long to wait for another server process to hand over the shared browser (default: 25, max 45; 0 = report busy at once). Only matters when several MCP clients run at the same time.
+- `--browser-min-hold SECONDS` - Shortest time this process keeps the shared browser before handing it to a waiting process (default: 20, clamped below `--browser-wait` so a waiting client is served before its own timeout; 0 = hand over after every tool call). Raising it means fewer browser restarts but longer waits for other clients.
+- `--browser-idle-timeout SECONDS` - Close an idle browser and release the shared profile after this long without a tool call (default: 600; 0 = keep it open until the server exits).
 - `--auto-import` / `--no-auto-import` - Enable or disable auto-import of a session from a locally logged-in browser on the first no-session tool call (before falling back to manual login). Auto-import is on by default across interactive and non-interactive desktop runs; pass `--no-auto-import` (or `AUTO_IMPORT_FROM_BROWSER=false`) to require `--login` / `--import-from-browser` instead. No effect under Docker or on a non-loopback HTTP bind. On macOS the keychain may prompt once for Safe Storage access.
 - `--eager-full-chromium` / `--no-eager-full-chromium` - Download full Chrome for Testing in the background right after the headless shell (`EAGER_FULL_CHROMIUM=true`), instead of lazily on the first headed login (the default). Headless setup is usable as soon as the shell is installed; this only pre-warms the headed login fallback. Pass `--no-eager-full-chromium` to override `EAGER_FULL_CHROMIUM=true` for a single run.
 - `--user-data-dir PATH` - Path to persistent browser profile directory (default: ~/.linkedin-mcp/profile)
 - `--chrome-path PATH` - Path to Chrome/Chromium executable (for custom browser installations)
+- `--proxy-server URL` - Route the browser through a proxy, as `scheme://host:port`. Set the password via `PROXY_PASSWORD` (no flag, so it stays out of the process list)
 
 **Import a session from your everyday browser:**
 
@@ -171,9 +177,18 @@ uvx mcp-server-linkedin@latest --transport streamable-http --host 127.0.0.1 --po
 
 Runtime server logs are emitted by FastMCP/Uvicorn.
 
-Tool calls are serialized within a single server process to protect the shared
-LinkedIn browser session. Concurrent client requests queue instead of running in
-parallel. Use `--log-level DEBUG` to see scraper lock wait/acquire/release logs.
+Tool calls are serialized to protect the shared LinkedIn browser session, both
+within one server process and across separate ones. If you run several MCP
+clients at once, each starts its own server process, and only one of them uses
+the browser at a time; the others wait briefly and take over as soon as it
+finishes a call. A client that waits too long gets a "browser is busy" message
+and can simply retry. Use `--log-level DEBUG` to see the wait/acquire/release
+logs.
+
+This covers processes on the same machine and in the same runtime. It does not
+extend between the host and a Docker container sharing the same
+`~/.linkedin-mcp` directory, so do not run `--login` or `--logout` on the host
+while a container is running.
 
 **Test with mcp inspector:**
 
@@ -212,6 +227,28 @@ parallel. Use `--log-level DEBUG` to see scraper lock wait/acquire/release logs.
 - *Entire tool calls timing out* (e.g. multi-section profiles, cold-start Chromium, slow containers): increase the per-tool execution timeout — `--tool-timeout 300` or `TOOL_TIMEOUT=300` (seconds, default 180).
 - *First tool call with no session*: if a locally logged-in browser has a live LinkedIn session, the server auto-imports it (see `AUTO_IMPORT_FROM_BROWSER` / `--auto-import`) instead of forcing a manual login. On macOS the keychain may prompt once for Safe Storage access. If no importable browser session exists, it falls back to opening a login window and waits up to `LOGIN_INLINE_WAIT` seconds (default 25, max 45; `--login-inline-wait`) so a quick sign-in resolves in one call. If the wait elapses, the tool returns a pending signal and the model retries in about 30 seconds. Neither the auto-import nor the inline wait applies under Docker or when the server is bound to a non-loopback HTTP host; create the session on the host with `--login`.
 - Users on slow connections may need higher values for either.
+
+**Using a proxy:**
+
+> **Most people should not use one.** LinkedIn's own guidance for reducing
+> security challenges is to avoid a VPN or proxy, and it scores the addresses a
+> session signs in from. A home connection you have used for years is a trust
+> signal; a commercial exit node with a history you cannot see is not, and
+> switching to one is itself the kind of change that triggers a checkpoint.
+> A proxy is worth it in one case: the server runs somewhere its address is
+> obviously a data centre, or in a different country from the account's history.
+> Even then, a WireGuard or Tailscale exit node on your own home network beats
+> any paid provider, because the address really is yours. If you do buy one,
+> take a dedicated static ISP address and keep it, rather than a rotating
+> residential pool.
+
+- Route the browser through a proxy with `--proxy-server http://host:port` (`http`, `https`, `socks4` and `socks5` are accepted). Only browser traffic is routed, not the MCP transport.
+- Credentials go in `PROXY_USERNAME` and `PROXY_PASSWORD`. There is no `--proxy-password` flag on purpose: command-line arguments are readable by every other user on the machine. `PROXY_SERVER` also accepts the combined `http://user:pass@host:port` form most providers hand out.
+- Chromium cannot authenticate to a SOCKS proxy, so credentials require an `http(s)` endpoint. If your provider only offers authenticated SOCKS5, run a local relay that holds the credentials and point the server at that.
+- Local addresses go through the proxy too. Chromium's usual direct route for `localhost` is removed when a proxy is set, so add `PROXY_BYPASS=localhost,127.0.0.1,::1` if you need local targets reached directly.
+- Auto-import is skipped while a proxy is configured: a session taken from a local browser was created on your real address, and moving it to the proxy is the very change that triggers a checkpoint. Use `--login`.
+- A wrong proxy password does not report itself: Chromium retries the authentication challenge until the page times out, so it surfaces as a timeout or a failed sign-in. If sessions stop working right after you add a proxy, check the credentials before assuming the session expired.
+- **Set the proxy up before creating the session.** Run `--login` with the proxy already configured. Turning a proxy on for an existing profile moves a logged-in session to a new IP, which is what triggers a LinkedIn checkpoint. The same applies to `--import-from-browser`, which imports a session created on your real IP. Use a sticky session, not a rotating pool, for the same reason.
 
 **Custom Chrome path:**
 
@@ -322,14 +359,18 @@ This opens a browser window where you log in manually (5 minute timeout for 2FA,
 - `--host HOST` - HTTP server host (default: 127.0.0.1)
 - `--port PORT` - HTTP server port (default: 8000)
 - `--path PATH` - HTTP server path (default: /mcp)
-- `--logout` - Clear all stored LinkedIn auth state, including source and derived runtime profiles
+- `--logout` - Clear all stored LinkedIn auth state, including source and derived runtime profiles and any retired sessions
 - `--timeout MS` - Browser timeout for page operations in milliseconds (default: 5000)
 - `--tool-timeout SECONDS` - Per-tool MCP execution timeout in seconds (default: 180.0). Increase further for heavy scrapes / cold-start Chromium / slow networks.
 - `--login-timeout SECONDS` - Manual login wait timeout in seconds (default: 1800; 0 = no limit). How long the `--login` browser waits for you to finish signing in.
 - `--login-inline-wait SECONDS` - Bounded inline wait for a tool call to resume after login completes, in seconds (default: 25, max 45; 0 = return immediately).
+- `--browser-wait SECONDS` - How long to wait for another server process to hand over the shared browser (default: 25, max 45; 0 = report busy at once). Only matters when several MCP clients run at the same time.
+- `--browser-min-hold SECONDS` - Shortest time this process keeps the shared browser before handing it to a waiting process (default: 20, clamped below `--browser-wait` so a waiting client is served before its own timeout; 0 = hand over after every tool call). Raising it means fewer browser restarts but longer waits for other clients.
+- `--browser-idle-timeout SECONDS` - Close an idle browser and release the shared profile after this long without a tool call (default: 600; 0 = keep it open until the server exits).
 - `--auto-import` / `--no-auto-import` - Enable or disable auto-import of a session from a locally logged-in browser on the first no-session tool call (before falling back to manual login). Auto-import is on by default across interactive and non-interactive desktop runs; pass `--no-auto-import` (or `AUTO_IMPORT_FROM_BROWSER=false`) to require `--login` / `--import-from-browser` instead. No effect under Docker or on a non-loopback HTTP bind. On macOS the keychain may prompt once for Safe Storage access.
 - `--user-data-dir PATH` - Path to persistent browser profile directory (default: ~/.linkedin-mcp/profile)
 - `--chrome-path PATH` - Path to Chrome/Chromium executable (rarely needed in Docker)
+- `--proxy-server URL` - Route the browser through a proxy, as `scheme://host:port`. Set the password via `PROXY_PASSWORD` (no flag, so it stays out of the process list)
 
 > [!NOTE]
 > `--login` and `--no-headless` are not available in Docker (no display server). Use the [uvx setup](#-uvx-setup-recommended---universal) to create profiles.
@@ -345,6 +386,24 @@ docker run -it --rm \
 ```
 
 Runtime server logs are emitted by FastMCP/Uvicorn.
+
+The HTTP server answers requests addressed to `localhost` or to the address it
+is bound to, and refuses others with `421`. That is what stops a website you
+merely visit from pointing a domain at this server and using your LinkedIn
+session through your own browser.
+
+Reaching the server by any other name is refused, including a machine name on
+your network and the public name in front of a reverse proxy. Either have the
+proxy rewrite the upstream `Host` to the backend address, or name the host you
+serve it under:
+
+```bash
+FASTMCP_HTTP_ALLOWED_HOSTS='["mcp.example"]'
+```
+
+That permits exactly that name and keeps refusing everything else. The endpoint
+still has no authentication, so anything reachable beyond your own machine
+belongs behind something that provides it.
 
 **Test with mcp inspector:**
 
@@ -378,6 +437,28 @@ Runtime server logs are emitted by FastMCP/Uvicorn.
 - *Entire tool calls timing out* (e.g. multi-section profiles, cold-start Chromium, slow containers): increase the per-tool execution timeout — `--tool-timeout 300` or `TOOL_TIMEOUT=300` (seconds, default 180).
 - *First tool call with no session*: if a locally logged-in browser has a live LinkedIn session, the server auto-imports it (see `AUTO_IMPORT_FROM_BROWSER` / `--auto-import`) instead of forcing a manual login. On macOS the keychain may prompt once for Safe Storage access. If no importable browser session exists, it falls back to opening a login window and waits up to `LOGIN_INLINE_WAIT` seconds (default 25, max 45; `--login-inline-wait`) so a quick sign-in resolves in one call. If the wait elapses, the tool returns a pending signal and the model retries in about 30 seconds. Neither the auto-import nor the inline wait applies under Docker or when the server is bound to a non-loopback HTTP host; create the session on the host with `--login`.
 - Users on slow connections may need higher values for either.
+
+**Using a proxy:**
+
+> **Most people should not use one.** LinkedIn's own guidance for reducing
+> security challenges is to avoid a VPN or proxy, and it scores the addresses a
+> session signs in from. A home connection you have used for years is a trust
+> signal; a commercial exit node with a history you cannot see is not, and
+> switching to one is itself the kind of change that triggers a checkpoint.
+> A proxy is worth it in one case: the server runs somewhere its address is
+> obviously a data centre, or in a different country from the account's history.
+> Even then, a WireGuard or Tailscale exit node on your own home network beats
+> any paid provider, because the address really is yours. If you do buy one,
+> take a dedicated static ISP address and keep it, rather than a rotating
+> residential pool.
+
+- Route the browser through a proxy with `--proxy-server http://host:port` (`http`, `https`, `socks4` and `socks5` are accepted). Only browser traffic is routed, not the MCP transport.
+- Credentials go in `PROXY_USERNAME` and `PROXY_PASSWORD`. There is no `--proxy-password` flag on purpose: command-line arguments are readable by every other user on the machine. `PROXY_SERVER` also accepts the combined `http://user:pass@host:port` form most providers hand out.
+- Chromium cannot authenticate to a SOCKS proxy, so credentials require an `http(s)` endpoint. If your provider only offers authenticated SOCKS5, run a local relay that holds the credentials and point the server at that.
+- Local addresses go through the proxy too. Chromium's usual direct route for `localhost` is removed when a proxy is set, so add `PROXY_BYPASS=localhost,127.0.0.1,::1` if you need local targets reached directly.
+- Auto-import is skipped while a proxy is configured: a session taken from a local browser was created on your real address, and moving it to the proxy is the very change that triggers a checkpoint. Use `--login`.
+- A wrong proxy password does not report itself: Chromium retries the authentication challenge until the page times out, so it surfaces as a timeout or a failed sign-in. If sessions stop working right after you add a proxy, check the credentials before assuming the session expired.
+- **Set the proxy up before creating the session.** Run `--login` with the proxy already configured. Turning a proxy on for an existing profile moves a logged-in session to a new IP, which is what triggers a LinkedIn checkpoint. The same applies to `--import-from-browser`, which imports a session created on your real IP. Use a sticky session, not a rotating pool, for the same reason.
 
 **Custom Chrome path:**
 
@@ -442,6 +523,7 @@ The local server uses the same managed-runtime flow as MCPB and `uvx`: it prepar
 - `--user-agent STRING` - Custom browser user agent
 - `--viewport WxH` - Browser viewport size (default: 1280x720)
 - `--chrome-path PATH` - Path to Chrome/Chromium executable (for custom browser installations)
+- `--proxy-server URL` - Route the browser through a proxy, as `scheme://host:port`. Set the password via `PROXY_PASSWORD` (no flag, so it stays out of the process list)
 - `--help` - Show help
 
 > **Note:** Most CLI options have environment variable equivalents. See `.env.example` for details.
@@ -500,6 +582,28 @@ uv run -m linkedin_mcp_server --transport streamable-http --host 127.0.0.1 --por
 - *Entire tool calls timing out* (e.g. multi-section profiles, cold-start Chromium, slow containers): increase the per-tool execution timeout — `--tool-timeout 300` or `TOOL_TIMEOUT=300` (seconds, default 180).
 - *First tool call with no session*: if a locally logged-in browser has a live LinkedIn session, the server auto-imports it (see `AUTO_IMPORT_FROM_BROWSER` / `--auto-import`) instead of forcing a manual login. On macOS the keychain may prompt once for Safe Storage access. If no importable browser session exists, it falls back to opening a login window and waits up to `LOGIN_INLINE_WAIT` seconds (default 25, max 45; `--login-inline-wait`) so a quick sign-in resolves in one call. If the wait elapses, the tool returns a pending signal and the model retries in about 30 seconds. Neither the auto-import nor the inline wait applies under Docker or when the server is bound to a non-loopback HTTP host; create the session on the host with `--login`.
 - Users on slow connections may need higher values for either.
+
+**Using a proxy:**
+
+> **Most people should not use one.** LinkedIn's own guidance for reducing
+> security challenges is to avoid a VPN or proxy, and it scores the addresses a
+> session signs in from. A home connection you have used for years is a trust
+> signal; a commercial exit node with a history you cannot see is not, and
+> switching to one is itself the kind of change that triggers a checkpoint.
+> A proxy is worth it in one case: the server runs somewhere its address is
+> obviously a data centre, or in a different country from the account's history.
+> Even then, a WireGuard or Tailscale exit node on your own home network beats
+> any paid provider, because the address really is yours. If you do buy one,
+> take a dedicated static ISP address and keep it, rather than a rotating
+> residential pool.
+
+- Route the browser through a proxy with `--proxy-server http://host:port` (`http`, `https`, `socks4` and `socks5` are accepted). Only browser traffic is routed, not the MCP transport.
+- Credentials go in `PROXY_USERNAME` and `PROXY_PASSWORD`. There is no `--proxy-password` flag on purpose: command-line arguments are readable by every other user on the machine. `PROXY_SERVER` also accepts the combined `http://user:pass@host:port` form most providers hand out.
+- Chromium cannot authenticate to a SOCKS proxy, so credentials require an `http(s)` endpoint. If your provider only offers authenticated SOCKS5, run a local relay that holds the credentials and point the server at that.
+- Local addresses go through the proxy too. Chromium's usual direct route for `localhost` is removed when a proxy is set, so add `PROXY_BYPASS=localhost,127.0.0.1,::1` if you need local targets reached directly.
+- Auto-import is skipped while a proxy is configured: a session taken from a local browser was created on your real address, and moving it to the proxy is the very change that triggers a checkpoint. Use `--login`.
+- A wrong proxy password does not report itself: Chromium retries the authentication challenge until the page times out, so it surfaces as a timeout or a failed sign-in. If sessions stop working right after you add a proxy, check the credentials before assuming the session expired.
+- **Set the proxy up before creating the session.** Run `--login` with the proxy already configured. Turning a proxy on for an existing profile moves a logged-in session to a new IP, which is what triggers a LinkedIn checkpoint. The same applies to `--import-from-browser`, which imports a session created on your real IP. Use a sticky session, not a rotating pool, for the same reason.
 
 **Custom Chrome path:**
 
