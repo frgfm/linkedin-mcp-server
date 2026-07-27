@@ -4366,34 +4366,15 @@ class LinkedInExtractor:
             """(editor, { candidates }) => {
                 const normalize = value =>
                     (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                const isVisible = element =>
-                    !!(
-                        element &&
-                        (element.offsetWidth ||
-                            element.offsetHeight ||
-                            element.getClientRects().length)
-                    );
-
-                const targetValues = candidates.map(normalize).filter(Boolean);
                 const root =
                     editor.closest('[role="dialog"]') || editor.closest('form');
                 if (!root) return false;
-
-                const entries = Array.from(
-                    root.querySelectorAll(
-                        'button, [role="button"], a, span, div, li, p, h1, h2, h3'
-                    )
-                )
-                    .filter(isVisible)
-                    .map(element =>
-                        [
-                            normalize(element.innerText || element.textContent || ''),
-                            normalize(element.getAttribute('aria-label') || ''),
-                        ].filter(Boolean)
-                    )
-                    .flat();
-
-                return targetValues.some(candidate =>
+                const entries = [
+                    normalize(root.innerText),
+                    ...Array.from(root.querySelectorAll('[aria-label]'))
+                        .map(element => normalize(element.getAttribute('aria-label'))),
+                ].filter(Boolean);
+                return candidates.map(normalize).filter(Boolean).some(candidate =>
                     entries.some(entry => entry === candidate || entry.includes(candidate))
                 );
             }""",
@@ -5950,8 +5931,7 @@ class LinkedInExtractor:
                 message_surface,
             )
 
-        compose_box = await self._resolve_message_compose_box()
-        if compose_box is None:
+        if message_surface is None:
             await self._dismiss_message_ui()
             return self._message_action_result(
                 self._page.url,
@@ -5960,16 +5940,11 @@ class LinkedInExtractor:
                 recipient_selected=recipient_selected,
             )
 
-        logger.debug(
-            "Message compose box resolved for %s after hydration",
-            linkedin_username,
-        )
-
-        recipient_compose_box = await self._resolve_recipient_message_compose_box(
+        compose_box = await self._resolve_recipient_message_compose_box(
             display_name or "",
             linkedin_username,
         )
-        if recipient_compose_box is None:
+        if compose_box is None:
             logger.debug(
                 "Recipient match still failed for %s after compose hydration",
                 linkedin_username,
@@ -5981,7 +5956,6 @@ class LinkedInExtractor:
                 "LinkedIn opened a compose page, but the visible recipient did not match the requested profile.",
                 recipient_selected=recipient_selected,
             )
-        compose_box = recipient_compose_box
         recipient_selected = True
 
         if not confirm_send:
