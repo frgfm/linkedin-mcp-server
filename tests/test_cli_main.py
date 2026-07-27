@@ -2,6 +2,7 @@
 
 import importlib.metadata
 import json
+import logging
 from typing import Literal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -80,7 +81,64 @@ def test_main_interactive_prompts_when_transport_not_explicit(
         host=config.server.host,
         port=config.server.port,
         path=config.server.path,
+        host_origin_protection=True,
     )
+    assert config.server.transport == "streamable-http"
+
+
+def test_choosing_http_at_the_prompt_warns_about_an_exposed_bind(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Answering the prompt has to update the stored transport, not a local.
+
+    Several checks read it to decide how exposed this process is. Leaving it at
+    stdio told the bind-address warning there was no listener to warn about,
+    and told the cookie-import gate that a server listening on every interface
+    was a private one.
+    """
+    config = _make_config(
+        is_interactive=True, transport="stdio", transport_explicitly_set=False
+    )
+    config.server.host = "0.0.0.0"
+    _patch_main_dependencies(monkeypatch, config)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.choose_transport_interactive",
+        lambda: "streamable-http",
+    )
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.create_mcp_server", lambda **_kwargs: MagicMock()
+    )
+
+    with caplog.at_level(logging.WARNING):
+        cli_main.main()
+
+    assert config.server.transport == "streamable-http"
+    assert "no authentication" in caplog.text
+
+
+def test_choosing_stdio_at_the_prompt_leaves_no_listener_recorded(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The host is meaningless without a listener, so it must not warn."""
+    config = _make_config(
+        is_interactive=True, transport="streamable-http", transport_explicitly_set=False
+    )
+    config.server.host = "0.0.0.0"
+    _patch_main_dependencies(monkeypatch, config)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.choose_transport_interactive", lambda: "stdio"
+    )
+    mcp = MagicMock()
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.create_mcp_server", lambda **_kwargs: mcp
+    )
+
+    with caplog.at_level(logging.WARNING):
+        cli_main.main()
+
+    assert config.server.transport == "stdio"
+    assert "no authentication" not in caplog.text
+    mcp.run.assert_called_once_with(transport="stdio")
 
 
 def test_main_explicit_transport_skips_prompt(
@@ -131,9 +189,40 @@ def test_main_streamable_http_passes_host_port_path(
         host="0.0.0.0",
         port=8123,
         path="/custom-mcp",
+        host_origin_protection=True,
     )
     captured = capsys.readouterr()
     assert captured.out == ""
+
+
+def test_main_streamable_http_enables_host_and_origin_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard is not optional and has no configuration switch.
+
+    Two details here are load-bearing rather than incidental. ``True`` instead
+    of ``"auto"``: the latter validates only when the connection landed on a
+    loopback address, so an exposed server checked nothing over its own LAN
+    address. And no ``allowed_hosts``: a wildcard would accept an attacker's
+    domain as the Host and reopen the hole from the other side.
+
+    See ``test_transport_security.py`` for what the resulting server answers.
+    """
+    config = _make_config(
+        is_interactive=False,
+        transport="streamable-http",
+        transport_explicitly_set=True,
+    )
+    _patch_main_dependencies(monkeypatch, config)
+    mcp = MagicMock()
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.create_mcp_server", lambda **_kwargs: mcp
+    )
+
+    cli_main.main()
+
+    assert mcp.run.call_args.kwargs["host_origin_protection"] is True
+    assert "allowed_hosts" not in mcp.run.call_args.kwargs
 
 
 def test_main_passes_configured_tool_timeout_to_factory(
@@ -166,14 +255,14 @@ def test_get_version_prefers_installed_metadata(
 
     def fake_version(package_name: str) -> str:
         calls.append(package_name)
-        if package_name == "linkedin-scraper-mcp":
+        if package_name == "mcp-server-linkedin":
             return "4.2.0"
         raise importlib.metadata.PackageNotFoundError(package_name)
 
     monkeypatch.setattr(importlib.metadata, "version", fake_version)
 
     assert cli_main.get_version() == "4.2.0"
-    assert calls == ["linkedin-scraper-mcp"]
+    assert calls == ["mcp-server-linkedin"]
 
 
 def test_main_non_interactive_no_auth_still_starts_server(
@@ -318,6 +407,137 @@ def test_profile_info_reports_committed_derived_runtime(
     captured = capsys.readouterr()
     assert "derived (committed, current generation)" in captured.out.lower()
     assert str(storage_state) in captured.out
+
+
+def _patch_import_handler(monkeypatch, tmp_path, *, is_interactive=False):
+    config = AppConfig()
+    config.is_interactive = is_interactive
+    config.server.import_from_browser = "chrome"
+    monkeypatch.setattr("linkedin_mcp_server.cli_main.get_config", lambda: config)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.configure_logging", lambda **_kwargs: None
+    )
+    monkeypatch.setattr("linkedin_mcp_server.cli_main.get_version", lambda: "4.0.0")
+    monkeypatch.setattr("linkedin_mcp_server.cli_main.set_headless", lambda _x: None)
+    configured = {"called": False}
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.configure_browser_environment",
+        lambda: configured.__setitem__("called", True),
+    )
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.get_profile_dir", lambda: tmp_path / "profile"
+    )
+    return config, configured
+
+
+def test_import_from_browser_success_exits_zero(monkeypatch, capsys, tmp_path):
+    _config, configured = _patch_import_handler(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.browser_import.orchestrate.import_session_from_browser",
+        AsyncMock(return_value=True),
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main.import_from_browser_and_exit()
+
+    assert exit_info.value.code == 0
+    assert configured["called"] is True
+    assert "imported and validated" in capsys.readouterr().out.lower()
+
+
+def test_import_from_browser_failure_exits_one(monkeypatch, capsys, tmp_path):
+    _patch_import_handler(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.browser_import.orchestrate.import_session_from_browser",
+        AsyncMock(return_value=False),
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main.import_from_browser_and_exit()
+
+    assert exit_info.value.code == 1
+    assert "did not produce a valid session" in capsys.readouterr().out.lower()
+
+
+def test_import_from_browser_no_session_guidance(monkeypatch, capsys, tmp_path):
+    from linkedin_mcp_server.exceptions import NoLinkedInSessionFoundError
+
+    _patch_import_handler(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.browser_import.orchestrate.import_session_from_browser",
+        AsyncMock(side_effect=NoLinkedInSessionFoundError("none found")),
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main.import_from_browser_and_exit()
+
+    assert exit_info.value.code == 1
+    out = capsys.readouterr().out.lower()
+    assert "log into linkedin" in out
+    assert "--login" in out
+
+
+def test_import_from_browser_app_bound_message(monkeypatch, capsys, tmp_path):
+    from linkedin_mcp_server.exceptions import CookieDecryptionError
+
+    _patch_import_handler(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.browser_import.orchestrate.import_session_from_browser",
+        AsyncMock(side_effect=CookieDecryptionError("app-bound in Brave")),
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main.import_from_browser_and_exit()
+
+    assert exit_info.value.code == 1
+    assert "could not import session" in capsys.readouterr().out.lower()
+
+
+def test_main_dispatches_import_before_login(monkeypatch, tmp_path):
+    # Driving the dispatch through main() (not the handler directly) proves the
+    # wiring: import is gated into ensure_browser_installed and runs before the
+    # --login handler.
+    config = _make_config(
+        is_interactive=False, transport="stdio", transport_explicitly_set=False
+    )
+    config.server.import_from_browser = "chrome"
+    config.server.login = True  # also set; import must win and exit first
+    _patch_main_dependencies(monkeypatch, config)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.configure_browser_environment", lambda: None
+    )
+
+    calls: list[str] = []
+
+    def fake_ensure(*, full: bool = False) -> None:
+        # Both --login and --import-from-browser are set; import dispatches
+        # first, so the install requests full chromium for the headed login.
+        calls.append(f"ensure(full={full})")
+
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.ensure_browser_installed", fake_ensure
+    )
+
+    def fake_import():
+        calls.append("import")
+        raise SystemExit(0)
+
+    def fake_login():
+        calls.append("login")
+        raise SystemExit(0)
+
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.import_from_browser_and_exit", fake_import
+    )
+    monkeypatch.setattr("linkedin_mcp_server.cli_main.get_profile_and_exit", fake_login)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main.main()
+
+    assert exit_info.value.code == 0
+    # Browser install gate ran for import, import dispatched, login never reached.
+    # --login is also set, so the install requests full chromium.
+    assert calls == ["ensure(full=True)", "import"]
 
 
 def test_clear_profile_and_exit_clears_all_auth_state(

@@ -61,3 +61,58 @@ class LinuxBrowserDependencyError(LinkedInMCPError):
 
 class BrowserBinaryMissingError(LinkedInMCPError):
     """Patchright Chromium binary is absent or stale on disk."""
+
+
+class CookieDecryptionError(LinkedInMCPError):
+    """A browser cookie could not be decrypted."""
+
+
+class KeystoreUnavailableError(CookieDecryptionError):
+    """The OS keystore holding the browser's Safe Storage key is unavailable."""
+
+
+class V20EncryptedError(CookieDecryptionError):
+    """Cookie uses Chrome 127+ app-bound encryption (v20); needs OS elevation."""
+
+
+class NoLinkedInSessionFoundError(LinkedInMCPError):
+    """No discoverable local browser profile has a decryptable LinkedIn (li_at) session."""
+
+
+class BrowserShutdownUnconfirmedError(LinkedInMCPError):
+    """A browser's teardown did not complete, so it may still hold the profile.
+
+    Distinct from an ordinary failure because the recovery differs: the profile
+    must be left exactly as it is. Resetting it, restoring over it, or trying
+    the next candidate would all write underneath a Chromium that may still be
+    running.
+    """
+
+    def __init__(self, message: str | None = None):
+        super().__init__(
+            message
+            or (
+                "A browser on this profile did not shut down cleanly and may "
+                "still be running. Restart the server to recover."
+            )
+        )
+
+
+class BrowserBusyError(LinkedInMCPError):
+    """Another server process holds the shared browser profile.
+
+    Deliberately not an ``AuthenticationError``: that class is routed into
+    ``invalidate_auth_and_trigger_relogin``, which force-retires the shared
+    profile. Classifying contention as an auth failure would let a process that
+    merely lost a race destroy every other process's session.
+    """
+
+    def __init__(self, message: str | None = None):
+        super().__init__(
+            message
+            or (
+                "Another LinkedIn MCP client is currently using the browser. "
+                "This is not a failure and your saved session was not changed. "
+                "Wait a moment and call this exact tool again."
+            )
+        )

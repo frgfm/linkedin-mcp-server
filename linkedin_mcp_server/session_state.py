@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
+import functools
 import json
 import logging
+import os
 import platform
 from pathlib import Path
 import shutil
+import socket
+from collections.abc import Callable, Iterator
 from typing import Any
 from uuid import uuid4
 
-from linkedin_mcp_server.common_utils import secure_write_text, utcnow_iso
+from linkedin_mcp_server.common_utils import (
+    secure_mkdir,
+    secure_write_text,
+    utcnow_iso,
+)
 from linkedin_mcp_server.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -19,6 +29,16 @@ logger = logging.getLogger(__name__)
 _SOURCE_STATE_FILE = "source-state.json"
 _RUNTIME_STATE_FILE = "runtime-state.json"
 _RUNTIME_PROFILES_DIR = "runtime-profiles"
+
+# Prefix of the timestamped directories retired auth state is moved into.
+QUARANTINE_PREFIX = "invalid-state-"
+
+# Chromium writes a profile it owns three Singleton* links and removes them on a
+# clean exit. Only this one encodes the owner as ``<hostname>-<pid>``; the
+# siblings hold a socket path and an opaque token, so they cannot be attributed
+# and are ignored. A crash leaves the link behind, so presence alone proves
+# nothing — see ``profile_in_use_by``.
+_CHROMIUM_LOCK_NAME = "SingletonLock"
 
 
 @dataclass
@@ -29,6 +49,11 @@ class SourceState:
     created_at: str
     profile_path: str
     cookies_path: str
+    # The user agent the session's cookies were minted under (synthesized from
+    # the source browser during import, see browser_import/user_agent.py). None
+    # for manual logins (the cookie is minted in the runtime browser itself, so
+    # its default UA already matches) and for pre-existing state files.
+    user_agent: str | None = None
 
 
 @dataclass
@@ -208,7 +233,11 @@ def load_source_state(source_profile_dir: Path | None = None) -> SourceState | N
         return None
 
 
-def write_source_state(source_profile_dir: Path | None = None) -> SourceState:
+def write_source_state(
+    source_profile_dir: Path | None = None,
+    *,
+    user_agent: str | None = None,
+) -> SourceState:
     """Write a fresh source session generation after successful login."""
     profile_dir = (
         (source_profile_dir or get_source_profile_dir()).expanduser().resolve()
@@ -220,6 +249,7 @@ def write_source_state(source_profile_dir: Path | None = None) -> SourceState:
         created_at=utcnow_iso(),
         profile_path=str(profile_dir),
         cookies_path=str(portable_cookie_path(profile_dir)),
+        user_agent=user_agent,
     )
     _write_json(source_state_path(profile_dir), asdict(state))
     return state
@@ -287,29 +317,375 @@ def clear_runtime_profile(
         return False
 
 
-def clear_auth_state(source_profile_dir: Path | None = None) -> bool:
-    """Remove source auth artifacts and all derived runtime profiles."""
-    profile_dir = (source_profile_dir or get_source_profile_dir()).expanduser()
-    targets = [
+def _auth_state_targets(profile_dir: Path) -> list[Path]:
+    """The four artifacts that together make up one source session."""
+    return [
         profile_dir,
         portable_cookie_path(profile_dir),
         source_state_path(profile_dir),
         runtime_profiles_root(profile_dir),
     ]
 
-    success = True
+
+def quarantine_dirs(source_profile_dir: Path | None = None) -> list[Path]:
+    """Existing quarantine directories, newest name last."""
+    root = auth_root_dir(source_profile_dir)
+    if not root.is_dir():
+        return []
+    return sorted(path for path in root.glob(f"{QUARANTINE_PREFIX}*") if path.is_dir())
+
+
+async def run_deferring_cancels(
+    work: Callable[[], Any],
+) -> tuple[Any, bool]:
+    """Run *work* in a worker thread, holding back cancels until it finishes.
+
+    Uses ``run_in_executor`` rather than ``to_thread``: the latter registers an
+    ``asyncio.Task``, which ``asyncio.run`` cancels along with everything else
+    at loop teardown. Shielding an already-cancelled *task* re-raises forever,
+    so the wait below would spin and the process would never exit. A bare
+    Future is not in ``all_tasks()`` and never reaches that state.
+
+    Returns the result and whether a cancel arrived, so the caller can finish
+    cleaning up and re-raise once at the end.
+    """
+    future = asyncio.get_running_loop().run_in_executor(None, work)
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(future), cancelled
+        except asyncio.CancelledError:
+            # A cancel here must not abandon the worker: it is already moving
+            # the session, and dropping its result strands the user logged out.
+            cancelled = True
+
+
+async def rotate_shielded(source_profile_dir: Path) -> Path | None:
+    """Rotate off the event loop without losing the backup path to a cancel.
+
+    A bare ``await asyncio.to_thread(rotate...)`` is cancellable, and a cancel
+    lands *after* the thread has already moved the session: the move stands, but
+    its return value is gone, so nothing can put it back. Overlapping cancels
+    are real here — a tool timeout racing a server shutdown — so every one of
+    them is deferred until the session is safely accounted for.
+    """
+    retired, cancelled = await run_deferring_cancels(
+        functools.partial(rotate_source_profile, source_profile_dir)
+    )
+    if not cancelled:
+        return retired
+
+    if retired is not None:
+        restored, _ = await run_deferring_cancels(
+            functools.partial(restore_source_profile, retired, source_profile_dir)
+        )
+        if not restored:
+            logger.warning(
+                "Rotation was cancelled and the previous session could not be "
+                "restored; it is kept at %s",
+                retired,
+            )
+    raise asyncio.CancelledError
+
+
+def _runtime_profile_dirs(source_profile_dir: Path) -> list[Path]:
+    """Every derived runtime profile under the auth root."""
+    root = runtime_profiles_root(source_profile_dir)
+    if not root.is_dir():
+        return []
+    return [item / "profile" for item in root.iterdir() if (item / "profile").is_dir()]
+
+
+def profile_in_use_by(profile_dir: Path) -> Path | None:
+    """The Chromium lock proving another *live* process owns *profile_dir*.
+
+    Returns ``None`` when the profile is free, including when a lock is left
+    over from a crash: Chromium does not clean these up on an abnormal exit, and
+    treating a stale one as an owner would wedge every future login behind a
+    manual file deletion.
+
+    On Linux and macOS the lock is a symlink whose target encodes the owning
+    ``<host>-<pid>``. The pid is only meaningful in that host's namespace, so it
+    is probed only when the host matches ours. A lock from a *different* host —
+    a container writing into the mounted auth root, most often — is treated as
+    held: its pid says nothing to us, and the alternative is moving a profile
+    out from under a running container. That errs toward refusing to rotate,
+    which the operator can resolve by stopping the container, whereas the
+    opposite corrupts two sessions silently.
+    """
+    candidate = profile_dir / _CHROMIUM_LOCK_NAME
+    try:
+        target = os.readlink(candidate)
+    except OSError:
+        # Not a symlink, or absent: no attributable owner.
+        return None
+
+    owner, separator, pid_text = target.rpartition("-")
+    if not separator:
+        return None  # Not the documented shape; nothing to attribute.
+    if owner != socket.gethostname():
+        return candidate  # Another host: unverifiable, so assume live.
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None  # Stale: the writer is gone.
+    except PermissionError:
+        return candidate  # Alive, owned by another user.
+    except OSError:
+        return None
+    return candidate
+
+
+@contextmanager
+def _exclusive_profile(profile_dir: Path, *, action: str) -> Iterator[None]:
+    """Hold the profile exclusively for the duration of an auth-state mutation.
+
+    Checking and then releasing before the move would leave a window in which
+    another process launches Chromium against the very files being moved, so the
+    lease is held until the mutation finishes.
+
+    Three independent signals, because none alone is sufficient:
+
+    * This process's own browser. The lease is reference-counted, so asking it
+      for another reference would simply succeed and prove nothing about whether
+      our Chromium is still running — the flag is what answers that. It matters
+      most when a close could not be confirmed: the lease is deliberately kept in
+      that case because Chromium may still be alive.
+    * The lease itself, which every cooperating process takes before it opens
+      Chromium. Authoritative, but only among processes that know about it.
+    * Chromium's ``SingletonLock``, which catches a foreign holder — an older
+      version, a container, a human with a browser open on the directory. Note it
+      is written only by full Chrome: the default ``chrome-headless-shell`` never
+      writes one, which is precisely why the lease exists.
+
+    Every profile is checked, not just the source: a container runs Chromium out
+    of ``runtime-profiles/<runtime>/profile`` while sharing the mounted auth
+    root, so checking only the source would move a live container's profile out
+    from under it.
+    """
+    from linkedin_mcp_server.profile_lease import get_profile_lease
+
+    lease = get_profile_lease(profile_dir)
+    if lease.browser_open:
+        raise RuntimeError(
+            "This server still has a browser open on the profile. "
+            f"Close it before {action}."
+        )
+    if not lease.try_acquire():
+        raise RuntimeError(
+            "The browser profile is in use by another process. "
+            f"Stop the running server or container before {action}."
+        )
+
+    try:
+        lock = next(
+            (
+                held
+                for candidate in [profile_dir, *_runtime_profile_dirs(profile_dir)]
+                if (held := profile_in_use_by(candidate)) is not None
+            ),
+            None,
+        )
+        if lock is not None:
+            raise RuntimeError(
+                f"The browser profile is in use by another process (found {lock.name}). "
+                f"Stop the running server or container before {action}."
+            )
+        yield
+    finally:
+        lease.release()
+
+
+def rotate_source_profile(source_profile_dir: Path | None = None) -> Path | None:
+    """Retire the current source session so the next one starts clean.
+
+    Chromium mints ``machine_id``, ``session_id_generator_last_value`` and
+    friends into ``Local State`` once and then keeps them for the life of the
+    profile. Reusing the directory for a different LinkedIn account hands
+    LinkedIn the same device identity twice, which is exactly the signal that
+    links accounts to one another. Every path that establishes a new source
+    session therefore rotates first.
+
+    The retired artifacts are moved, not deleted, so a session that turns out to
+    have been fine is still recoverable. ``--logout`` clears the quarantines.
+
+    Returns the quarantine directory, or ``None`` when there was nothing to
+    retire.
+
+    Raises:
+        RuntimeError: Another process holds the profile. Rotating underneath a
+            live Chromium corrupts both the old and the new session.
+        OSError: A move failed. Whatever had already moved is put back first, so
+            the caller always sees either the old session intact or a complete
+            retirement, never one session split across both.
+    """
+    profile_dir = (source_profile_dir or get_source_profile_dir()).expanduser()
+    existing = [
+        target for target in _auth_state_targets(profile_dir) if target.exists()
+    ]
+    if not existing:
+        return None
+
+    with _exclusive_profile(profile_dir, action="creating a new session"):
+        # utcnow_iso() is second-resolution and rotation is now routine rather
+        # than exceptional, so two rotations can land in the same second. The
+        # suffix keeps them from merging into one directory.
+        stamp = utcnow_iso().replace(":", "-")
+        backup_dir = (
+            auth_root_dir(profile_dir) / f"{QUARANTINE_PREFIX}{stamp}-{uuid4().hex[:8]}"
+        )
+        secure_mkdir(backup_dir)
+        moved: list[Path] = []
+        try:
+            for target in existing:
+                shutil.move(str(target), str(backup_dir / target.name))
+                moved.append(target)
+        except OSError:
+            _restore(backup_dir, moved)
+            raise
+        logger.info("Retired previous session to %s", backup_dir)
+        return backup_dir
+
+
+def _restore(backup_dir: Path, targets: list[Path]) -> None:
+    """Move *targets* back out of *backup_dir*, best effort."""
     for target in targets:
+        try:
+            shutil.move(str(backup_dir / target.name), str(target))
+        except OSError as exc:
+            logger.warning("Could not restore %s: %s", target, exc)
+    try:
+        backup_dir.rmdir()
+    except OSError:
+        pass
+
+
+def restore_source_profile(
+    backup_dir: Path, source_profile_dir: Path | None = None
+) -> bool:
+    """Put a retired session back, undoing ``rotate_source_profile``.
+
+    A rotation happens *before* the replacement session exists, so a login that
+    is cancelled or an import where every candidate is rejected would otherwise
+    leave the user logged out of a session that was working. Callers restore on
+    that path, passing the same directory they rotated: ``--user-data-dir`` can
+    point somewhere other than the configured default, and restoring to the
+    configured one would strand the artifacts in a foreign auth root.
+
+    Like rotation, this moves the active auth artifacts, so it holds the profile
+    exclusively while it does. Every caller already owns the lease (login,
+    import, and the cancelled-rotation path), which is re-entrant within a
+    process; the guard is here so a future caller cannot forget.
+
+    Returns ``False`` when the active paths are already occupied — the
+    replacement succeeded after all, and overwriting it would be the very
+    fingerprint mixing this module exists to prevent.
+    """
+    if not backup_dir.is_dir():
+        return False
+    profile_dir = (source_profile_dir or get_source_profile_dir()).expanduser()
+    with _exclusive_profile(profile_dir, action="restoring the previous session"):
+        return _restore_source_profile_locked(backup_dir, profile_dir)
+
+
+def _restore_source_profile_locked(backup_dir: Path, profile_dir: Path) -> bool:
+    """Put a retired session back; the caller holds the profile exclusively."""
+    targets = {target.name: target for target in _auth_state_targets(profile_dir)}
+
+    # Only a successful login or import commits all three of these together.
+    # Anything less is debris — most often the profile directory Chromium
+    # creates on launch and abandons when the login is cancelled, or a
+    # half-written marker — and reading it as a replacement would strand the
+    # working session in quarantine.
+    replacement_committed = (
+        load_source_state(profile_dir) is not None
+        and profile_exists(profile_dir)
+        and portable_cookie_path(profile_dir).exists()
+    )
+    if replacement_committed:
+        logger.debug("Not restoring %s: a newer session is in place", backup_dir)
+        return False
+
+    # Park the debris beside the backup instead of deleting it: if a move fails
+    # halfway the caller ends up with neither session, and an uncommitted
+    # profile may still hold a Chromium login worth inspecting.
+    debris_dir = backup_dir.parent / f"{backup_dir.name}-superseded"
+    for target in _auth_state_targets(profile_dir):
         if not target.exists():
             continue
         try:
-            if target.is_dir():
-                shutil.rmtree(target)
-            else:
-                target.unlink()
+            secure_mkdir(debris_dir)
+            shutil.move(str(target), str(debris_dir / target.name))
         except OSError as exc:
-            logger.warning("Could not clear auth artifact %s: %s", target, exc)
-            success = False
-    return success
+            logger.warning("Could not clear %s before restoring: %s", target, exc)
+            return False
+
+    restorable = [
+        (item, targets[item.name])
+        for item in backup_dir.iterdir()
+        if item.name in targets
+    ]
+    restored: list[Path] = []
+    for source, target in restorable:
+        try:
+            shutil.move(str(source), str(target))
+            restored.append(target)
+        except OSError as exc:
+            # Undo the partial restore, so the session stays wholly quarantined
+            # rather than split across both places, where the auth preflight
+            # rejects it and the next rotation would divide it again.
+            logger.warning("Could not restore %s: %s", target, exc)
+            _retire(backup_dir, restored)
+            return False
+    try:
+        backup_dir.rmdir()
+    except OSError:
+        pass
+    logger.info("Restored the previous session from %s", backup_dir)
+    return True
+
+
+def _retire(backup_dir: Path, targets: list[Path]) -> None:
+    """Move *targets* back into *backup_dir*, best effort."""
+    for target in targets:
+        try:
+            shutil.move(str(target), str(backup_dir / target.name))
+        except OSError as exc:
+            logger.warning("Could not re-retire %s: %s", target, exc)
+
+
+def clear_auth_state(source_profile_dir: Path | None = None) -> bool:
+    """Remove source auth artifacts, derived runtime profiles and quarantines.
+
+    Raises:
+        RuntimeError: Another process is using the profile. Deleting it out from
+            under a live browser corrupts that session and, with several clients,
+            destroys everyone's rather than just this caller's.
+    """
+    profile_dir = (source_profile_dir or get_source_profile_dir()).expanduser()
+    with _exclusive_profile(profile_dir, action="clearing the stored session"):
+        # Quarantines hold previous sessions' cookies, so a logout that left them
+        # behind would not be the "clear all stored auth state" the CLI
+        # advertises.
+        targets = _auth_state_targets(profile_dir) + quarantine_dirs(profile_dir)
+
+        success = True
+        for target in targets:
+            if not target.exists():
+                continue
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+            except OSError as exc:
+                logger.warning("Could not clear auth artifact %s: %s", target, exc)
+                success = False
+        return success
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
