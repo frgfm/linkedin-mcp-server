@@ -1534,7 +1534,13 @@ class TestConnectWithPerson:
         mock_nav.assert_not_awaited()
         mock_submit.assert_not_awaited()
 
-    async def test_pending_received_invitation_is_accepted(self, mock_page):
+    @pytest.mark.parametrize(
+        ("action_status", "expected_status"),
+        [("accepted", "accepted"), ("verification_failed", "send_failed")],
+    )
+    async def test_pending_received_invitation_uses_connection_result(
+        self, mock_page, action_status, expected_status
+    ):
         """A received invitation can share the outgoing Pending fingerprint."""
         extractor = LinkedInExtractor(mock_page)
         text = "Alice\n\nAccept\nIgnore\n"
@@ -1551,12 +1557,21 @@ class TestConnectWithPerson:
                 extractor,
                 "_respond_via_received_invitations",
                 new_callable=AsyncMock,
-                return_value={"status": "accepted"},
+                return_value={
+                    "status": action_status,
+                    "message": "Invitation action result.",
+                },
             ) as mock_accept,
         ):
             result = await extractor.connect_with_person("alice")
 
-        assert result["status"] == "accepted"
+        assert result == {
+            "url": "https://www.linkedin.com/in/alice/",
+            "status": expected_status,
+            "message": "Invitation action result.",
+            "note_sent": False,
+            "profile": text,
+        }
         mock_accept.assert_awaited_once_with("alice", "accept")
 
     async def test_returns_incoming_request_accepted(self, mock_page):
