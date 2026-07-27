@@ -171,20 +171,19 @@ _MESSAGING_CLOSE_SELECTOR = (
 )
 
 _ARCHIVE_CONVERSATION_JS = r"""
-async () => {
+async (anchor) => {
   const visible = el => !el.disabled && el.getClientRects().length > 0;
   const text = el =>
     (el.getAttribute('aria-label') || el.innerText || el.textContent || '')
       .replace(/\s+/g, ' ').trim().toLowerCase();
-  const event = document.querySelector('[data-event-urn^="urn:li:msg_message:"]');
+  const root = anchor?.closest('[role="dialog"]') || document.querySelector('main');
+  if (!root) return { clicked: false, verified: false, reason: 'no_root' };
+  const event = root.querySelector('[data-event-urn^="urn:li:msg_message:"]');
   if (!event) return { clicked: false, verified: false, reason: 'no_messages' };
 
-  const dialog = event.closest('[role="dialog"]');
-  const root = dialog || document.querySelector('main');
-  if (!root) return { clicked: false, verified: false, reason: 'no_root' };
-
   const eventRect = event.getBoundingClientRect();
-  const actionItems = () => Array.from(document.querySelectorAll(
+  // BrowserManager forces en-US, so LinkedIn's menu labels are stable here.
+  const actionItems = () => Array.from(root.querySelectorAll(
     '[role="menuitem"], [role="menu"] button, [role="button"]'
   )).filter(visible);
   const findAction = action => actionItems().find(item =>
@@ -1458,6 +1457,8 @@ _CLICK_RECEIVED_INVITATION_ACTION_JS = r"""
         .filter(button => text(button))
         .filter(button => !button.hasAttribute('aria-expanded'));
       if (buttons.length === 2) {
+        // LinkedIn's invitation manager renders [Ignore, Accept]; the exact
+        // two-button guard keeps this observed fallback scoped to that row.
         const target = buttons.find(button => labels.has(text(button).toLowerCase()))
           || buttons[action === 'accept' ? 1 : 0];
         target.click();
@@ -5759,42 +5760,14 @@ class LinkedInExtractor:
     def _strip_select_conversation_prefix(cls, aria_label: str) -> str:
         return cls._SELECT_CONVERSATION_PREFIX_RE.sub("", aria_label).strip()
 
-    async def get_conversation(
+    async def _open_conversation_surface(
         self,
         linkedin_username: str | None = None,
         thread_id: str | None = None,
         message_url: str | None = None,
         index: int = 0,
-        max_scrolls: int = 3,
-    ) -> dict[str, Any]:
-        """Read a conversation by thread ID, username, or invitation URL.
-
-        ``index`` (0-based) selects which thread to open when a participant has
-        multiple conversation threads — e.g. an organic 1-on-1 plus a separate
-        InMail. Ignored when ``thread_id`` is provided. Use
-        ``search_conversations`` to enumerate thread IDs first if disambiguation
-        by index is impractical.
-
-        ``max_scrolls`` caps how many times we scroll the message list back to
-        load older history. LinkedIn virtualizes the list, so the number of
-        returned messages grows with the scroll count; older history requires
-        higher values at the cost of latency.
-
-        Returns ``{url, sections: {messages, members}}``: ``messages`` is an
-        ordered list of ``{timestamp, status, sender, content}`` entries and
-        ``members`` is the participant list. Timestamp parsing and the
-        ``deleted`` status detection are en-US best-effort — BrowserManager
-        forces the browser locale to en-US; in other locales timestamps fall
-        through to raw concatenated text and deleted messages render with the
-        localized body text in ``content`` (status stays ``"sent"``).
-
-        Side effect when looked up by username: resolution searches LinkedIn's
-        messaging inbox for the participant's display name and click-visits
-        every matching row to capture its thread ID (no anchor hrefs or
-        thread-id attributes exist in the sidebar). Each visit selects the row
-        in the LinkedIn UI and may mark it as read. Pass ``thread_id`` directly
-        to skip this enumeration.
-        """
+    ) -> Any | None:
+        """Open a conversation and return its dialog root, if any."""
         if not linkedin_username and not thread_id and not message_url:
             raise LinkedInScraperException(
                 "Provide at least one of linkedin_username or thread_id"
@@ -5855,6 +5828,51 @@ class LinkedInExtractor:
             await detect_rate_limit(self._page)
             await self._wait_for_main_text(log_context="Conversation")
             await handle_modal_close(self._page)
+
+        return conversation_root
+
+    async def get_conversation(
+        self,
+        linkedin_username: str | None = None,
+        thread_id: str | None = None,
+        message_url: str | None = None,
+        index: int = 0,
+        max_scrolls: int = 3,
+    ) -> dict[str, Any]:
+        """Read a conversation by thread ID, username, or invitation URL.
+
+        ``index`` (0-based) selects which thread to open when a participant has
+        multiple conversation threads — e.g. an organic 1-on-1 plus a separate
+        InMail. Ignored when ``thread_id`` is provided. Use
+        ``search_conversations`` to enumerate thread IDs first if disambiguation
+        by index is impractical.
+
+        ``max_scrolls`` caps how many times we scroll the message list back to
+        load older history. LinkedIn virtualizes the list, so the number of
+        returned messages grows with the scroll count; older history requires
+        higher values at the cost of latency.
+
+        Returns ``{url, sections: {messages, members}}``: ``messages`` is an
+        ordered list of ``{timestamp, status, sender, content}`` entries and
+        ``members`` is the participant list. Timestamp parsing and the
+        ``deleted`` status detection are en-US best-effort — BrowserManager
+        forces the browser locale to en-US; in other locales timestamps fall
+        through to raw concatenated text and deleted messages render with the
+        localized body text in ``content`` (status stays ``"sent"``).
+
+        Side effect when looked up by username: resolution searches LinkedIn's
+        messaging inbox for the participant's display name and click-visits
+        every matching row to capture its thread ID (no anchor hrefs or
+        thread-id attributes exist in the sidebar). Each visit selects the row
+        in the LinkedIn UI and may mark it as read. Pass ``thread_id`` directly
+        to skip this enumeration.
+        """
+        conversation_root = await self._open_conversation_surface(
+            linkedin_username=linkedin_username,
+            thread_id=thread_id,
+            message_url=message_url,
+            index=index,
+        )
         if max_scrolls > 0:
             await self._scroll_main_scrollable_region(
                 position="top",
@@ -5882,14 +5900,17 @@ class LinkedInExtractor:
         index: int = 0,
     ) -> dict[str, Any]:
         """Open a conversation and archive it from LinkedIn's actions menu."""
-        await self.get_conversation(
+        conversation_root = await self._open_conversation_surface(
             linkedin_username=linkedin_username,
             thread_id=thread_id,
             message_url=message_url,
             index=index,
-            max_scrolls=0,
         )
-        result = await self._page.evaluate(_ARCHIVE_CONVERSATION_JS)
+        result = (
+            await conversation_root.evaluate(_ARCHIVE_CONVERSATION_JS)
+            if conversation_root is not None
+            else await self._page.evaluate(_ARCHIVE_CONVERSATION_JS)
+        )
         if not isinstance(result, dict):
             result = {"clicked": False, "verified": False}
 

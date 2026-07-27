@@ -18,6 +18,7 @@ from linkedin_mcp_server.scraping.connection import (
 from linkedin_mcp_server.scraping.extractor import (
     ExtractedSection,
     LinkedInExtractor,
+    _ARCHIVE_CONVERSATION_JS,
     _CONNECTION_CARDS_JS,
     _FEED_POSTS_JS,
     _INVITATION_CARDS_JS,
@@ -6058,21 +6059,20 @@ class TestArchiveConversation:
 
         with patch.object(
             extractor,
-            "get_conversation",
+            "_open_conversation_surface",
             new_callable=AsyncMock,
-            return_value={"url": mock_page.url, "sections": {}},
-        ) as get_conversation:
+            return_value=None,
+        ) as open_conversation:
             result = await extractor.archive_conversation(thread_id="thread-123")
 
         assert result["status"] == "archived"
         assert result["archived"] is True
         assert result["already_archived"] is False
-        get_conversation.assert_awaited_once_with(
+        open_conversation.assert_awaited_once_with(
             linkedin_username=None,
             thread_id="thread-123",
             message_url=None,
             index=0,
-            max_scrolls=0,
         )
 
     async def test_already_archived_is_success(self, mock_page):
@@ -6085,13 +6085,44 @@ class TestArchiveConversation:
             }
         )
 
-        with patch.object(extractor, "get_conversation", new_callable=AsyncMock):
+        with patch.object(
+            extractor,
+            "_open_conversation_surface",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
             result = await extractor.archive_conversation(thread_id="thread-123")
 
         assert result["status"] == "archived"
         assert result["performed"] is False
         assert result["already_archived"] is True
         assert result["message"] == "Conversation was already archived."
+
+    async def test_invitation_archive_uses_resolved_dialog(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        compose_root = MagicMock()
+        compose_root.evaluate = AsyncMock(
+            return_value={
+                "clicked": True,
+                "verified": True,
+                "alreadyArchived": False,
+            }
+        )
+
+        with patch.object(
+            extractor,
+            "_open_conversation_surface",
+            new_callable=AsyncMock,
+            return_value=compose_root,
+        ):
+            result = await extractor.archive_conversation(
+                linkedin_username="gautier",
+                message_url="/messaging/compose/?profileUrn=urn%3Ali%3Afsd_profile%3A1",
+            )
+
+        assert result["status"] == "archived"
+        compose_root.evaluate.assert_awaited_once_with(_ARCHIVE_CONVERSATION_JS)
+        mock_page.evaluate.assert_not_awaited()
 
 
 class TestConversationParserHelpers:

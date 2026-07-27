@@ -247,32 +247,45 @@ async def test_archive_conversation_verifies_restore_and_is_idempotent(dom_page)
     await dom_page.set_content(
         """
         <main>
-          <div data-event-urn="urn:li:msg_message:1">Message</div>
-          <button id="options" aria-expanded="false" onclick="toggleMenu()">...</button>
-          <div id="menu"></div>
+          <div id="wrong" role="dialog">
+            <div class="editor"></div>
+            <div data-event-urn="urn:li:msg_message:1">Wrong message</div>
+            <button aria-expanded="false" onclick="toggleMenu('wrong')">...</button>
+            <div class="menu"></div>
+          </div>
+          <div id="target" role="dialog">
+            <div class="editor"></div>
+            <div data-event-urn="urn:li:msg_message:2">Target message</div>
+            <button aria-expanded="false" onclick="toggleMenu('target')">...</button>
+            <div class="menu"></div>
+          </div>
         </main>
         <script>
-          let archived = false;
-          function toggleMenu() {
-            const options = document.getElementById('options');
-            const menu = document.getElementById('menu');
+          function toggleMenu(id) {
+            const dialog = document.getElementById(id);
+            const options = dialog.querySelector('button');
+            const menu = dialog.querySelector('.menu');
             const open = options.getAttribute('aria-expanded') !== 'true';
             options.setAttribute('aria-expanded', String(open));
             menu.innerHTML = open
               ? `<div role="button" onclick="
-                  archived = true;
-                  document.getElementById('options')
-                    .setAttribute('aria-expanded', 'false');
-                  document.getElementById('menu').innerHTML = '';
-                ">${archived ? 'Restore' : 'Archive'}</div>`
+                  archiveDialog('${id}');
+                ">${dialog.dataset.archived ? 'Restore' : 'Archive'}</div>`
               : '';
+          }
+          function archiveDialog(id) {
+            const dialog = document.getElementById(id);
+            dialog.dataset.archived = 'true';
+            dialog.querySelector('button').setAttribute('aria-expanded', 'false');
+            dialog.querySelector('.menu').innerHTML = '';
           }
         </script>
         """
     )
 
-    first = await dom_page.evaluate(_ARCHIVE_CONVERSATION_JS)
-    second = await dom_page.evaluate(_ARCHIVE_CONVERSATION_JS)
+    target = dom_page.locator("#target .editor")
+    first = await target.evaluate(_ARCHIVE_CONVERSATION_JS)
+    second = await target.evaluate(_ARCHIVE_CONVERSATION_JS)
 
     assert first == {
         "clicked": True,
@@ -284,3 +297,5 @@ async def test_archive_conversation_verifies_restore_and_is_idempotent(dom_page)
         "verified": True,
         "alreadyArchived": True,
     }
+    assert await dom_page.locator("#wrong").get_attribute("data-archived") is None
+    assert await dom_page.locator("#target").get_attribute("data-archived") == "true"
