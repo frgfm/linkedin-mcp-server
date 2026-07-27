@@ -1519,13 +1519,60 @@ class TestConnectWithPerson:
             patch.object(
                 extractor, "_submit_invite_dialog", new_callable=AsyncMock
             ) as mock_submit,
+            patch.object(
+                extractor,
+                "_respond_via_received_invitations",
+                new_callable=AsyncMock,
+                return_value={"status": "not_found"},
+            ) as mock_accept,
         ):
             result = await extractor.connect_with_person("testuser")
 
         assert result["status"] == "pending"
+        mock_accept.assert_awaited_once_with("testuser", "accept")
         # No write-path side effects.
         mock_nav.assert_not_awaited()
         mock_submit.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("action_status", "expected_status"),
+        [("accepted", "accepted"), ("verification_failed", "send_failed")],
+    )
+    async def test_pending_received_invitation_uses_connection_result(
+        self, mock_page, action_status, expected_status
+    ):
+        """A received invitation can share the outgoing Pending fingerprint."""
+        extractor = LinkedInExtractor(mock_page)
+        text = "Alice\n\nAccept\nIgnore\n"
+
+        with (
+            self._mock_scrape(extractor, text),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                return_value=self._signals(labeled_anchor=True),
+            ),
+            patch.object(
+                extractor,
+                "_respond_via_received_invitations",
+                new_callable=AsyncMock,
+                return_value={
+                    "status": action_status,
+                    "message": "Invitation action result.",
+                },
+            ) as mock_accept,
+        ):
+            result = await extractor.connect_with_person("alice")
+
+        assert result == {
+            "url": "https://www.linkedin.com/in/alice/",
+            "status": expected_status,
+            "message": "Invitation action result.",
+            "note_sent": False,
+            "profile": text,
+        }
+        mock_accept.assert_awaited_once_with("alice", "accept")
 
     async def test_returns_incoming_request_accepted(self, mock_page):
         """Structural detection + structural accept click, German locale."""
