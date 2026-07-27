@@ -170,6 +170,72 @@ _MESSAGING_CLOSE_SELECTOR = (
     'button[aria-label*="Close"]'
 )
 
+_ARCHIVE_CONVERSATION_JS = r"""
+async (anchor) => {
+  const visible = el => !el.disabled && el.getClientRects().length > 0;
+  const text = el =>
+    (el.getAttribute('aria-label') || el.innerText || el.textContent || '')
+      .replace(/\s+/g, ' ').trim().toLowerCase();
+  const root = anchor?.closest('[role="dialog"]') || document.querySelector('main');
+  if (!root) return { clicked: false, verified: false, reason: 'no_root' };
+  const event = root.querySelector('[data-event-urn^="urn:li:msg_message:"]');
+  if (!event) return { clicked: false, verified: false, reason: 'no_messages' };
+
+  const eventRect = event.getBoundingClientRect();
+  // BrowserManager forces en-US, so LinkedIn's menu labels are stable here.
+  const actionItems = () => Array.from(root.querySelectorAll(
+    '[role="menuitem"], [role="menu"] button, [role="button"]'
+  )).filter(visible);
+  const findAction = action => actionItems().find(item =>
+    text(item) === action || text(item) === `${action} conversation`
+  );
+  const menuButtons = Array.from(root.querySelectorAll(
+    'button[aria-haspopup="menu"], button[aria-expanded]'
+  ))
+    .filter(visible)
+    .filter(button => {
+      const rect = button.getBoundingClientRect();
+      return rect.left + rect.width / 2 >= eventRect.left;
+    });
+  for (const button of menuButtons) {
+    button.click();
+    for (let waits = 0; waits < 10; waits++) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      if (findAction('restore')) {
+        return {
+          clicked: false,
+          verified: true,
+          alreadyArchived: true,
+        };
+      }
+      const archive = findAction('archive');
+      if (!archive) continue;
+
+      archive.click();
+      let reopened = false;
+      for (let verifies = 0; verifies < 20; verifies++) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (findAction('restore')) {
+          return { clicked: true, verified: true, alreadyArchived: false };
+        }
+        if (
+          !reopened &&
+          verifies >= 2 &&
+          button.isConnected &&
+          button.getAttribute('aria-expanded') !== 'true'
+        ) {
+          button.click();
+          reopened = true;
+        }
+      }
+      return { clicked: true, verified: false };
+    }
+    if (button.getAttribute('aria-expanded') === 'true') button.click();
+  }
+  return { clicked: false, verified: false, reason: 'archive_action_not_found' };
+}
+"""
+
 # Shared JS function that walks up from any /messaging/compose/ anchor
 # inside <main> to find the smallest ancestor that satisfies the
 # action-root predicate (>=2 interactive children, >=1 button). This is
@@ -1364,6 +1430,55 @@ _CLICK_INCOMING_ACTION_JS = (
 """
 )
 
+_CLICK_RECEIVED_INVITATION_ACTION_JS = r"""
+({ username, action, target_labels }) => {
+  const main = document.querySelector('main');
+  if (!main) return { found: false, clicked: false, reason: 'no_main' };
+
+  const expected = `/in/${username.replace(/^\/+|\/+$/g, '')}/`;
+  const visible = el => !el.disabled && el.getClientRects().length > 0;
+  const text = el => (el.innerText || el.textContent || '').trim();
+  const labels = new Set((target_labels || []).map(label => label.toLowerCase()));
+
+  const profileLinks = Array.from(main.querySelectorAll('a[href*="/in/"]'))
+    .filter(link => {
+      try {
+        return new URL(link.href, location.origin).pathname.startsWith(expected);
+      } catch {
+        return false;
+      }
+    });
+
+  for (const link of profileLinks) {
+    let card = link.parentElement;
+    while (card && card !== main) {
+      const buttons = Array.from(card.querySelectorAll('button, [role="button"]'))
+        .filter(visible)
+        .filter(button => text(button))
+        .filter(button => !button.hasAttribute('aria-expanded'));
+      if (buttons.length === 2) {
+        // LinkedIn's invitation manager renders [Ignore, Accept]; the exact
+        // two-button guard keeps this observed fallback scoped to that row.
+        const target = buttons.find(button => labels.has(text(button).toLowerCase()))
+          || buttons[action === 'accept' ? 1 : 0];
+        target.click();
+        return {
+          found: true,
+          clicked: true,
+          match_strategy: labels.has(text(target).toLowerCase())
+            ? 'label_text'
+            : 'position',
+          clicked_button: text(target),
+          button_count: buttons.length,
+        };
+      }
+      card = card.parentElement;
+    }
+  }
+  return { found: false, clicked: false, reason: 'invitation_card_not_found' };
+}
+"""
+
 _EXPAND_INVITATION_NOTES_JS = r"""
 () => {
   const buttons = Array.from(
@@ -1555,6 +1670,18 @@ def _normalize_invitation_username(value: str) -> str:
     if match:
         return match.group(1).strip("/")
     return path_or_username.split("?", 1)[0].split("#", 1)[0].strip("/")
+
+
+def _is_invitation_message_url(value: str) -> bool:
+    """Return whether value is a relative invitation compose URL."""
+    parsed = urlparse(value)
+    return bool(
+        not parsed.scheme
+        and not parsed.netloc
+        and parsed.path == "/messaging/compose/"
+        and parsed.query
+        and not parsed.fragment
+    )
 
 
 def _invitation_manager_url(kind: Literal["received", "sent"]) -> str:
@@ -2771,13 +2898,20 @@ class LinkedInExtractor:
         position: Literal["top", "bottom"],
         attempts: int,
         pause_time: float = 0.5,
+        root: Any | None = None,
     ) -> None:
-        """Scroll the largest scrollable region inside main when one exists."""
-        for _ in range(attempts):
-            await self._page.evaluate(
-                """({ position }) => {
-                    const main = document.querySelector('main');
-                    if (!main) return false;
+        """Scroll the largest scrollable region inside root when one exists."""
+        script = """(startOrInput, input) => {
+                    const start = input ? startOrInput : null;
+                    const { position } = input || startOrInput;
+                    const root = start
+                        ? (
+                            start.closest('[role="dialog"]')
+                            || start.closest('main')
+                            || start
+                        )
+                        : document.querySelector('main');
+                    if (!root) return false;
 
                     const isScrollable = element => {
                         const style = window.getComputedStyle(element);
@@ -2787,15 +2921,18 @@ class LinkedInExtractor:
                         );
                     };
 
-                    const candidates = [main, ...main.querySelectorAll('*')].filter(isScrollable);
+                    const candidates = [root, ...root.querySelectorAll('*')].filter(isScrollable);
                     const target = candidates.sort(
                         (left, right) => right.scrollHeight - left.scrollHeight
-                    )[0] || main;
+                    )[0] || root;
                     target.scrollTop = position === 'top' ? 0 : target.scrollHeight;
                     return true;
-                }""",
-                {"position": position},
-            )
+                }"""
+        for _ in range(attempts):
+            if root is not None:
+                await root.evaluate(script, {"position": position})
+            else:
+                await self._page.evaluate(script, {"position": position})
             await asyncio.sleep(pause_time)
 
     async def extract_feed(
@@ -5623,14 +5760,86 @@ class LinkedInExtractor:
     def _strip_select_conversation_prefix(cls, aria_label: str) -> str:
         return cls._SELECT_CONVERSATION_PREFIX_RE.sub("", aria_label).strip()
 
+    async def _open_conversation_surface(
+        self,
+        linkedin_username: str | None = None,
+        thread_id: str | None = None,
+        message_url: str | None = None,
+        index: int = 0,
+    ) -> Any | None:
+        """Open a conversation and return its dialog root, if any."""
+        if not linkedin_username and not thread_id and not message_url:
+            raise LinkedInScraperException(
+                "Provide at least one of linkedin_username or thread_id"
+            )
+        if message_url and not linkedin_username:
+            raise LinkedInScraperException(
+                "linkedin_username is required with message_url"
+            )
+        if message_url and thread_id:
+            raise LinkedInScraperException(
+                "message_url cannot be combined with thread_id"
+            )
+        if message_url and not _is_invitation_message_url(message_url):
+            raise LinkedInScraperException(
+                "message_url must be a relative /messaging/compose/ path "
+                "with a query string"
+            )
+
+        conversation_root = None
+        if message_url:
+            await self._navigate_to_page(
+                f"https://www.linkedin.com/in/{linkedin_username}/"
+            )
+            await detect_rate_limit(self._page)
+            await self._wait_for_main_text(log_context="Invitation sender profile")
+            await handle_modal_close(self._page)
+            display_name = await self._read_profile_display_name()
+            if not await self._open_invitation_message_compose(
+                linkedin_username or "",
+                message_url,
+            ):
+                raise LinkedInScraperException(
+                    "LinkedIn did not expose the requested invitation conversation"
+                )
+            if await self._wait_for_message_surface() != "composer":
+                raise LinkedInScraperException(
+                    "LinkedIn did not expose a usable invitation conversation"
+                )
+            conversation_root = await self._resolve_recipient_message_compose_box(
+                display_name or "",
+                linkedin_username or "",
+            )
+            if conversation_root is None:
+                raise LinkedInScraperException(
+                    "Invitation conversation recipient did not match "
+                    "the requested profile"
+                )
+        elif thread_id:
+            await self._navigate_to_page(
+                f"https://www.linkedin.com/messaging/thread/{thread_id}/"
+            )
+        else:
+            await self._open_conversation_by_username(
+                linkedin_username or "", index=index
+            )
+
+        if not message_url:
+            await detect_rate_limit(self._page)
+            await self._wait_for_main_text(log_context="Conversation")
+            await handle_modal_close(self._page)
+
+        return conversation_root
+
     async def get_conversation(
         self,
         linkedin_username: str | None = None,
         thread_id: str | None = None,
+        message_url: str | None = None,
         index: int = 0,
         max_scrolls: int = 3,
     ) -> dict[str, Any]:
-        """Read a specific messaging conversation by thread ID or username.
+        """Read a conversation by thread ID, username, or invitation URL.
 
         ``index`` (0-based) selects which thread to open when a participant has
         multiple conversation threads — e.g. an organic 1-on-1 plus a separate
@@ -5658,35 +5867,84 @@ class LinkedInExtractor:
         in the LinkedIn UI and may mark it as read. Pass ``thread_id`` directly
         to skip this enumeration.
         """
-        if not linkedin_username and not thread_id:
-            raise LinkedInScraperException(
-                "Provide at least one of linkedin_username or thread_id"
-            )
-
-        if thread_id:
-            await self._navigate_to_page(
-                f"https://www.linkedin.com/messaging/thread/{thread_id}/"
-            )
-        else:
-            await self._open_conversation_by_username(
-                linkedin_username or "", index=index
-            )
-
-        await detect_rate_limit(self._page)
-        await self._wait_for_main_text(log_context="Conversation")
-        await handle_modal_close(self._page)
+        conversation_root = await self._open_conversation_surface(
+            linkedin_username=linkedin_username,
+            thread_id=thread_id,
+            message_url=message_url,
+            index=index,
+        )
         if max_scrolls > 0:
             await self._scroll_main_scrollable_region(
-                position="top", attempts=max_scrolls, pause_time=0.5
+                position="top",
+                attempts=max_scrolls,
+                pause_time=0.5,
+                root=conversation_root,
             )
 
-        messages, members = await extract_conversation(self._page)
+        messages, members = await extract_conversation(
+            self._page, root=conversation_root
+        )
         return {
             "url": self._page.url,
             "sections": {
                 "messages": messages,
                 "members": members,
             },
+        }
+
+    async def archive_conversation(
+        self,
+        linkedin_username: str | None = None,
+        thread_id: str | None = None,
+        message_url: str | None = None,
+        index: int = 0,
+    ) -> dict[str, Any]:
+        """Open a conversation and archive it from LinkedIn's actions menu."""
+        conversation_root = await self._open_conversation_surface(
+            linkedin_username=linkedin_username,
+            thread_id=thread_id,
+            message_url=message_url,
+            index=index,
+        )
+        result = (
+            await conversation_root.evaluate(_ARCHIVE_CONVERSATION_JS)
+            if conversation_root is not None
+            else await self._page.evaluate(_ARCHIVE_CONVERSATION_JS)
+        )
+        if not isinstance(result, dict):
+            result = {"clicked": False, "verified": False}
+
+        clicked = bool(result.get("clicked"))
+        verified = bool(result.get("verified"))
+        already_archived = bool(result.get("alreadyArchived"))
+        status = (
+            "archived"
+            if verified
+            else "verification_failed"
+            if clicked
+            else "action_unavailable"
+        )
+        message = (
+            "Conversation was already archived."
+            if already_archived
+            else {
+                "archived": "Conversation archived.",
+                "verification_failed": (
+                    "Archive was clicked, but the conversation menu did not "
+                    "change to Restore."
+                ),
+                "action_unavailable": (
+                    "Could not find the Archive conversation action."
+                ),
+            }[status]
+        )
+        return {
+            "url": self._page.url,
+            "status": status,
+            "message": message,
+            "archived": verified,
+            "performed": clicked,
+            "already_archived": already_archived,
         }
 
     async def search_conversations(
@@ -5828,14 +6086,7 @@ class LinkedInExtractor:
         """
         profile_url = f"https://www.linkedin.com/in/{linkedin_username}/"
         if compose_url is not None:
-            parsed_compose_url = urlparse(compose_url)
-            if (
-                parsed_compose_url.scheme
-                or parsed_compose_url.netloc
-                or parsed_compose_url.path != "/messaging/compose/"
-                or not parsed_compose_url.query
-                or parsed_compose_url.fragment
-            ):
+            if not _is_invitation_message_url(compose_url):
                 return self._message_action_result(
                     profile_url,
                     "message_unavailable",
@@ -6556,6 +6807,87 @@ class LinkedInExtractor:
             )
         )
 
+    async def _respond_via_received_invitations(
+        self,
+        username: str,
+        action: Literal["accept", "ignore"],
+    ) -> dict[str, Any]:
+        """Handle profile states that render incoming invitations as Pending."""
+        from linkedin_mcp_server.scraping.connection import INCOMING_REQUEST_LABELS
+
+        url = _invitation_manager_url("received")
+        profile_url = f"/in/{username}/"
+        pending = await self.get_pending_invitations(limit=100, kind="received")
+
+        def has_target(invitations: Any) -> bool:
+            return isinstance(invitations, list) and any(
+                isinstance(invitation, dict)
+                and _normalize_invitation_username(
+                    ((invitation.get("sender") or {}).get("url") or "")
+                )
+                == username
+                for invitation in invitations
+            )
+
+        if not has_target(pending.get("invitations")):
+            return _invitation_action_result(
+                url,
+                "not_found",
+                f"No received connection request found for {username}.",
+                action=action,
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+
+        labels = [
+            pair[0 if action == "accept" else 1]
+            for pair in INCOMING_REQUEST_LABELS.values()
+        ]
+        try:
+            click_result = await self._page.evaluate(
+                _CLICK_RECEIVED_INVITATION_ACTION_JS,
+                {
+                    "username": username,
+                    "action": action,
+                    "target_labels": labels,
+                },
+            )
+        except Exception:
+            logger.debug("Invitation-manager %s click failed", action, exc_info=True)
+            click_result = {"clicked": False}
+        if not isinstance(click_result, dict) or not click_result.get("clicked"):
+            return _invitation_action_result(
+                url,
+                "action_unavailable",
+                f"Could not click the {action} button for {username}.",
+                action=action,
+                linkedin_username=username,
+                profile_url=profile_url,
+            )
+
+        await asyncio.sleep(0.5)
+        refreshed = await self.get_pending_invitations(limit=100, kind="received")
+        if not has_target(refreshed.get("invitations")):
+            return _invitation_action_result(
+                url,
+                self._INCOMING_SUCCESS_STATUS[action],
+                f"Invitation {self._INCOMING_SUCCESS_STATUS[action]}.",
+                action=action,
+                linkedin_username=username,
+                profile_url=profile_url,
+                performed=True,
+            )
+
+        return _invitation_action_result(
+            url,
+            "verification_failed",
+            f"Clicked {action}, but {username} still appears in received invitations.",
+            action=action,
+            linkedin_username=username,
+            profile_url=profile_url,
+            performed=True,
+        )
+
     async def _respond_to_incoming_invitation(
         self,
         linkedin_username: str,
@@ -6620,6 +6952,8 @@ class LinkedInExtractor:
                 linkedin_username=username,
                 profile_url=profile_url,
             )
+        if state == "pending":
+            return await self._respond_via_received_invitations(username, action)
         if state != "incoming_request":
             return _invitation_action_result(
                 url,

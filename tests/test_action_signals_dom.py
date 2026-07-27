@@ -21,6 +21,7 @@ from patchright.async_api import async_playwright
 
 from linkedin_mcp_server.scraping.extractor import (
     _ACTION_SIGNALS_JS,
+    _ARCHIVE_CONVERSATION_JS,
     _CLICK_INCOMING_ACCEPT_JS,
 )
 
@@ -240,3 +241,61 @@ class TestClickIncomingAccept:
         await dom_page.set_content(_page_html(FOLLOW_ONLY_TOP_CARD, VIDEO_PLAYER_BAR))
         clicked = await dom_page.evaluate(_CLICK_INCOMING_ACCEPT_JS)
         assert clicked is False
+
+
+async def test_archive_conversation_verifies_restore_and_is_idempotent(dom_page):
+    await dom_page.set_content(
+        """
+        <main>
+          <div id="wrong" role="dialog">
+            <div class="editor"></div>
+            <div data-event-urn="urn:li:msg_message:1">Wrong message</div>
+            <button aria-expanded="false" onclick="toggleMenu('wrong')">...</button>
+            <div class="menu"></div>
+          </div>
+          <div id="target" role="dialog">
+            <div class="editor"></div>
+            <div data-event-urn="urn:li:msg_message:2">Target message</div>
+            <button aria-expanded="false" onclick="toggleMenu('target')">...</button>
+            <div class="menu"></div>
+          </div>
+        </main>
+        <script>
+          function toggleMenu(id) {
+            const dialog = document.getElementById(id);
+            const options = dialog.querySelector('button');
+            const menu = dialog.querySelector('.menu');
+            const open = options.getAttribute('aria-expanded') !== 'true';
+            options.setAttribute('aria-expanded', String(open));
+            menu.innerHTML = open
+              ? `<div role="button" onclick="
+                  archiveDialog('${id}');
+                ">${dialog.dataset.archived ? 'Restore' : 'Archive'}</div>`
+              : '';
+          }
+          function archiveDialog(id) {
+            const dialog = document.getElementById(id);
+            dialog.dataset.archived = 'true';
+            dialog.querySelector('button').setAttribute('aria-expanded', 'false');
+            dialog.querySelector('.menu').innerHTML = '';
+          }
+        </script>
+        """
+    )
+
+    target = dom_page.locator("#target .editor")
+    first = await target.evaluate(_ARCHIVE_CONVERSATION_JS)
+    second = await target.evaluate(_ARCHIVE_CONVERSATION_JS)
+
+    assert first == {
+        "clicked": True,
+        "verified": True,
+        "alreadyArchived": False,
+    }
+    assert second == {
+        "clicked": False,
+        "verified": True,
+        "alreadyArchived": True,
+    }
+    assert await dom_page.locator("#wrong").get_attribute("data-archived") is None
+    assert await dom_page.locator("#target").get_attribute("data-archived") == "true"

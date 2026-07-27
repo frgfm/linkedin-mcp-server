@@ -37,6 +37,7 @@ def _make_mock_extractor(scrape_result: dict) -> MagicMock:
     mock.get_sidebar_profiles = AsyncMock(return_value=scrape_result)
     mock.get_inbox = AsyncMock(return_value=scrape_result)
     mock.get_conversation = AsyncMock(return_value=scrape_result)
+    mock.archive_conversation = AsyncMock(return_value=scrape_result)
     mock.search_conversations = AsyncMock(return_value=scrape_result)
     mock.send_message = AsyncMock(return_value=scrape_result)
     mock.get_pending_invitations = AsyncMock(return_value=scrape_result)
@@ -789,8 +790,67 @@ class TestMessagingTools:
         mock_extractor.get_conversation.assert_awaited_once_with(
             linkedin_username="testuser",
             thread_id=None,
+            message_url=None,
             index=0,
             max_scrolls=3,
+        )
+
+    async def test_get_invitation_conversation_success(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/",
+            "sections": {"messages": [], "members": []},
+        }
+        mock_extractor = _make_mock_extractor(expected)
+        message_url = "/messaging/compose/?recipient=ACoAAB&invitation=urn"
+
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "get_conversation")
+        await tool_fn(
+            mock_context,
+            linkedin_username="testuser",
+            message_url=message_url,
+            extractor=mock_extractor,
+        )
+
+        mock_extractor.get_conversation.assert_awaited_once_with(
+            linkedin_username="testuser",
+            thread_id=None,
+            message_url=message_url,
+            index=0,
+            max_scrolls=3,
+        )
+
+    async def test_archive_conversation_success(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/messaging/",
+            "status": "archived",
+            "archived": True,
+            "performed": True,
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "archive_conversation")
+        result = await tool_fn(
+            mock_context,
+            thread_id="thread-123",
+            extractor=mock_extractor,
+        )
+
+        assert result["status"] == "archived"
+        mock_extractor.archive_conversation.assert_awaited_once_with(
+            linkedin_username=None,
+            thread_id="thread-123",
+            message_url=None,
+            index=0,
         )
 
     async def test_search_conversations_success(self, mock_context):

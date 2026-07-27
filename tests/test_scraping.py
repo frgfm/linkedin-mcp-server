@@ -18,6 +18,7 @@ from linkedin_mcp_server.scraping.connection import (
 from linkedin_mcp_server.scraping.extractor import (
     ExtractedSection,
     LinkedInExtractor,
+    _ARCHIVE_CONVERSATION_JS,
     _CONNECTION_CARDS_JS,
     _FEED_POSTS_JS,
     _INVITATION_CARDS_JS,
@@ -5297,6 +5298,34 @@ class TestInvitationManagement:
         assert result["performed"] is False
         evaluate_mock.assert_not_awaited()
 
+    async def test_pending_profile_falls_back_to_received_invitations(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        stack, _, evaluate_mock = self._patch_incoming_profile_pipeline(
+            extractor, state="pending"
+        )
+        invitation = {"sender": {"url": "/in/alice/"}}
+        with (
+            stack,
+            patch.object(
+                extractor,
+                "get_pending_invitations",
+                new_callable=AsyncMock,
+                side_effect=[
+                    {"invitations": [invitation]},
+                    {"invitations": []},
+                ],
+            ) as get_pending,
+        ):
+            result = await extractor.act_on_invitation("alice", "ignore")
+
+        assert result["status"] == "ignored"
+        assert result["performed"] is True
+        assert result["url"].endswith("/invitation-manager/received/")
+        assert get_pending.await_count == 2
+        get_pending.assert_awaited_with(limit=100, kind="received")
+        assert evaluate_mock.await_args.args[1]["username"] == "alice"
+        assert evaluate_mock.await_args.args[1]["action"] == "ignore"
+
     async def test_respond_to_incoming_action_unavailable_when_click_fails(
         self, mock_page
     ):
@@ -5844,6 +5873,126 @@ class TestGetConversation:
         with pytest.raises(LinkedInScraperException):
             await extractor.get_conversation()
 
+    async def test_reads_invitation_conversation_from_compose_dialog(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        message_url = "/messaging/compose/?recipient=ACoAAB&invitation=urn"
+        messages = [
+            {
+                "timestamp": "2026-07-27T13:13:00",
+                "status": "sent",
+                "sender": 1,
+                "content": "Hello!",
+            }
+        ]
+        members = [
+            {"kind": "person", "is_self": True},
+            {
+                "kind": "person",
+                "url": "/in/gautier/",
+                "name": "Gautier",
+                "is_self": False,
+            },
+        ]
+        compose_root = MagicMock()
+
+        with (
+            patch.object(
+                extractor, "_navigate_to_page", new_callable=AsyncMock
+            ) as navigate,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor,
+                "_read_profile_display_name",
+                new_callable=AsyncMock,
+                return_value="Gautier",
+            ),
+            patch.object(
+                extractor,
+                "_open_invitation_message_compose",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as open_compose,
+            patch.object(
+                extractor,
+                "_wait_for_message_surface",
+                new_callable=AsyncMock,
+                return_value="composer",
+            ),
+            patch.object(
+                extractor,
+                "_resolve_recipient_message_compose_box",
+                new_callable=AsyncMock,
+                return_value=compose_root,
+            ),
+            patch.object(
+                extractor,
+                "_scroll_main_scrollable_region",
+                new_callable=AsyncMock,
+            ) as scroll,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.extract_conversation",
+                new_callable=AsyncMock,
+                return_value=(messages, members),
+            ) as extract,
+        ):
+            result = await extractor.get_conversation(
+                linkedin_username="gautier",
+                message_url=message_url,
+            )
+
+        navigate.assert_awaited_once_with("https://www.linkedin.com/in/gautier/")
+        open_compose.assert_awaited_once_with("gautier", message_url)
+        scroll.assert_awaited_once_with(
+            position="top",
+            attempts=3,
+            pause_time=0.5,
+            root=compose_root,
+        )
+        extract.assert_awaited_once_with(
+            mock_page,
+            root=compose_root,
+        )
+        assert result["sections"] == {"messages": messages, "members": members}
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            (
+                {"message_url": "/messaging/compose/?recipient=ACoAAB"},
+                "linkedin_username is required",
+            ),
+            (
+                {
+                    "linkedin_username": "gautier",
+                    "thread_id": "abc123",
+                    "message_url": "/messaging/compose/?recipient=ACoAAB",
+                },
+                "cannot be combined",
+            ),
+            (
+                {
+                    "linkedin_username": "gautier",
+                    "message_url": "https://example.com/messaging/compose/?recipient=x",
+                },
+                "relative /messaging/compose/",
+            ),
+        ],
+    )
+    async def test_rejects_invalid_invitation_conversation_args(
+        self, mock_page, kwargs, message
+    ):
+        extractor = LinkedInExtractor(mock_page)
+        with pytest.raises(LinkedInScraperException, match=message):
+            await extractor.get_conversation(**kwargs)
+
     async def test_by_username_default_index_picks_first_thread(self, mock_page):
         """get_conversation by username opens the 0th matching thread by default."""
         with _patched_extractor(
@@ -5897,6 +6046,88 @@ class TestGetConversation:
                 await ext.get_conversation(linkedin_username="jacki-old")
 
 
+class TestArchiveConversation:
+    async def test_opens_then_archives(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "clicked": True,
+                "verified": True,
+                "alreadyArchived": False,
+            }
+        )
+
+        with patch.object(
+            extractor,
+            "_open_conversation_surface",
+            new_callable=AsyncMock,
+            return_value=None,
+        ) as open_conversation:
+            result = await extractor.archive_conversation(thread_id="thread-123")
+
+        assert result["status"] == "archived"
+        assert result["archived"] is True
+        assert result["already_archived"] is False
+        open_conversation.assert_awaited_once_with(
+            linkedin_username=None,
+            thread_id="thread-123",
+            message_url=None,
+            index=0,
+        )
+
+    async def test_already_archived_is_success(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "clicked": False,
+                "verified": True,
+                "alreadyArchived": True,
+            }
+        )
+
+        with patch.object(
+            extractor,
+            "_open_conversation_surface",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            result = await extractor.archive_conversation(thread_id="thread-123")
+
+        assert result["status"] == "archived"
+        assert result["performed"] is False
+        assert result["already_archived"] is True
+        assert result["message"] == "Conversation was already archived."
+
+    async def test_invitation_archive_uses_resolved_dialog(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        compose_root = MagicMock()
+        compose_root.evaluate = AsyncMock(
+            return_value={
+                "clicked": True,
+                "verified": True,
+                "alreadyArchived": False,
+            }
+        )
+
+        with patch.object(
+            extractor,
+            "_open_conversation_surface",
+            new_callable=AsyncMock,
+            return_value=compose_root,
+        ):
+            result = await extractor.archive_conversation(
+                linkedin_username="gautier",
+                message_url="/messaging/compose/?profileUrn=urn%3Ali%3Afsd_profile%3A1",
+            )
+
+        assert result["status"] == "archived"
+        compose_root.evaluate.assert_awaited_once_with(_ARCHIVE_CONVERSATION_JS)
+        mock_page.evaluate.assert_not_awaited()
+        assert "anchor?.closest('[role=\"dialog\"]')" in _ARCHIVE_CONVERSATION_JS
+        assert "const event = root.querySelector(" in _ARCHIVE_CONVERSATION_JS
+        assert "Array.from(root.querySelectorAll(" in _ARCHIVE_CONVERSATION_JS
+
+
 class TestConversationParserHelpers:
     """Unit tests for the conversation parser helpers (no browser needed).
 
@@ -5904,6 +6135,21 @@ class TestConversationParserHelpers:
     normalization, and quoted-reply flattening — the en-US, locale-aware
     pieces of the new ``get_conversation`` pipeline.
     """
+
+    async def test_extract_conversation_uses_dialog_locator(self, mock_page):
+        dialog_locator = MagicMock()
+        dialog_locator.evaluate = AsyncMock(
+            return_value={"events": [], "viewer_urn": None}
+        )
+        mock_page.evaluate = AsyncMock()
+
+        result = await conversation_parser.extract_conversation(
+            mock_page, root=dialog_locator
+        )
+
+        assert result == ([], [])
+        dialog_locator.evaluate.assert_awaited_once()
+        mock_page.evaluate.assert_not_awaited()
 
     def test_normalize_profile_url_strips_origin_and_query(self):
         assert (
