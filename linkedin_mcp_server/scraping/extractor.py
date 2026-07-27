@@ -3946,6 +3946,9 @@ class LinkedInExtractor:
                 profile=page_text,
             )
         if state == "pending":
+            incoming = await self._respond_via_received_invitations(username, "accept")
+            if incoming["status"] != "not_found":
+                return incoming
             return _connection_result(
                 url,
                 "pending",

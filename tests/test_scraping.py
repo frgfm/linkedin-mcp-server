@@ -1519,13 +1519,45 @@ class TestConnectWithPerson:
             patch.object(
                 extractor, "_submit_invite_dialog", new_callable=AsyncMock
             ) as mock_submit,
+            patch.object(
+                extractor,
+                "_respond_via_received_invitations",
+                new_callable=AsyncMock,
+                return_value={"status": "not_found"},
+            ) as mock_accept,
         ):
             result = await extractor.connect_with_person("testuser")
 
         assert result["status"] == "pending"
+        mock_accept.assert_awaited_once_with("testuser", "accept")
         # No write-path side effects.
         mock_nav.assert_not_awaited()
         mock_submit.assert_not_awaited()
+
+    async def test_pending_received_invitation_is_accepted(self, mock_page):
+        """A received invitation can share the outgoing Pending fingerprint."""
+        extractor = LinkedInExtractor(mock_page)
+        text = "Alice\n\nAccept\nIgnore\n"
+
+        with (
+            self._mock_scrape(extractor, text),
+            patch.object(
+                extractor,
+                "_read_action_signals",
+                new_callable=AsyncMock,
+                return_value=self._signals(labeled_anchor=True),
+            ),
+            patch.object(
+                extractor,
+                "_respond_via_received_invitations",
+                new_callable=AsyncMock,
+                return_value={"status": "accepted"},
+            ) as mock_accept,
+        ):
+            result = await extractor.connect_with_person("alice")
+
+        assert result["status"] == "accepted"
+        mock_accept.assert_awaited_once_with("alice", "accept")
 
     async def test_returns_incoming_request_accepted(self, mock_page):
         """Structural detection + structural accept click, German locale."""
