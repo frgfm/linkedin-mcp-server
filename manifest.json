@@ -101,7 +101,11 @@
     },
     {
       "name": "get_conversation",
-      "description": "Read a messaging conversation as a structured list of messages plus participants, by thread ID or LinkedIn username"
+      "description": "Read a messaging conversation as a structured list of messages plus participants, by thread ID, LinkedIn username, or invitation compose URL"
+    },
+    {
+      "name": "archive_conversation",
+      "description": "Archive a LinkedIn conversation by thread ID, username, or invitation compose URL"
     },
     {
       "name": "search_conversations",

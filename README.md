@@ -42,7 +42,8 @@ This MCP server is **free** and **open source**, supported by [**Unipile**](http
 | `connect_with_person` | Send a connection request or accept an incoming one, with optional note | [#407](https://github.com/stickerdaniel/linkedin-mcp-server/issues/407) [#432](https://github.com/stickerdaniel/linkedin-mcp-server/issues/432) [#454](https://github.com/stickerdaniel/linkedin-mcp-server/issues/454) |
 | `get_sidebar_profiles` | Extract profile URLs from sidebar recommendation sections ("More profiles for you", "Explore premium profiles", "People you may know") on a profile page | working |
 | `get_inbox` | List recent conversations from the LinkedIn messaging inbox | working |
-| `get_conversation` | Read a messaging conversation as a structured list of messages plus participants, by username or thread ID | [#434](https://github.com/stickerdaniel/linkedin-mcp-server/issues/434) |
+| `get_conversation` | Read a messaging conversation as a structured list of messages plus participants, by username, thread ID, or invitation compose URL | [#434](https://github.com/stickerdaniel/linkedin-mcp-server/issues/434) |
+| `archive_conversation` | Archive a conversation by username, thread ID, or invitation compose URL | working |
 | `search_conversations` | Search messages by keyword | working |
 | `send_message` | Send a message to a LinkedIn user (requires confirmation) | [#433](https://github.com/stickerdaniel/linkedin-mcp-server/issues/433) [#441](https://github.com/stickerdaniel/linkedin-mcp-server/issues/441) |
 | `message_invitation_sender` | Message a received connection-invitation sender using its invitation compose URL (requires confirmation) | [#613](https://github.com/stickerdaniel/linkedin-mcp-server/issues/613) |
@@ -77,6 +78,9 @@ Month DD, YYYY" line — `null` for other locales or unparseable text).
 `message_invitation_sender` accepts the relative `/messaging/compose/` URL
 exposed by a received invitation plus the sender's `linkedin_username`; set
 `confirm_send=true` to send.
+
+`get_conversation` accepts that same `message_url` with `linkedin_username` to
+read conversations that remain scoped to a pending invitation.
 
 <br/>
 <br/>

@@ -83,6 +83,7 @@ def register_messaging_tools(
         ctx: Context,
         linkedin_username: str | None = None,
         thread_id: str | None = None,
+        message_url: str | None = None,
         index: Annotated[int, Field(ge=0)] = 0,
         max_scrolls: Annotated[int, Field(ge=0, le=20)] = 3,
         extractor: Any | None = None,
@@ -90,7 +91,9 @@ def register_messaging_tools(
         """
         Read a specific messaging conversation as a structured list of messages.
 
-        Provide either linkedin_username or thread_id to identify the conversation.
+        Provide a thread_id, or linkedin_username for inbox lookup. For a
+        pending invitation sender who is not a direct connection, provide
+        linkedin_username plus the message_url from get_pending_invitations.
 
         When looked up by linkedin_username, resolution searches the messaging
         inbox for the participant's display name and click-visits every
@@ -103,6 +106,9 @@ def register_messaging_tools(
             ctx: FastMCP context for progress reporting
             linkedin_username: LinkedIn username of the conversation participant
             thread_id: LinkedIn messaging thread ID
+            message_url: Relative invitation compose URL from
+                get_pending_invitations. Requires linkedin_username and cannot
+                be combined with thread_id.
             index: 0-based selector for which thread to open when the
                 participant has multiple threads (e.g. an organic 1-on-1 plus
                 an InMail). Ignored when thread_id is provided. To enumerate
@@ -120,10 +126,24 @@ def register_messaging_tools(
             ``sent`` and ``deleted`` are reliably emitted today). Timestamp
             and deleted-status parsing are en-US best-effort.
         """
-        if not linkedin_username and not thread_id:
+        if not linkedin_username and not thread_id and not message_url:
             raise_tool_error(
                 LinkedInScraperException(
                     "Provide at least one of linkedin_username or thread_id"
+                ),
+                "get_conversation",
+            )
+        if message_url and not linkedin_username:
+            raise_tool_error(
+                LinkedInScraperException(
+                    "linkedin_username is required with message_url"
+                ),
+                "get_conversation",
+            )
+        if message_url and thread_id:
+            raise_tool_error(
+                LinkedInScraperException(
+                    "message_url cannot be combined with thread_id"
                 ),
                 "get_conversation",
             )
@@ -133,9 +153,11 @@ def register_messaging_tools(
                 ctx, tool_name="get_conversation"
             )
             logger.info(
-                "Fetching conversation: username=%s, thread_id=%s, index=%d, max_scrolls=%d",
+                "Fetching conversation: username=%s, thread_id=%s, "
+                "invitation=%s, index=%d, max_scrolls=%d",
                 linkedin_username,
                 thread_id,
+                message_url is not None,
                 index,
                 max_scrolls,
             )
@@ -147,6 +169,7 @@ def register_messaging_tools(
             result = await extractor.get_conversation(
                 linkedin_username=linkedin_username,
                 thread_id=thread_id,
+                message_url=message_url,
                 index=index,
                 max_scrolls=max_scrolls,
             )
@@ -162,6 +185,73 @@ def register_messaging_tools(
                 raise_tool_error(relogin_exc, "get_conversation")
         except Exception as e:
             raise_tool_error(e, "get_conversation")  # NoReturn
+
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="Archive Conversation",
+        annotations={"destructiveHint": True, "openWorldHint": True},
+        tags={"messaging", "actions"},
+        exclude_args=["extractor"],
+    )
+    async def archive_conversation(
+        ctx: Context,
+        linkedin_username: str | None = None,
+        thread_id: str | None = None,
+        message_url: str | None = None,
+        index: Annotated[int, Field(ge=0)] = 0,
+        extractor: Any | None = None,
+    ) -> dict[str, Any]:
+        """Archive a messaging conversation.
+
+        Identify it by ``thread_id`` or ``linkedin_username``. For a pending
+        invitation conversation, provide ``linkedin_username`` plus the
+        ``message_url`` returned by ``get_pending_invitations``.
+        """
+        if not linkedin_username and not thread_id and not message_url:
+            raise_tool_error(
+                LinkedInScraperException(
+                    "Provide at least one of linkedin_username or thread_id"
+                ),
+                "archive_conversation",
+            )
+        if message_url and not linkedin_username:
+            raise_tool_error(
+                LinkedInScraperException(
+                    "linkedin_username is required with message_url"
+                ),
+                "archive_conversation",
+            )
+        if message_url and thread_id:
+            raise_tool_error(
+                LinkedInScraperException(
+                    "message_url cannot be combined with thread_id"
+                ),
+                "archive_conversation",
+            )
+
+        try:
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="archive_conversation"
+            )
+            logger.info(
+                "Archiving conversation: username=%s, thread_id=%s, invitation=%s",
+                linkedin_username,
+                thread_id,
+                message_url is not None,
+            )
+            return await extractor.archive_conversation(
+                linkedin_username=linkedin_username,
+                thread_id=thread_id,
+                message_url=message_url,
+                index=index,
+            )
+        except AuthenticationError as e:
+            try:
+                await handle_auth_error(e, ctx)
+            except Exception as relogin_exc:
+                raise_tool_error(relogin_exc, "archive_conversation")
+        except Exception as e:
+            raise_tool_error(e, "archive_conversation")  # NoReturn
 
     @mcp.tool(
         timeout=tool_timeout,

@@ -76,17 +76,19 @@ _SHARED_LINK_RE = re.compile(
 )
 
 _EXTRACT_SCRIPT = r"""
-    () => {
+    start => {
         const clean = s => (s || '').replace(/\s+/g, ' ').trim();
-        const inMain = sel => {
-            const main = document.querySelector('main');
-            return main ? Array.from(main.querySelectorAll(sel)) : [];
+        const root = start
+            ? (start.closest('[role="dialog"]') || start.closest('main') || start)
+            : document.querySelector('main');
+        const inRoot = sel => {
+            return root ? Array.from(root.querySelectorAll(sel)) : [];
         };
 
         // Real message events carry a data-event-urn attribute on an
         // inner element. Locale-independent and stable across the chrome
         // <li>s (loader, top-of-list, quick-reply chips) which have none.
-        const eventLis = inMain('li')
+        const eventLis = inRoot('li')
             .filter(li => li.querySelector('[data-event-urn^="urn:li:msg_message:"]'));
 
         const events = eventLis.map(li => {
@@ -436,12 +438,19 @@ def normalize_conversation_events(
     return messages, members
 
 
-async def extract_conversation(page: Page) -> tuple[list[Message], list[Member]]:
+async def extract_conversation(
+    page: Page, root: Any | None = None
+) -> tuple[list[Message], list[Member]]:
     """Pull structured messages + members from the current thread page.
 
     The caller is responsible for navigating to the thread URL and
     waiting for the message list to hydrate. This function only runs
-    the in-page extraction script and normalizes its output.
+    the in-page extraction script and normalizes its output. ``root`` may be
+    a locator inside a messaging dialog; otherwise the parser uses ``main``.
     """
-    raw = await page.evaluate(_EXTRACT_SCRIPT)
+    raw = (
+        await root.evaluate(_EXTRACT_SCRIPT)
+        if root is not None
+        else await page.evaluate(_EXTRACT_SCRIPT, None)
+    )
     return normalize_conversation_events(raw)

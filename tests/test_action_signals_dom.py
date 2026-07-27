@@ -21,6 +21,7 @@ from patchright.async_api import async_playwright
 
 from linkedin_mcp_server.scraping.extractor import (
     _ACTION_SIGNALS_JS,
+    _ARCHIVE_CONVERSATION_JS,
     _CLICK_INCOMING_ACCEPT_JS,
 )
 
@@ -240,3 +241,46 @@ class TestClickIncomingAccept:
         await dom_page.set_content(_page_html(FOLLOW_ONLY_TOP_CARD, VIDEO_PLAYER_BAR))
         clicked = await dom_page.evaluate(_CLICK_INCOMING_ACCEPT_JS)
         assert clicked is False
+
+
+async def test_archive_conversation_verifies_restore_and_is_idempotent(dom_page):
+    await dom_page.set_content(
+        """
+        <main>
+          <div data-event-urn="urn:li:msg_message:1">Message</div>
+          <button id="options" aria-expanded="false" onclick="toggleMenu()">...</button>
+          <div id="menu"></div>
+        </main>
+        <script>
+          let archived = false;
+          function toggleMenu() {
+            const options = document.getElementById('options');
+            const menu = document.getElementById('menu');
+            const open = options.getAttribute('aria-expanded') !== 'true';
+            options.setAttribute('aria-expanded', String(open));
+            menu.innerHTML = open
+              ? `<div role="button" onclick="
+                  archived = true;
+                  document.getElementById('options')
+                    .setAttribute('aria-expanded', 'false');
+                  document.getElementById('menu').innerHTML = '';
+                ">${archived ? 'Restore' : 'Archive'}</div>`
+              : '';
+          }
+        </script>
+        """
+    )
+
+    first = await dom_page.evaluate(_ARCHIVE_CONVERSATION_JS)
+    second = await dom_page.evaluate(_ARCHIVE_CONVERSATION_JS)
+
+    assert first == {
+        "clicked": True,
+        "verified": True,
+        "alreadyArchived": False,
+    }
+    assert second == {
+        "clicked": False,
+        "verified": True,
+        "alreadyArchived": True,
+    }
