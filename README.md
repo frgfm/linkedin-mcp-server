@@ -45,6 +45,7 @@ This MCP server is **free** and **open source**, supported by [**Unipile**](http
 | `get_conversation` | Read a messaging conversation as a structured list of messages plus participants, by username or thread ID | [#434](https://github.com/stickerdaniel/linkedin-mcp-server/issues/434) |
 | `search_conversations` | Search messages by keyword | working |
 | `send_message` | Send a message to a LinkedIn user (requires confirmation) | [#433](https://github.com/stickerdaniel/linkedin-mcp-server/issues/433) [#441](https://github.com/stickerdaniel/linkedin-mcp-server/issues/441) |
+| `message_invitation_sender` | Message a received connection-invitation sender using its invitation compose URL (requires confirmation) | [#613](https://github.com/stickerdaniel/linkedin-mcp-server/issues/613) |
 | `get_pending_invitations` | List pending network invitations from `/mynetwork/invitation-manager/` (`received` or `sent`) | working |
 | `get_connections` | List most recently added 1st-degree connections from `/mynetwork/invite-connect/connections/` | working |
 | `ignore_connection_request` | Ignore a received connection request, identified by `linkedin_username` | working |
@@ -72,6 +73,10 @@ with `invitation_age` and `recipient` (`name`, `url`, `headline`).
 first. Each connection has `name`, `url` (relative `/in/<slug>/`), `headline`,
 and `connected_on` (ISO date `YYYY-MM-DD`, parsed from the en-US "Connected on
 Month DD, YYYY" line — `null` for other locales or unparseable text).
+
+`message_invitation_sender` accepts the relative `/messaging/compose/` URL
+exposed by a received invitation plus the sender's `linkedin_username`; set
+`confirm_send=true` to send.
 
 <br/>
 <br/>

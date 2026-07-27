@@ -4292,6 +4292,20 @@ class LinkedInExtractor:
         """Wait for the usable LinkedIn message composer to appear."""
         return await self._resolve_message_compose_box() is not None
 
+    async def _resolve_recipient_message_compose_box(
+        self, *candidates: str
+    ) -> Any | None:
+        """Wait for the newest compose box to identify the intended recipient."""
+        for _ in range(20):
+            compose_box = await self._resolve_message_compose_box()
+            if compose_box is not None and await self._compose_page_matches_recipient(
+                compose_box,
+                *candidates,
+            ):
+                return compose_box
+            await asyncio.sleep(0.25)
+        return None
+
     async def _resolve_message_compose_box(self) -> Any | None:
         """Resolve the visible compose box used for writing a LinkedIn message.
 
@@ -4340,43 +4354,27 @@ class LinkedInExtractor:
 
         return None
 
-    async def _compose_page_matches_recipient(self, *candidates: str) -> bool:
-        """Verify the compose page visibly identifies the intended recipient."""
+    async def _compose_page_matches_recipient(
+        self, compose_box: Any, *candidates: str
+    ) -> bool:
+        """Verify the resolved compose dialog identifies the intended recipient."""
         normalized_candidates = [value.strip() for value in candidates if value.strip()]
         if not normalized_candidates:
             return False
 
-        matched = await self._page.evaluate(
-            """({ candidates }) => {
+        matched = await compose_box.evaluate(
+            """(editor, { candidates }) => {
                 const normalize = value =>
                     (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                const isVisible = element =>
-                    !!(
-                        element &&
-                        (element.offsetWidth ||
-                            element.offsetHeight ||
-                            element.getClientRects().length)
-                    );
-
-                const targetValues = candidates.map(normalize).filter(Boolean);
-                const root = document.querySelector('main') || document.body;
+                const root =
+                    editor.closest('[role="dialog"]') || editor.closest('form');
                 if (!root) return false;
-
-                const entries = Array.from(
-                    root.querySelectorAll(
-                        'button, [role="button"], a, span, div, li, p, h1, h2, h3'
-                    )
-                )
-                    .filter(isVisible)
-                    .map(element =>
-                        [
-                            normalize(element.innerText || element.textContent || ''),
-                            normalize(element.getAttribute('aria-label') || ''),
-                        ].filter(Boolean)
-                    )
-                    .flat();
-
-                return targetValues.some(candidate =>
+                const entries = [
+                    normalize(root.innerText),
+                    ...Array.from(root.querySelectorAll('[aria-label]'))
+                        .map(element => normalize(element.getAttribute('aria-label'))),
+                ].filter(Boolean);
+                return candidates.map(normalize).filter(Boolean).some(candidate =>
                     entries.some(entry => entry === candidate || entry.includes(candidate))
                 );
             }""",
@@ -4384,24 +4382,34 @@ class LinkedInExtractor:
         )
         return bool(matched)
 
-    async def _message_text_visible(self, message: str) -> bool:
-        """Wait until the compose page visibly contains the just-sent message text.
-
-        Uses the page-level default timeout (``BrowserConfig.default_timeout``).
-        """
-        try:
-            await self._page.wait_for_function(
-                """({ expected }) => {
-                    const normalize = value =>
-                        (value || '').replace(/\\s+/g, ' ').trim();
-                    const bodyText = normalize(document.body?.innerText || '');
-                    return bodyText.includes(normalize(expected));
-                }""",
-                arg={"expected": message},
-            )
-            return True
-        except PlaywrightTimeoutError:
-            return False
+    async def _message_text_visible(self, message: str, compose_box: Any) -> bool:
+        """Confirm the editor cleared and a sent bubble contains ``message``."""
+        for _ in range(20):
+            try:
+                visible = await compose_box.evaluate(
+                    """(editor, expected) => {
+                        const normalize = value =>
+                            (value || '').replace(/\\s+/g, ' ').trim();
+                        const root =
+                            editor.closest('[role="dialog"]') || editor.closest('form');
+                        if (!root) return false;
+                        const messageVisible = Array.from(
+                            root.querySelectorAll('p, div, span')
+                        ).some(element =>
+                            !element.closest('[contenteditable="true"]')
+                            && normalize(element.innerText || element.textContent)
+                                === normalize(expected)
+                        );
+                        return !normalize(editor.innerText) && messageVisible;
+                    }""",
+                    message,
+                )
+                if visible:
+                    return True
+            except Exception:
+                logger.debug("Could not verify sent message", exc_info=True)
+            await asyncio.sleep(0.25)
+        return False
 
     async def _type_message_with_newlines(self, message: str) -> None:
         """Type ``message`` into the focused compose box, preserving newlines.
@@ -5730,6 +5738,74 @@ class LinkedInExtractor:
             references=references,
         )
 
+    async def _open_invitation_message_compose(
+        self,
+        linkedin_username: str,
+        message_url: str,
+    ) -> bool:
+        """Open an invitation's message modal from the received-invitations page."""
+        username = _normalize_invitation_username(linkedin_username)
+        await self._navigate_to_page(_invitation_manager_url("received"))
+        await detect_rate_limit(self._page)
+        await self._wait_for_main_text(log_context="Invitations (received)")
+        await handle_modal_close(self._page)
+        # Invitation links render before LinkedIn attaches their SPA modal handlers.
+        await self._page.wait_for_timeout(2000)
+
+        for attempt in range(20):
+            invitations = await self._extract_invitation_cards(
+                kind="received",
+                limit=100,
+            )
+            matching_invitation = next(
+                (
+                    invitation
+                    for invitation in invitations
+                    if invitation.get("type") == "connection_request"
+                    and invitation.get("message_url") == message_url
+                    and _normalize_invitation_username(
+                        ((invitation.get("sender") or {}).get("url") or "")
+                    )
+                    == username
+                ),
+                None,
+            )
+            if matching_invitation is not None:
+                # DOM access is required to trigger LinkedIn's modal; direct URL
+                # navigation renders an empty compose shell.
+                link_index = await self._page.evaluate(
+                    """({ expected }) => Array.from(
+                        document.querySelectorAll('a[href*="/messaging/compose/"]')
+                    ).findIndex(anchor => {
+                        const url = new URL(
+                            anchor.getAttribute('href'),
+                            location.origin
+                        );
+                        return url.pathname + url.search === expected;
+                    })""",
+                    {"expected": message_url},
+                )
+                if not isinstance(link_index, int) or link_index < 0:
+                    return False
+                try:
+                    await (
+                        self._page.locator('a[href*="/messaging/compose/"]')
+                        .nth(link_index)
+                        .click()
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not click invitation message link",
+                        exc_info=True,
+                    )
+                    return False
+                return True
+
+            if attempt >= 19 or not await self._scroll_invitation_manager_down():
+                break
+
+        return False
+
     async def send_message(
         self,
         linkedin_username: str,
@@ -5737,6 +5813,7 @@ class LinkedInExtractor:
         *,
         confirm_send: bool,
         profile_urn: str | None = None,
+        compose_url: str | None = None,
     ) -> dict[str, Any]:
         """Send a message to a LinkedIn user with explicit confirmation gating.
 
@@ -5746,8 +5823,26 @@ class LinkedInExtractor:
             confirm_send: Must be True to actually send (False does a dry run).
             profile_urn: Optional profile URN (e.g. ACoAAB...) to construct the
                 compose URL directly, bypassing the Message-button lookup.
+            compose_url: Optional relative invitation compose URL returned by
+                ``get_pending_invitations``.
         """
         profile_url = f"https://www.linkedin.com/in/{linkedin_username}/"
+        if compose_url is not None:
+            parsed_compose_url = urlparse(compose_url)
+            if (
+                parsed_compose_url.scheme
+                or parsed_compose_url.netloc
+                or parsed_compose_url.path != "/messaging/compose/"
+                or not parsed_compose_url.query
+                or parsed_compose_url.fragment
+            ):
+                return self._message_action_result(
+                    profile_url,
+                    "message_unavailable",
+                    "Invitation message URL must be a relative "
+                    "/messaging/compose/ path with a query string.",
+                )
+
         await self._navigate_to_page(profile_url)
         await detect_rate_limit(self._page)
 
@@ -5758,38 +5853,51 @@ class LinkedInExtractor:
 
         await handle_modal_close(self._page)
         display_name = await self._read_profile_display_name()
-        if profile_urn:
-            # Build the full compose URL that LinkedIn's own Message button
-            # generates. The minimal ?recipient=<URN> form works for established
-            # connections but shows a "Say hello" widget (no compose box) for new
-            # connections. Adding profileUrn + screenContext + interop=msgOverlay
-            # consistently opens the real composer regardless of connection age.
-            _encoded = quote_plus(f"urn:li:fsd_profile:{profile_urn}")
-            compose_url: str | None = (
-                f"https://www.linkedin.com/messaging/compose/"
-                f"?profileUrn={_encoded}"
-                f"&recipient={profile_urn}"
-                f"&screenContext=NON_SELF_PROFILE_VIEW"
-                f"&interop=msgOverlay"
-            )
+        if compose_url is not None:
+            if not await self._open_invitation_message_compose(
+                linkedin_username,
+                compose_url,
+            ):
+                return self._message_action_result(
+                    profile_url,
+                    "message_unavailable",
+                    "LinkedIn did not expose the requested invitation message action.",
+                )
         else:
-            compose_url = await self._resolve_message_compose_href()
-        if not compose_url:
-            return self._message_action_result(
-                profile_url,
-                "message_unavailable",
-                "LinkedIn did not expose a usable Message action for this profile.",
-            )
+            if profile_urn:
+                # Build the full compose URL that LinkedIn's own Message button
+                # generates. The minimal ?recipient=<URN> form works for established
+                # connections but shows a "Say hello" widget (no compose box) for new
+                # connections. Adding profileUrn + screenContext + interop=msgOverlay
+                # consistently opens the real composer regardless of connection age.
+                _encoded = quote_plus(f"urn:li:fsd_profile:{profile_urn}")
+                compose_url = (
+                    f"https://www.linkedin.com/messaging/compose/"
+                    f"?profileUrn={_encoded}"
+                    f"&recipient={profile_urn}"
+                    f"&screenContext=NON_SELF_PROFILE_VIEW"
+                    f"&interop=msgOverlay"
+                )
+            else:
+                compose_url = await self._resolve_message_compose_href()
+            if not compose_url:
+                return self._message_action_result(
+                    profile_url,
+                    "message_unavailable",
+                    "LinkedIn did not expose a usable Message action for this profile.",
+                )
 
-        await self._navigate_to_page(compose_url)
-        await detect_rate_limit(self._page)
+            await self._navigate_to_page(compose_url)
+            await detect_rate_limit(self._page)
 
-        try:
-            await self._page.wait_for_selector("main")
-        except PlaywrightTimeoutError:
-            logger.debug("Compose page did not fully load for %s", linkedin_username)
+            try:
+                await self._page.wait_for_selector("main")
+            except PlaywrightTimeoutError:
+                logger.debug(
+                    "Compose page did not fully load for %s", linkedin_username
+                )
 
-        await handle_modal_close(self._page)
+            await handle_modal_close(self._page)
         message_surface = await self._wait_for_message_surface()
         logger.debug(
             "Message surface for %s before hydration was %s",
@@ -5822,8 +5930,7 @@ class LinkedInExtractor:
                 message_surface,
             )
 
-        compose_box = await self._resolve_message_compose_box()
-        if compose_box is None:
+        if message_surface is None:
             await self._dismiss_message_ui()
             return self._message_action_result(
                 self._page.url,
@@ -5832,15 +5939,11 @@ class LinkedInExtractor:
                 recipient_selected=recipient_selected,
             )
 
-        logger.debug(
-            "Message compose box resolved for %s after hydration",
-            linkedin_username,
-        )
-
-        if not await self._compose_page_matches_recipient(
+        compose_box = await self._resolve_recipient_message_compose_box(
             display_name or "",
             linkedin_username,
-        ):
+        )
+        if compose_box is None:
             logger.debug(
                 "Recipient match still failed for %s after compose hydration",
                 linkedin_username,
@@ -5865,30 +5968,30 @@ class LinkedInExtractor:
 
         # patchright quirk: compose_box.click() and press_sequentially() use
         # actionability checks internally and hit the same wait_for timeout.
-        # Instead: focus via page.evaluate() (no actionability check) and type
-        # via page.keyboard which operates on the active element directly
-        # and fires the real keydown/input/keyup events React needs to enable Send.
+        # Instead: focus the resolved element via evaluate() (no actionability
+        # check) and type via page.keyboard, which fires the real events React
+        # needs to enable Send.
         #
         # Newlines are emitted as Shift+Enter (see _type_message_with_newlines):
         # plain Enter submits LinkedIn's composer, so a literal "\n" inside
         # keyboard.type() would split a multi-paragraph message into one send
         # per line. See issue #441.
         #
-        # DOM dependency: innerText extraction is not applicable here — we need
-        # to call .focus() on the element reference, which requires querySelector.
-        # Selectors use only role + contenteditable + aria-label (ARIA attributes,
-        # not layout class names) so they are stable across LinkedIn UI changes.
-        focused = await self._page.evaluate(
-            """() => {
-                const el = document.querySelector(
-                    'div[role="textbox"][contenteditable="true"][aria-label*="Write a message"],'
-                    + 'div[role="textbox"][contenteditable="true"]'
-                );
-                if (!el) return false;
-                el.focus();
-                return true;
-            }"""
-        )
+        # DOM dependency: innerText cannot focus an element. The resolved
+        # locator uses role + contenteditable + aria-label, not layout classes.
+        try:
+            focused = await compose_box.evaluate(
+                """el => {
+                    el.focus();
+                    return (
+                        document.activeElement === el
+                        || el.getRootNode().activeElement === el
+                    );
+                }"""
+            )
+        except Exception:
+            logger.debug("Could not focus resolved compose box", exc_info=True)
+            focused = False
         if not focused:
             await self._dismiss_message_ui()
             return self._message_action_result(
@@ -5902,16 +6005,18 @@ class LinkedInExtractor:
         await asyncio.sleep(0.3)
 
         # patchright actionability also blocks send_button.click(). Use JS click
-        # on any visible, enabled send button; fall back to Enter key which
-        # LinkedIn's composer also accepts for submission.
+        # on a visible, enabled send button in this editor's form; fall back to
+        # Enter, which LinkedIn's composer also accepts for submission.
         #
         # DOM dependency: we need btn.click() on the element reference — not
         # achievable via innerText or URL navigation. Selectors use only type,
         # aria-label, and data attributes (no layout class names).
         await asyncio.sleep(1.0)  # allow React to process keyboard input
-        sent_via_js = await self._page.evaluate(
-            """() => {
-                const btn = Array.from(document.querySelectorAll(
+        sent_via_js = await compose_box.evaluate(
+            """editor => {
+                const form = editor.closest('form');
+                if (!form) return false;
+                const btn = Array.from(form.querySelectorAll(
                     'button[type="submit"], button[aria-label*="Send"], button[aria-label*="send"],'
                     + 'button[data-control-name="send"]'
                 )).find(b => !b.disabled && (b.offsetWidth || b.offsetHeight || b.getClientRects().length));
@@ -5923,7 +6028,7 @@ class LinkedInExtractor:
         if not sent_via_js:
             await self._page.keyboard.press("Enter")
 
-        if not await self._message_text_visible(message):
+        if not await self._message_text_visible(message, compose_box):
             await self._dismiss_message_ui()
             return self._message_action_result(
                 self._page.url,
