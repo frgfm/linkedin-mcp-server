@@ -871,6 +871,40 @@ class TestMessagingTools:
             "testuser", "Hello!", confirm_send=True, profile_urn="ACoAAB1IelEB"
         )
 
+    async def test_message_invitation_sender_success(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/messaging/thread/abc123/",
+            "status": "confirmation_required",
+            "message": "Set confirm_send=true to send the message.",
+            "recipient_selected": True,
+            "sent": False,
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "message_invitation_sender")
+        result = await tool_fn(
+            "testuser",
+            "/messaging/compose/?recipient=ACoAAB&invitation=urn",
+            "Hello!",
+            False,
+            mock_context,
+            extractor=mock_extractor,
+        )
+
+        assert result["status"] == "confirmation_required"
+        assert result["sent"] is False
+        mock_extractor.send_message.assert_awaited_once_with(
+            "testuser",
+            "Hello!",
+            confirm_send=False,
+            compose_url="/messaging/compose/?recipient=ACoAAB&invitation=urn",
+        )
+
     async def test_send_message_error(self, mock_context):
         from fastmcp.exceptions import ToolError
 
@@ -1749,6 +1783,7 @@ class TestToolTimeouts:
             "get_conversation",
             "search_conversations",
             "send_message",
+            "message_invitation_sender",
             "get_pending_invitations",
             "get_connections",
             "ignore_connection_request",
@@ -1786,6 +1821,7 @@ class TestToolTimeouts:
             "get_conversation",
             "search_conversations",
             "send_message",
+            "message_invitation_sender",
             "get_pending_invitations",
             "get_connections",
             "ignore_connection_request",
