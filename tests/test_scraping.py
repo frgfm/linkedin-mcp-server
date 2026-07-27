@@ -19,6 +19,7 @@ from linkedin_mcp_server.scraping.extractor import (
     ExtractedSection,
     LinkedInExtractor,
     _CONNECTION_CARDS_JS,
+    _FEED_POSTS_JS,
     _INVITATION_CARDS_JS,
     _CONTENT_DATE_POSTED_MAP,
     _RATE_LIMITED_MSG,
@@ -7335,17 +7336,21 @@ class TestExtractFeedPosts:
             "repost_count": 0,
         }
 
-    async def test_evaluate_exception_returns_empty(self, mock_page):
-        """A failing page.evaluate is swallowed → [] (not propagated)."""
+    def test_fallback_uses_locale_independent_action_structure(self):
+        assert "button[aria-label]" in _FEED_POSTS_JS
+        assert "aria-label*=" not in _FEED_POSTS_JS
+
+    async def test_evaluate_exception_propagates(self, mock_page):
         mock_page.evaluate = AsyncMock(side_effect=RuntimeError("boom"))
         extractor = LinkedInExtractor(mock_page)
-        assert await extractor._extract_feed_posts(10) == []
+        with pytest.raises(RuntimeError, match="boom"):
+            await extractor._extract_feed_posts(10)
 
-    async def test_non_list_result_returns_empty(self, mock_page):
-        """A malformed (non-list) JS result degrades to []."""
+    async def test_non_list_result_raises(self, mock_page):
         mock_page.evaluate = AsyncMock(return_value={"not": "a list"})
         extractor = LinkedInExtractor(mock_page)
-        assert await extractor._extract_feed_posts(10) == []
+        with pytest.raises(TypeError, match="non-list"):
+            await extractor._extract_feed_posts(10)
 
     async def test_respects_limit(self, mock_page):
         raws = [self._raw_post(f"P{i}") for i in range(5)]

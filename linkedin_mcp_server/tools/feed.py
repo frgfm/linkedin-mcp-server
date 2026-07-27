@@ -1,11 +1,9 @@
 """
 LinkedIn feed scraping tool.
 
-Fetches posts from the authenticated user's LinkedIn home feed using
-innerText extraction. Scrolls until the requested number of post
-permalinks have been observed in SDUI pagination responses — a
-locale-independent progress signal, since the feed DOM exposes no
-stable per-post container selector.
+Fetches structured posts from the authenticated user's LinkedIn home feed.
+Scroll progress uses permalinks observed in SDUI pagination responses; post
+fields come from minimal DOM structure plus innerText.
 """
 
 import logging
@@ -65,8 +63,8 @@ def register_feed_tools(
             - section_errors: present when the feed is rate-limited or
               extraction fails.
 
-            Truncated post bodies are not auto-expanded; full text for any
-            post is reachable via its ``url`` permalink.
+            Truncated post bodies are not auto-expanded. Follow the post's
+            ``url`` when present; otherwise use ``references["feed"]``.
         """
         try:
             extractor = extractor or await get_ready_extractor(

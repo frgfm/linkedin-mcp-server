@@ -1134,7 +1134,7 @@ class TestFeedTools:
         mock_extractor = MagicMock()
         mock_extractor.extract_feed = AsyncMock(
             return_value=ExtractedSection(
-                text="Some feed text",
+                text="",
                 references=[
                     {
                         "kind": "feed_post",

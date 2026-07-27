@@ -988,16 +988,16 @@ _FEED_POSTS_JS = r"""
   nodes = nodes.filter(el => !nodes.some(o => o !== el && o.contains(el)));
   if (!nodes.length) {
     // Fallback: LinkedIn renders a visually-hidden "Feed post" heading once
-    // per update — climb from it to the post root (has an actor anchor and a
-    // social footer).
+    // per update — climb from it to the post root (has an actor anchor and at
+    // least four labeled actions).
     const climbed = [];
     for (const h of Array.from(root.querySelectorAll('h2, [role="heading"]'))
       .filter(h => /^feed post$/i.test(normalize(h.textContent)))) {
       let el = h;
       for (let i = 0; i < 8 && el && el !== root; i++) {
         const actor = el.querySelector('a[href*="/in/"], a[href*="/company/"], a[href*="/school/"], a[href*="/showcase/"]');
-        const footer = el.querySelector('[aria-label*="omment" i], [aria-label*="eact" i], [aria-label*="epost" i]');
-        if (actor && footer && normalize(el.innerText).length > 80) { climbed.push(el); break; }
+        const actions = el.querySelectorAll('button[aria-label], [role="button"][aria-label]').length;
+        if (actor && actions >= 4 && normalize(el.innerText).length > 80) { climbed.push(el); break; }
         el = el.parentElement;
       }
     }
@@ -2992,13 +2992,9 @@ class LinkedInExtractor:
         feed's innerText flattens. The classifier leans on URN shapes and
         attribute presence, not layout class names (per AGENTS.md).
         """
-        try:
-            raw_posts = await self._page.evaluate(_FEED_POSTS_JS, {"limit": limit})
-        except Exception:
-            logger.debug("Feed post extraction failed", exc_info=True)
-            return []
+        raw_posts = await self._page.evaluate(_FEED_POSTS_JS, {"limit": limit})
         if not isinstance(raw_posts, list):
-            return []
+            raise TypeError("Feed post extractor returned a non-list result")
         posts: list[FeedPost] = []
         for raw in raw_posts:
             post = _normalize_feed_post(raw)
