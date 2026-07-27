@@ -6,7 +6,12 @@ from fastmcp import FastMCP
 from fastmcp.tools import FunctionTool
 
 from linkedin_mcp_server.callbacks import MCPContextProgressCallback
-from linkedin_mcp_server.scraping.extractor import ExtractedSection, _RATE_LIMITED_MSG
+from linkedin_mcp_server.scraping.extractor import (
+    ExtractedSection,
+    _RATE_LIMITED_MSG,
+    _normalize_feed_post,
+)
+from linkedin_mcp_server.scraping.link_metadata import FeedPost
 
 
 async def get_tool_fn(
@@ -1084,9 +1089,28 @@ class TestGetCompanyEmployeesTool:
 
 class TestFeedTools:
     async def test_get_feed_success(self, mock_context):
+        """sections["feed"] is the structured FeedPost list, not raw text."""
+        posts: list[FeedPost] = [
+            {
+                "url": "/feed/update/urn:li:activity:1/",
+                "post_age": "21min",
+                "author": {
+                    "name": "Sami B",
+                    "profile_url": "/in/sami/",
+                    "headline": "Data scientist",
+                    "degree": "1st",
+                },
+                "content": "Hello world",
+                "is_promoted": False,
+                "media": None,
+                "reactions_count": 1,
+                "comment_count": None,
+                "repost_count": None,
+            }
+        ]
         mock_extractor = MagicMock()
         mock_extractor.extract_feed = AsyncMock(
-            return_value=ExtractedSection(text="Post 1\nPost 2", references=[])
+            return_value=ExtractedSection(text="", references=[], posts=posts)
         )
 
         from linkedin_mcp_server.tools.feed import register_feed_tools
@@ -1097,8 +1121,12 @@ class TestFeedTools:
         tool_fn = await get_tool_fn(mcp, "get_feed")
         result = await tool_fn(mock_context, extractor=mock_extractor)
         assert result["url"] == "https://www.linkedin.com/feed/"
+        # the tool must populate the section key (guards against the else
+        # branch being dropped) ...
         assert "feed" in result["sections"]
-        assert result["sections"]["feed"] == "Post 1\nPost 2"
+        # ... and surface the structured list verbatim.
+        assert result["sections"]["feed"] == posts
+        assert result["sections"]["feed"][0]["author"]["degree"] == "1st"
         assert "posts" not in result
 
     async def test_get_feed_surfaces_references(self, mock_context):
@@ -1106,7 +1134,7 @@ class TestFeedTools:
         mock_extractor = MagicMock()
         mock_extractor.extract_feed = AsyncMock(
             return_value=ExtractedSection(
-                text="Some feed text",
+                text="",
                 references=[
                     {
                         "kind": "feed_post",
@@ -1199,6 +1227,163 @@ class TestFeedTools:
 
         with pytest.raises(ValidationError, match="num_posts"):
             await mcp.call_tool("get_feed", {"num_posts": 51})
+
+
+class TestNormalizeFeedPost:
+    """Python-side normalization of raw cards from _FEED_POSTS_JS."""
+
+    def _raw(self, **overrides: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "url": "/feed/update/urn:li:activity:7/",
+            "post_age": "15h",
+            "author": {
+                "name": "Corentin Hugot",
+                "profile_url": "/in/corentin/",
+                "headline": "Co-founder",
+                "degree": "2nd",
+            },
+            "content": "I applied to YC 5 times",
+            "is_promoted": False,
+            "media": None,
+            "reactions_count": 141,
+            "comment_count": 34,
+            "repost_count": 1,
+        }
+        base.update(overrides)
+        return base
+
+    def test_native_post_round_trips(self):
+        assert _normalize_feed_post(self._raw()) == self._raw()
+
+    def test_sponsored_post_author_shape(self):
+        raw = self._raw(
+            url=None,
+            post_age=None,
+            is_promoted=True,
+            author={
+                "name": "Vanta",
+                "profile_url": "/company/vanta/",
+                "headline": "137,470 followers",
+                "degree": None,
+            },
+            content="Achieve SOC 2 compliance",
+            reactions_count=3,
+            comment_count=None,
+            repost_count=None,
+        )
+        post = _normalize_feed_post(raw)
+        assert post is not None
+        assert post["is_promoted"] is True
+        assert post["author"]["profile_url"] == "/company/vanta/"
+        assert post["author"]["headline"] == "137,470 followers"
+        assert post["author"]["degree"] is None
+        assert post["url"] is None
+        assert post["post_age"] is None
+
+    def test_silent_post_counts_are_none(self):
+        post = _normalize_feed_post(
+            self._raw(reactions_count=None, comment_count=None, repost_count=None)
+        )
+        assert post is not None
+        assert post["reactions_count"] is None
+        assert post["comment_count"] is None
+        assert post["repost_count"] is None
+
+    @pytest.mark.parametrize(
+        "media,expected",
+        [
+            (
+                {"type": "image", "url": "https://media.licdn.com/x.jpg"},
+                {"type": "image", "url": "https://media.licdn.com/x.jpg"},
+            ),
+            (
+                {"type": "video", "url": "https://media.licdn.com/v.mp4"},
+                {"type": "video", "url": "https://media.licdn.com/v.mp4"},
+            ),
+            (
+                {"type": "link", "url": "https://lnkd.in/abc"},
+                {"type": "link", "url": "https://lnkd.in/abc"},
+            ),
+            ({"type": "video", "url": None}, None),  # no src -> dropped
+            ({"type": "bogus", "url": "https://x"}, None),  # bad type
+            (None, None),
+            ("notadict", None),
+        ],
+    )
+    def test_media_normalization(self, media, expected):
+        post = _normalize_feed_post(self._raw(media=media))
+        assert post is not None
+        assert post["media"] == expected
+
+    @pytest.mark.parametrize(
+        "raw_degree,expected",
+        [
+            ("1st", "1st"),
+            ("2nd", "2nd"),
+            ("3rd+", "3rd+"),
+            ("• 1st", "1st"),
+            ("1ST", "1st"),
+            ("", None),
+            ("first", None),
+            (None, None),
+        ],
+    )
+    def test_degree_normalization(self, raw_degree, expected):
+        author = dict(self._raw()["author"], degree=raw_degree)
+        post = _normalize_feed_post(self._raw(author=author))
+        assert post is not None
+        assert post["author"]["degree"] == expected
+
+    @pytest.mark.parametrize(
+        "raw_age,expected",
+        [
+            ("21min", "21min"),
+            ("15h", "15h"),
+            ("1d", "1d"),
+            ("2mo", "2mo"),
+            ("3w", "3w"),
+            ("1y", "1y"),
+            ("21m", None),  # ambiguous bare form; JS emits the long token
+            ("yesterday", None),
+            ("", None),
+            (None, None),
+        ],
+    )
+    def test_age_validation(self, raw_age, expected):
+        post = _normalize_feed_post(self._raw(post_age=raw_age))
+        assert post is not None
+        assert post["post_age"] == expected
+
+    def test_count_coercion(self):
+        post = _normalize_feed_post(
+            self._raw(reactions_count="141", comment_count=-3, repost_count=True)
+        )
+        assert post is not None
+        assert post["reactions_count"] == 141  # numeric string coerced
+        assert post["comment_count"] is None  # negative -> None
+        assert post["repost_count"] is None  # bool rejected
+
+    def test_truncated_content_preserved(self):
+        post = _normalize_feed_post(self._raw(content="line one\nline two"))
+        assert post is not None
+        assert post["content"] == "line one\nline two"
+
+    def test_chrome_with_no_signal_dropped(self):
+        raw = self._raw(
+            url=None,
+            content=None,
+            author={
+                "name": None,
+                "profile_url": None,
+                "headline": None,
+                "degree": None,
+            },
+        )
+        assert _normalize_feed_post(raw) is None
+
+    def test_non_dict_dropped(self):
+        assert _normalize_feed_post("nope") is None
+        assert _normalize_feed_post(None) is None
 
 
 class TestNetworkTools:

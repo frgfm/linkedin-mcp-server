@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 import json
 import logging
@@ -36,6 +36,9 @@ from linkedin_mcp_server.core.utils import (
 )
 from linkedin_mcp_server.scraping.connection import ActionSignals
 from linkedin_mcp_server.scraping.link_metadata import (
+    FeedAuthor,
+    FeedMedia,
+    FeedPost,
     Reference,
     build_references,
     dedupe_references,
@@ -879,6 +882,319 @@ _INVITATION_CARDS_JS = r"""
 }
 """
 
+
+# Structured feed-post extractor. Mirrors _INVITATION_CARDS_JS: discover one
+# container per post, then read each field from a mix of innerText lines
+# (locale-locked en-US, like the rest of the feed) and stable structural
+# signals (data-urn URN shapes, anchor href patterns, aria-label presence,
+# media element tags) — never layout class names. Returns raw dicts that
+# _normalize_feed_post validates Python-side.
+_FEED_POSTS_JS = r"""
+({ limit }) => {
+  const root = document.querySelector('main') || document.body;
+  if (!root) return [];
+
+  const normalize = v => (v || '').replace(/\s+/g, ' ').trim();
+  const linesFrom = el => {
+    const t = el ? (el.innerText || el.textContent || '') : '';
+    return t.split('\n').map(normalize).filter(Boolean);
+  };
+  const linkedInPath = href => {
+    try { const u = new URL(href, location.origin); return `${u.pathname}${u.search}${u.hash}`; }
+    catch { return ''; }
+  };
+  const absUrl = href => { try { return new URL(href, location.origin).href; } catch { return null; } };
+  const isExternal = href => {
+    try {
+      const h = new URL(href, location.origin).host.toLowerCase();
+      // endsWith('linkedin.com') alone would treat notlinkedin.com as internal.
+      return !!h && h !== 'linkedin.com' && !h.endsWith('.linkedin.com');
+    } catch { return false; }
+  };
+  const bestAnchorText = a => {
+    const t = normalize(a.textContent);
+    if (t) return t;
+    return normalize(a.querySelector('img[alt]')?.getAttribute('alt')) || null;
+  };
+  const isImageOnlyAnchor = a => !normalize(a.textContent) && !!a.querySelector('img[alt]');
+  const cleanName = text => {
+    if (!text) return null;
+    const c = normalize(text)
+      .replace(/^view\s+/i, '')
+      .replace(/’/g, "'")
+      .replace(/\s*'s\s+(?:profile|page)\b.*$/i, '')
+      .replace(/\s+profile\s+(?:photo|picture)$/i, '')
+      .replace(/^[•·]+\s*/, '')
+      .trim();
+    return c || null;
+  };
+
+  const DEGREE_RE = /^[·•]?\s*(\d(?:st|nd|rd)\+?)$/i;
+  const AGE_RE = /(?:^|\s)(\d+)\s*(mo|min|m|hr|hrs|h|d|w|wk|y|yr)\b/i;
+  const FOLLOWERS_RE = /^\d[\d,.\s]*\s+followers$/i;
+  // Reaction/social-proof headers render above the actor as "<Name> <verb> this"
+  // — the verb spans every reaction (like/love/celebrate/support/funny/insightful)
+  // plus repost/comment/follow. en-US only (BrowserManager locks the locale).
+  const SOCIAL_PROOF_RE = /(?:likes?|loves?|celebrates?|supports?|reposted|shared|commented on|reacted(?:\s+to)?)\s+this$|\bfinds this (?:funny|insightful|helpful)$|follows? this page$|\breacted$/i;
+  const BADGE_RE = /^(?:premium|verified)\s+(?:profile|member|account)$/i;
+  const MORE_RE = /^(?:…|\.\.\.)\s*more$|^see more$/i;
+  const NOISE = new Set([
+    'Feed post', 'Suggested', 'Promoted', 'Following', 'Follow', '+ Follow',
+    'Connect', 'Message', 'Like', 'Comment', 'Repost', 'Send', 'More',
+    'Show translation', 'Save', 'Saved', 'Report post', 'Copy link to post',
+  ]);
+
+  const ageToken = (n, raw) => {
+    const u = raw.toLowerCase();
+    const unit = u.startsWith('mo') ? 'mo'
+      : (u === 'm' || u.startsWith('min')) ? 'min'
+      : u.startsWith('h') ? 'h'
+      : u.startsWith('d') ? 'd'
+      : u.startsWith('w') ? 'w'
+      : 'y';
+    return `${n}${unit}`;
+  };
+  const feedAge = lines => {
+    // The header age line is short and carries the "•" separator; prefer it
+    // before scanning the rest so body text like "5h of work" can't win.
+    for (const L of lines.slice(0, 10)) {
+      if (!/[•·]/.test(L) && L.length > 24) continue;
+      const m = L.match(AGE_RE); if (m) return ageToken(m[1], m[2]);
+    }
+    for (const L of lines.slice(0, 10)) { const m = L.match(AGE_RE); if (m) return ageToken(m[1], m[2]); }
+    return null;
+  };
+
+  const intFrom = s => { const n = parseInt(String(s).replace(/[^\d]/g, ''), 10); return Number.isFinite(n) ? n : null; };
+  const countFromLabels = (card, re) => {
+    // querySelectorAll is DOM order, so the post-level social bar (which
+    // precedes any expanded comment thread) is matched before comment counts.
+    for (const el of card.querySelectorAll('[aria-label]')) {
+      const m = normalize(el.getAttribute('aria-label')).match(re);
+      if (m) return intFrom(m[1]);
+    }
+    return null;
+  };
+  const countFromLines = (lines, re) => {
+    for (const L of lines) { const m = L.match(re); if (m) return intFrom(m[1]); }
+    return null;
+  };
+
+  // ---- Container discovery: one outermost element per post, by URN shape ----
+  const URN_RE = /urn:li:(?:activity|ugcPost|share):\d+/i;
+  const urnOf = el => el.getAttribute('data-urn') || el.getAttribute('data-id') || '';
+  let nodes = Array.from(root.querySelectorAll('[data-urn], [data-id]'))
+    .filter(el => URN_RE.test(urnOf(el)) || /sponsoredCreative/i.test(urnOf(el)));
+  nodes = nodes.filter(el => !nodes.some(o => o !== el && o.contains(el)));
+  if (!nodes.length) {
+    // Fallback: LinkedIn renders a visually-hidden "Feed post" heading once
+    // per update — climb from it to the post root (has an actor anchor and at
+    // least four labeled actions).
+    const climbed = [];
+    for (const h of Array.from(root.querySelectorAll('h2, [role="heading"]'))
+      .filter(h => /^feed post$/i.test(normalize(h.textContent)))) {
+      let el = h;
+      for (let i = 0; i < 8 && el && el !== root; i++) {
+        const actor = el.querySelector('a[href*="/in/"], a[href*="/company/"], a[href*="/school/"], a[href*="/showcase/"]');
+        const actions = el.querySelectorAll('button[aria-label], [role="button"][aria-label]').length;
+        if (actor && actions >= 4 && normalize(el.innerText).length > 80) { climbed.push(el); break; }
+        el = el.parentElement;
+      }
+    }
+    nodes = climbed.filter(el => !climbed.some(o => o !== el && o.contains(el)));
+  }
+  nodes.sort((a, b) => {
+    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+    return (ra.top - rb.top) || (ra.left - rb.left);
+  });
+
+  const result = [];
+  for (const card of nodes) {
+    const lines = linesFrom(card);
+    const urn = urnOf(card);
+    const anchors = Array.from(card.querySelectorAll('a[href]')).map(a => ({
+      a,
+      path: linkedInPath(a.getAttribute('href') || a.href),
+      href: a.getAttribute('href') || a.href,
+      text: bestAnchorText(a),
+      image_only: isImageOnlyAnchor(a),
+    }));
+    const buttonTexts = new Set(
+      Array.from(card.querySelectorAll('button, [role="button"]')).flatMap(linesFrom)
+    );
+
+    const is_promoted = /sponsoredCreative/i.test(urn) || lines.some(L => /^promoted$/i.test(L));
+
+    // ---- degree (structural: bullet + ordinal; people only) ----
+    let degree = null, degreeIdx = -1;
+    for (let i = 0; i < lines.length && i < 14; i++) {
+      const m = lines[i].match(DEGREE_RE);
+      if (m) { degree = m[1].toLowerCase(); degreeIdx = i; break; }
+    }
+
+    // The actor header sits above the degree/age line. Skip past any
+    // social-proof header ("<Reactor> likes this" — which LinkedIn may split
+    // across two lines, "<Reactor>" then "likes this") so the reactor's name
+    // can't be mistaken for the author or headline. Proof is matched only in
+    // this header window, never the footer's "N others reacted".
+    const ageLineIdx = lines.findIndex(
+      L => AGE_RE.test(L) && (/[•·]/.test(L) || L.length <= 24)
+    );
+    const headerEnd = degreeIdx >= 0
+      ? degreeIdx
+      : (ageLineIdx >= 0 ? ageLineIdx : Math.min(6, lines.length));
+    let headerStart = 0;
+    for (let i = 0; i < headerEnd; i++) {
+      if (SOCIAL_PROOF_RE.test(lines[i])) headerStart = i + 1;
+    }
+
+    // ---- author name from lines: the name sits just above the degree badge,
+    // else the first identity-ish line after the social-proof header ----
+    let authorName = null;
+    if (degreeIdx > 0) {
+      for (let i = degreeIdx - 1; i >= headerStart; i--) {
+        const L = lines[i];
+        if (!L || NOISE.has(L) || buttonTexts.has(L) || BADGE_RE.test(L)) continue;
+        if (SOCIAL_PROOF_RE.test(L)) break;
+        authorName = cleanName(L); if (authorName) break;
+      }
+    }
+    if (!authorName) {
+      for (let i = headerStart; i < lines.length; i++) {
+        const L = lines[i];
+        if (NOISE.has(L) || buttonTexts.has(L) || BADGE_RE.test(L)) continue;
+        if (SOCIAL_PROOF_RE.test(L) || DEGREE_RE.test(L) || FOLLOWERS_RE.test(L)) continue;
+        if (AGE_RE.test(L) && /[•·]/.test(L)) continue;
+        authorName = cleanName(L); if (authorName) break;
+      }
+    }
+
+    // ---- actor anchor (for profile_url): prefer the one whose text matches
+    // the resolved name, so social-proof reactor anchors aren't picked ----
+    const nameNorm = authorName ? normalize(authorName) : null;
+    const matchA = nameNorm && anchors.find(x =>
+      /^\/(?:in|company|showcase|school)\/[^/?#]+/.test(x.path) &&
+      x.text && normalize(cleanName(x.text)) === nameNorm);
+    const personA = anchors.find(x => !x.image_only && /^\/in\/[^/?#]+/.test(x.path));
+    const pageA = anchors.find(x => !x.image_only && /^\/(?:company|showcase|school)\/[^/?#]+/.test(x.path));
+    const actorA = matchA || personA || pageA || null;
+    let profile_url = actorA ? actorA.path.split('?')[0] : null;
+    if (profile_url) {
+      // Canonicalize to the base entity path: the actor anchor sometimes
+      // points at /company/<slug>/posts/ or similar deep links.
+      const baseMatch = profile_url.match(/^(\/(?:in|company|showcase|school)\/[^/?#]+)/);
+      if (baseMatch) profile_url = baseMatch[1] + '/';
+    }
+    const isPage = !!profile_url && /^\/(?:company|showcase|school)\//.test(profile_url);
+
+    // ---- headline ----
+    let headline = null;
+    if (isPage) {
+      headline = lines.find(L => FOLLOWERS_RE.test(L)) || null;
+    } else {
+      // Bound to the header window [headerStart, age) so neither a split
+      // social-proof reactor name above nor the post body below can leak in.
+      const headlineEnd = ageLineIdx >= 0 ? ageLineIdx : lines.length;
+      for (let i = headerStart; i < headlineEnd; i++) {
+        const L = lines[i];
+        if (nameNorm && (L === nameNorm || L.startsWith(nameNorm))) continue;
+        if (NOISE.has(L) || buttonTexts.has(L) || BADGE_RE.test(L)) continue;
+        if (DEGREE_RE.test(L) || SOCIAL_PROOF_RE.test(L) || FOLLOWERS_RE.test(L)) continue;
+        headline = L; break;
+      }
+    }
+
+    const post_age = feedAge(lines);
+
+    // ---- url (relative permalink) ----
+    let url = null;
+    const permA = anchors.find(x => /^\/feed\/update\/[^/?#]+/.test(x.path))
+               || anchors.find(x => /^\/posts\/[^/?#]+/.test(x.path));
+    if (permA) url = permA.path.split('?')[0].split('#')[0];
+    if (!url) {
+      const m = urn.match(/urn:li:(?:activity|ugcPost|share):\d+/i);
+      if (m) url = `/feed/update/${m[0]}/`;
+    }
+
+    // ---- content: body lines between the header and the "see more"/footer.
+    // Cutting at "see more" drops the trailing link-card CTA text cleanly. ----
+    const moreIdx = lines.findIndex(L => MORE_RE.test(L));
+    const footerIdx = lines.findIndex(L =>
+      /^\d[\d,.\s]*\s+(?:reactions?|comments?|reposts?)$/i.test(L) ||
+      /\breacted$/i.test(L) || L === 'Like' || L === 'Comment' || L === 'Repost' || L === 'Send');
+    let startIdx = 0;
+    const ageIdx = ageLineIdx;  // computed once in the header window above
+    if (ageIdx >= 0) {
+      startIdx = ageIdx + 1;
+    } else {
+      const promIdx = lines.findIndex(L => /^promoted$/i.test(L));
+      const folIdx = lines.findIndex(L => FOLLOWERS_RE.test(L));
+      startIdx = Math.max(promIdx, folIdx, degreeIdx) + 1;
+      if (startIdx <= 0 && authorName) {
+        const nIdx = lines.findIndex(L => normalize(L) === nameNorm);
+        startIdx = nIdx >= 0 ? nIdx + 1 : 0;
+      }
+    }
+    let endIdx = moreIdx >= 0 ? moreIdx : (footerIdx >= 0 ? footerIdx : lines.length);
+    if (endIdx < startIdx) endIdx = lines.length;
+    const body = lines.slice(startIdx, endIdx).filter(L =>
+      !NOISE.has(L) && !buttonTexts.has(L) && !BADGE_RE.test(L));
+    const content = body.join('\n').trim() || null;
+
+    // ---- media: first match wins, video > link > image ----
+    let media = null;
+    const video = card.querySelector('video');
+    if (video) {
+      const v = video.getAttribute('src') || video.querySelector('source')?.getAttribute('src') || null;
+      if (v) media = { type: 'video', url: absUrl(v) };
+    }
+    if (!media) {
+      // Link card = external anchor carrying a preview <img>. The <img> guard
+      // avoids matching inline body links (bare <a>, no thumbnail).
+      const linkCard = anchors.find(x => x.href && isExternal(x.href) && x.a.querySelector('img'));
+      if (linkCard) media = { type: 'link', url: absUrl(linkCard.href) };
+    }
+    if (!media) {
+      const img = Array.from(card.querySelectorAll('img')).find(im => {
+        const s = im.currentSrc || im.src || '';
+        return /media\.licdn\.com/i.test(s)
+          && /(feedshare|image-shrink|article-cover|media-proxy)/i.test(s)
+          && (im.naturalWidth || im.width || 0) >= 160;
+      });
+      if (img) media = { type: 'image', url: img.currentSrc || img.src };
+    }
+
+    // ---- engagement counts: aria-label first, then footer text ----
+    let reactions_count = countFromLabels(card, /\b(\d[\d,.\s]*)\s+reactions?\b/i)
+      ?? countFromLines(lines, /^(\d[\d,.\s]*)\s+reactions?$/i);
+    if (reactions_count == null && lines.some(L => /reacted/i.test(L))) {
+      // "Name and N others reacted" -> N + 1 (the named reactor counts too).
+      const rl = lines.find(L => /\band\s+\d[\d,.\s]*\s+others?\b/i.test(L));
+      const m = rl && rl.match(/\band\s+(\d[\d,.\s]*)\s+others?\b/i);
+      const n = m ? intFrom(m[1]) : null;
+      reactions_count = n == null ? null : n + 1;
+    }
+    const comment_count = countFromLabels(card, /\b(\d[\d,.\s]*)\s+comments?\b/i)
+      ?? countFromLines(lines, /^(\d[\d,.\s]*)\s+comments?$/i);
+    const repost_count = countFromLabels(card, /\b(\d[\d,.\s]*)\s+reposts?\b/i)
+      ?? countFromLines(lines, /^(\d[\d,.\s]*)\s+reposts?$/i);
+
+    // Drop chrome that slipped through discovery.
+    if (!authorName && !content && !url) continue;
+
+    result.push({
+      url, post_age,
+      author: { name: authorName, profile_url, headline, degree },
+      content, is_promoted, media,
+      reactions_count, comment_count, repost_count,
+    });
+    if (limit && result.length >= limit) break;
+  }
+  return result;
+}
+"""
+
+
 # Click Accept or Ignore on the recipient's profile page for an incoming
 # invitation. LinkedIn renders both buttons inside the same top-card action
 # root used by withdraw/connect — found via the compose-anchor walk
@@ -1598,11 +1914,24 @@ _NOISE_LINES: list[re.Pattern[str]] = [
 
 @dataclass
 class ExtractedSection:
-    """Text and compact references extracted from a loaded LinkedIn section."""
+    """Text and compact references extracted from a loaded LinkedIn section.
+
+    ``posts`` is populated only by ``extract_feed`` (do not set it in other
+    extractors): a list of structured ``FeedPost`` dicts that replaces the
+    raw-innerText ``text`` blob for the feed. All other sections leave
+    ``posts`` empty and carry their content in ``text``.
+
+    Feed sentinel: the feed path sets ``text=""`` deliberately and puts its
+    payload in ``posts``. Consumers must branch on the section, not on
+    ``if extracted.text`` — an empty ``text`` is not "no content" for the
+    feed. The rate-limit path still uses ``text`` (``_RATE_LIMITED_MSG``),
+    so ``tools/feed.py`` checks that before reading ``posts``.
+    """
 
     text: str
     references: list[Reference]
     error: dict[str, Any] | None = None
+    posts: list[FeedPost] = field(default_factory=list)
 
 
 _FEED_RSC_MARKER = "sduiid=com.linkedin.sdui.pagers.feed.mainFeed"
@@ -1675,6 +2004,99 @@ def _build_feed_references(
     # changing one without the other will drop or duplicate entries
     # silently. Matches get_feed's num_posts ceiling (Field(ge=1, le=50)).
     return dedupe_references(refs, cap=50)
+
+
+# Units must stay in sync with the JS ``ageToken`` helper in _FEED_POSTS_JS
+# (min/h/d/w/mo/y). These tokens are en-US — the JS ``AGE_RE`` reads en-US unit
+# letters and the digit is locale-independent, but the unit set assumes the
+# BrowserManager en-US lock. Add a unit on one side without the other and the
+# JS emits a token this guard rejects → post_age silently becomes None.
+_FEED_AGE_RE = re.compile(r"^\d+(?:min|h|d|w|mo|y)$")
+_FEED_DEGREE_RE = re.compile(r"^(\d(?:st|nd|rd))\+?$")
+
+
+def _normalize_feed_age(value: Any) -> str | None:
+    """Pass through the short age token the JS already normalized.
+
+    The browser-side ``ageToken`` resolves the feed's locale-locked unit
+    (bare ``m`` = minutes, ``mo`` = months) — something the invitation
+    parser can't do unambiguously — so we only validate the shape here.
+    """
+    text = _optional_text(value)
+    if text and _FEED_AGE_RE.match(text):
+        return text
+    return None
+
+
+def _normalize_feed_degree(value: Any) -> str | None:
+    """Validate the connection-distance badge (``"1st"`` / ``"2nd"`` / ``"3rd+"``)."""
+    text = _optional_text(value)
+    if not text:
+        return None
+    token = text.lower().lstrip("·• ").strip()
+    return token if _FEED_DEGREE_RE.match(token) else None
+
+
+def _normalize_feed_count(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    return count if count >= 0 else None
+
+
+def _normalize_feed_media(value: Any) -> FeedMedia | None:
+    if not isinstance(value, dict):
+        return None
+    media_type = _optional_text(value.get("type"))
+    url = _optional_text(value.get("url"))
+    if not url:
+        return None
+    # Explicit branches so the str narrows to FeedMedia's Literal type.
+    if media_type == "link":
+        return {"type": "link", "url": url}
+    if media_type == "image":
+        return {"type": "image", "url": url}
+    if media_type == "video":
+        return {"type": "video", "url": url}
+    return None
+
+
+def _normalize_feed_post(raw: Any) -> FeedPost | None:
+    """Coerce one raw card from ``_FEED_POSTS_JS`` into a ``FeedPost``.
+
+    Mirrors ``_normalize_structured_invitation``: every key is forced to
+    its declared type, and entries with no usable signal (no permalink,
+    no body, no author) are dropped so feed chrome can't leak through.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    raw_author = raw.get("author") if isinstance(raw.get("author"), dict) else {}
+    author: FeedAuthor = {
+        "name": _optional_text(raw_author.get("name")),
+        "profile_url": _optional_text(raw_author.get("profile_url")),
+        "headline": _optional_text(raw_author.get("headline")),
+        "degree": _normalize_feed_degree(raw_author.get("degree")),
+    }
+
+    post: FeedPost = {
+        "url": _optional_text(raw.get("url")),
+        "post_age": _normalize_feed_age(raw.get("post_age")),
+        "author": author,
+        "content": _optional_text(raw.get("content")),
+        "is_promoted": bool(raw.get("is_promoted")),
+        "media": _normalize_feed_media(raw.get("media")),
+        "reactions_count": _normalize_feed_count(raw.get("reactions_count")),
+        "comment_count": _normalize_feed_count(raw.get("comment_count")),
+        "repost_count": _normalize_feed_count(raw.get("repost_count")),
+    }
+
+    if not (post["url"] or post["content"] or author["name"]):
+        return None
+    return post
 
 
 async def _drain_listener_tasks(pending: list[asyncio.Task[None]]) -> None:
@@ -2552,11 +2974,37 @@ class LinkedInExtractor:
                 "Page %s returned only LinkedIn chrome (likely rate-limited)", url
             )
             return ExtractedSection(text=_RATE_LIMITED_MSG, references=[])
-        cleaned = _filter_linkedin_noise_lines(truncated)
-        return ExtractedSection(
-            text=cleaned,
-            references=_build_feed_references(raw_result["references"], captured_urls),
-        )
+        # innerText is no longer surfaced for the feed — sections["feed"] is now
+        # the structured post list, and ExtractedSection.text is left "" (the
+        # feed sentinel; see the dataclass docstring). The _extract_root_content
+        # pass above is NOT redundant: it supplies both the DOM-anchor references
+        # (_build_feed_references) and the chrome-only signal behind soft-rate-
+        # limit detection — neither is recoverable from the post extractor alone.
+        references = _build_feed_references(raw_result["references"], captured_urls)
+        posts = await self._extract_feed_posts(num_posts)
+        return ExtractedSection(text="", references=references, posts=posts)
+
+    async def _extract_feed_posts(self, limit: int) -> list[FeedPost]:
+        """Run the per-post DOM extractor and normalize each card Python-side.
+
+        DOM access is unavoidable here: media element tags, engagement
+        ``aria-label`` counts, and actor anchors are sibling structures the
+        feed's innerText flattens. The classifier leans on URN shapes and
+        attribute presence, not layout class names (per AGENTS.md).
+        """
+        raw_posts = await self._page.evaluate(_FEED_POSTS_JS, {"limit": limit})
+        if not isinstance(raw_posts, list):
+            raise TypeError("Feed post extractor returned a non-list result")
+        posts: list[FeedPost] = []
+        for raw in raw_posts:
+            post = _normalize_feed_post(raw)
+            if post is not None:
+                posts.append(post)
+                # Stop as soon as we have enough *valid* posts; chrome cards
+                # that normalize to None must not count toward the limit.
+                if len(posts) >= limit:
+                    break
+        return posts
 
     async def extract_page(
         self,
