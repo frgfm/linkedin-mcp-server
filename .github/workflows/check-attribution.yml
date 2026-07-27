@@ -14,6 +14,9 @@ on:
 # are deliberately allowed: they are maintenance automation, not authorship
 # claims.
 env:
+  # Internal upstream-sync branches preserve upstream commits verbatim. Check
+  # only their first-parent commits; the imported second parent is trusted.
+  FIRST_PARENT_ONLY: ${{ github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'codex/sync-upstream-') }}
   # Bare identities, matched against a trailer address and against the
   # author/committer fields. The optional digits cover GitHub's
   # "<id>+<handle>@users.noreply.github.com" form, whose id varies per app.
@@ -33,7 +36,9 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          COMMITS=$(git log --format='%H' "origin/${BASE_REF}..${HEAD_SHA}" 2>/dev/null || true)
+          LOG_ARGS=()
+          [ "$FIRST_PARENT_ONLY" = "true" ] && LOG_ARGS+=(--first-parent)
+          COMMITS=$(git log "${LOG_ARGS[@]}" --format='%H' "origin/${BASE_REF}..${HEAD_SHA}" 2>/dev/null || true)
 
           if [ -z "$COMMITS" ]; then
             echo "No commits to check"
@@ -71,7 +76,9 @@ jobs:
           # or committer field instead of adding a trailer, so the check above
           # cannot see them. Written to a file rather than piped so the loop
           # runs in this shell and its result survives.
-          git log --format='%H %ae %ce' "origin/${BASE_REF}..${HEAD_SHA}" > /tmp/authors.txt 2>/dev/null || true
+          LOG_ARGS=()
+          [ "$FIRST_PARENT_ONLY" = "true" ] && LOG_ARGS+=(--first-parent)
+          git log "${LOG_ARGS[@]}" --format='%H %ae %ce' "origin/${BASE_REF}..${HEAD_SHA}" > /tmp/authors.txt 2>/dev/null || true
 
           FOUND=0
           while read -r sha author committer; do
