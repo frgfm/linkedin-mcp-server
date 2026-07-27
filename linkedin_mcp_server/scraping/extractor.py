@@ -4408,7 +4408,6 @@ class LinkedInExtractor:
                     return True
             except Exception:
                 logger.debug("Could not verify sent message", exc_info=True)
-                return False
             await asyncio.sleep(0.25)
         return False
 

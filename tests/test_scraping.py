@@ -7309,7 +7309,7 @@ class TestSendMessageComposerInteraction:
     async def test_sent_message_verification_uses_resolved_composer(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
         compose_box = MagicMock()
-        compose_box.evaluate = AsyncMock(side_effect=[False, True])
+        compose_box.evaluate = AsyncMock(side_effect=[RuntimeError, True])
 
         with patch(
             "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
