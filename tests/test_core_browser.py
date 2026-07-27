@@ -1,11 +1,11 @@
 """Tests for BrowserManager cookie import/export helpers."""
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from linkedin_mcp_server.core.browser import BrowserManager
+from linkedin_mcp_server.core.browser import BrowserManager, _DISABLE_IMAGES_ARG
 
 
 def _make_cookie(
@@ -30,6 +30,32 @@ def _make_browser_manager(tmp_path) -> tuple[BrowserManager, MagicMock]:
     context.storage_state = AsyncMock()
     browser._context = context
     return browser, context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("headless", "blocks_images"), [(True, True), (False, False)])
+async def test_start_blocks_images_only_when_headless(
+    tmp_path, headless, blocks_images
+):
+    context = MagicMock()
+    context.pages = []
+    context.new_page = AsyncMock(return_value=MagicMock())
+    playwright = MagicMock()
+    playwright.chromium.launch_persistent_context = AsyncMock(return_value=context)
+    starter = MagicMock()
+    starter.start = AsyncMock(return_value=playwright)
+
+    with patch(
+        "linkedin_mcp_server.core.browser.async_playwright", return_value=starter
+    ):
+        await BrowserManager(
+            user_data_dir=tmp_path / "profile", headless=headless
+        ).start()
+
+    call = playwright.chromium.launch_persistent_context.await_args
+    assert call is not None
+    options = call.kwargs
+    assert (_DISABLE_IMAGES_ARG in options.get("args", [])) is blocks_images
 
 
 @pytest.mark.asyncio
