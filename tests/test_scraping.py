@@ -6123,6 +6123,9 @@ class TestArchiveConversation:
         assert result["status"] == "archived"
         compose_root.evaluate.assert_awaited_once_with(_ARCHIVE_CONVERSATION_JS)
         mock_page.evaluate.assert_not_awaited()
+        assert "anchor?.closest('[role=\"dialog\"]')" in _ARCHIVE_CONVERSATION_JS
+        assert "const event = root.querySelector(" in _ARCHIVE_CONVERSATION_JS
+        assert "Array.from(root.querySelectorAll(" in _ARCHIVE_CONVERSATION_JS
 
 
 class TestConversationParserHelpers:
