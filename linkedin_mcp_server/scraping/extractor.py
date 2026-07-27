@@ -16,6 +16,9 @@ from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 from linkedin_mcp_server.core import (
     detect_auth_barrier,
     detect_auth_barrier_quick,
+    raise_if_proxy_error,
+    redact_proxy_credentials,
+    redacted_copy,
     resolve_remember_me_prompt,
 )
 from linkedin_mcp_server.core.exceptions import (
@@ -65,8 +68,17 @@ _RATE_LIMITED_MSG = "[Rate limited] LinkedIn blocked this section. Try again lat
 # LinkedIn shows 25 results per page
 _PAGE_SIZE = 25
 
-# Normalization maps for job search filters
-_DATE_POSTED_MAP = {
+_SAVED_JOBS_URL = "https://www.linkedin.com/my-items/saved-jobs/"
+
+# The my-items lists page in 10s, unlike job search. Verified live: ?start=10
+# returns the 11th saved job, while ?start=25 lands past the end of a two-page
+# list and yields nothing.
+_SAVED_JOBS_PAGE_SIZE = 10
+
+# Normalization maps for job search filters. Job search encodes recency as
+# ``f_TPR=r<seconds>``; content search uses named tokens, hence the separate
+# ``_CONTENT_DATE_POSTED_MAP`` below.
+_JOB_DATE_POSTED_MAP = {
     "past_hour": "r3600",
     "past_24_hours": "r86400",
     "past_week": "r604800",
@@ -95,6 +107,29 @@ _JOB_TYPE_MAP = {
 _WORK_TYPE_MAP = {"on_site": "1", "remote": "2", "hybrid": "3"}
 
 _SORT_BY_MAP = {"date": "DD", "relevance": "R"}
+
+# Content (post) search uses literal ``datePosted`` tokens inside a JSON-list
+# facet, e.g. ``datePosted=["past-week"]`` — unlike job search, which uses
+# ``f_TPR=r<seconds>`` codes. The three hyphenated values are LinkedIn's
+# complete set, verified live: the filter dropdown offers exactly Past 24
+# hours / week / month, and anything else is ignored while still being echoed
+# back in the url, so a near-miss spelling returns unfiltered results that
+# look filtered. The underscore keys are this server's own spelling, carried
+# over so ``date_posted`` reads the same here as in ``search_jobs``
+# (``_JOB_DATE_POSTED_MAP``); ``past_hour`` has no content-search equivalent.
+_CONTENT_DATE_POSTED_MAP = {
+    "past-24h": "past-24h",
+    "past_24_hours": "past-24h",
+    "past-week": "past-week",
+    "past_week": "past-week",
+    "past-month": "past-month",
+    "past_month": "past-month",
+}
+
+# Content search is an infinite scroll with no ``&start=`` pagination, so
+# ``max_pages`` caps scroll depth instead of fetching discrete pages. One
+# nominal "page" is this many scrolls.
+_CONTENT_SCROLLS_PER_REQUESTED_PAGE = 5
 
 # Valid tokens for the people-search ``network`` facet.
 # LinkedIn accepts "F" (1st-degree), "S" (2nd-degree), "O" (3rd-degree and beyond).
@@ -1902,7 +1937,11 @@ class LinkedInExtractor:
             "current_url=%s title=%r auth_barrier=%s remember_me=%s hops=%s body_marker=%r",
             target_url,
             wait_until,
-            navigation_error,
+            # Redacted like the traces above: a driver error can quote the
+            # proxy URL, and this log is what users paste into issue reports.
+            redact_proxy_credentials(
+                f"{type(navigation_error).__name__}: {navigation_error}"
+            ),
             self._page.url,
             title,
             auth_barrier,
@@ -1973,6 +2012,11 @@ class LinkedInExtractor:
                     extra={"target_url": url, "wait_until": wait_until},
                 )
             except Exception as exc:
+                # Ahead of the traces below: they record the raw exception text,
+                # which for a proxy failure can quote the proxy URL and land a
+                # password in trace.jsonl. Converting here also keeps a proxy
+                # outage from being reported as a LinkedIn navigation problem.
+                raise_if_proxy_error(exc)
                 if allow_remember_me and await resolve_remember_me_prompt(self._page):
                     await stabilize_navigation(
                         f"remember-me resolution for {url}", logger
@@ -1983,7 +2027,9 @@ class LinkedInExtractor:
                         extra={
                             "target_url": url,
                             "wait_until": wait_until,
-                            "error": f"{type(exc).__name__}: {exc}",
+                            "error": redact_proxy_credentials(
+                                f"{type(exc).__name__}: {exc}"
+                            ),
                             "hops": hops,
                         },
                     )
@@ -1992,7 +2038,9 @@ class LinkedInExtractor:
                         "extractor-after-remember-me",
                         extra={
                             "target_url": url,
-                            "error": f"{type(exc).__name__}: {exc}",
+                            "error": redact_proxy_credentials(
+                                f"{type(exc).__name__}: {exc}"
+                            ),
                         },
                     )
                     unregister_navigation_listener()
@@ -2008,13 +2056,21 @@ class LinkedInExtractor:
                     extra={
                         "target_url": url,
                         "wait_until": wait_until,
-                        "error": f"{type(exc).__name__}: {exc}",
+                        "error": redact_proxy_credentials(
+                            f"{type(exc).__name__}: {exc}"
+                        ),
                         "hops": hops,
                     },
                 )
                 await self._log_navigation_failure(url, wait_until, exc, hops)
                 await self._raise_if_auth_barrier(url, navigation_error=exc)
-                raise
+                # Re-raised as a redacted copy rather than the original: with a
+                # proxy configured, a driver error can quote the proxy URL, and
+                # everything downstream from here logs the exception -- the
+                # catch-all in error_handler, and FastMCP's own handler above
+                # that. Only the message is rewritten; the type is preserved so
+                # callers that branch on it are unaffected.
+                raise redacted_copy(exc) from None
 
             barrier = await detect_auth_barrier_quick(self._page)
             if not barrier:
@@ -2593,8 +2649,15 @@ class LinkedInExtractor:
         # Dismiss any modals blocking content
         await handle_modal_close(self._page)
 
-        # Activity feed pages lazy-load post content after the tab header
-        is_activity = "/recent-activity/" in url
+        # Activity feed pages lazy-load post content after the tab header.
+        # Company posts pages (/company/<slug>/posts/) lazy-load the same way
+        # but don't carry a /recent-activity/ path, so match them too. Matched
+        # on the parsed path, since the url can carry a query string
+        # (?viewAsMember=true) that a raw suffix check would miss.
+        path = urlparse(url).path
+        is_activity = "/recent-activity/" in path or (
+            "/company/" in path and path.rstrip("/").endswith("/posts")
+        )
         if is_activity:
             try:
                 await self._page.wait_for_function(
@@ -4348,7 +4411,7 @@ class LinkedInExtractor:
             params += f"&location={quote_plus(location)}"
 
         if date_posted:
-            mapped = _DATE_POSTED_MAP.get(date_posted.strip(), date_posted)
+            mapped = _JOB_DATE_POSTED_MAP.get(date_posted.strip(), date_posted)
             params += f"&f_TPR={quote_plus(mapped)}"
         if job_type:
             params += f"&f_JT={_normalize_csv(job_type, _JOB_TYPE_MAP)}"
@@ -4509,6 +4572,232 @@ class LinkedInExtractor:
             result["section_errors"] = section_errors
         return result
 
+    async def _extract_saved_jobs_page(
+        self,
+        url: str,
+        section_name: str,
+    ) -> ExtractedSection:
+        """Extract innerText from a saved-jobs page with soft rate-limit retry."""
+        try:
+            result = await self._extract_saved_jobs_page_once(url, section_name)
+            if result.text != _RATE_LIMITED_MSG:
+                return result
+
+            logger.info(
+                "Retrying saved jobs page %s after %.0fs backoff",
+                url,
+                _RATE_LIMIT_RETRY_DELAY,
+            )
+            await asyncio.sleep(_RATE_LIMIT_RETRY_DELAY)
+            result = await self._extract_saved_jobs_page_once(url, section_name)
+            if result.text == _RATE_LIMITED_MSG:
+                logger.warning("Saved jobs page %s still rate-limited after retry", url)
+            return result
+
+        except LinkedInScraperException:
+            raise
+        except Exception as e:
+            logger.warning("Failed to extract saved jobs page %s: %s", url, e)
+            return ExtractedSection(
+                text="",
+                references=[],
+                error=build_issue_diagnostics(
+                    e,
+                    context="extract_saved_jobs_page",
+                    target_url=url,
+                    section_name=section_name,
+                ),
+            )
+
+    async def _extract_saved_jobs_page_once(
+        self,
+        url: str,
+        section_name: str,
+    ) -> ExtractedSection:
+        """Single attempt: navigate, scroll list, and extract innerText."""
+        await self._navigate_to_page(url)
+        await detect_rate_limit(self._page)
+
+        main_found = True
+        try:
+            await self._page.wait_for_selector("main")
+        except PlaywrightTimeoutError:
+            logger.debug("No <main> element found on %s", url)
+            main_found = False
+
+        await handle_modal_close(self._page)
+        if main_found:
+            await scroll_to_bottom(self._page, pause_time=0.5, max_scrolls=5)
+
+        raw_result = await self._extract_root_content(["main"])
+        raw = raw_result["text"]
+        if raw_result["source"] == "body":
+            logger.debug("No <main> at evaluation time on %s, using body fallback", url)
+        elif not main_found:
+            logger.debug(
+                "<main> appeared after wait timeout on %s, scroll was skipped",
+                url,
+            )
+
+        if not raw:
+            return ExtractedSection(text="", references=[])
+        truncated = _truncate_linkedin_noise(raw)
+        if not truncated and raw.strip():
+            logger.warning(
+                "Saved jobs page %s returned only LinkedIn chrome (likely rate-limited)",
+                url,
+            )
+            return ExtractedSection(text=_RATE_LIMITED_MSG, references=[])
+        cleaned = _filter_linkedin_noise_lines(truncated)
+        return ExtractedSection(
+            text=cleaned,
+            references=build_references(raw_result["references"], section_name),
+        )
+
+    async def _get_total_list_pages(self) -> int | None:
+        """Read last page number from artdeco pagination buttons.
+
+        Parses numeric page labels from ``ul.artdeco-pagination__pages``.
+        Returns ``None`` when pagination is absent or unparseable.
+
+        NOTE: This is a deliberate DOM exception, mirroring
+        ``_get_total_search_pages``. The my-items pager exposes no page count
+        in ``innerText`` and no stable attribute to count, so a design-system
+        class is the only reachable signal. The labels are numerals rather
+        than words, so no locale table is needed. A renamed class, or a locale
+        serving non-ASCII numerals that ``parseInt`` cannot read, both yield
+        ``None`` — pagination then falls back to ``max_pages`` and the
+        no-new-ids early stop.
+        """
+        value = await self._page.evaluate(
+            """() => {
+                const buttons = document.querySelectorAll(
+                    'ul.artdeco-pagination__pages li button'
+                );
+                if (!buttons.length) return null;
+                const nums = [...buttons]
+                    .map((b) => parseInt(b.textContent.trim(), 10))
+                    .filter((n) => !Number.isNaN(n));
+                return nums.length ? Math.max(...nums) : null;
+            }"""
+        )
+        return int(value) if value is not None else None
+
+    async def get_saved_jobs(self, max_pages: int = 3) -> dict[str, Any]:
+        """List the authenticated user's saved job postings.
+
+        Navigates to ``/my-items/saved-jobs/``, extracts innerText and job IDs
+        from each page, and paginates with ``?start=`` offsets (10 per step).
+
+        Args:
+            max_pages: Maximum pages to load (1-10, default 3)
+
+        Returns:
+            {url, sections: {saved_jobs: text}, job_ids: [str]}
+        """
+        base_url = _SAVED_JOBS_URL
+        all_job_ids: list[str] = []
+        seen_ids: set[str] = set()
+        page_texts: list[str] = []
+        page_references: list[Reference] = []
+        section_errors: dict[str, dict[str, Any]] = {}
+        total_pages: int | None = None
+        total_pages_queried = False
+
+        for page_num in range(max_pages):
+            if total_pages is not None and page_num >= total_pages:
+                logger.debug("All %d saved-jobs pages fetched, stopping", total_pages)
+                break
+
+            if page_num > 0:
+                await asyncio.sleep(_NAV_DELAY)
+
+            url = (
+                base_url
+                if page_num == 0
+                else f"{base_url}?start={page_num * _SAVED_JOBS_PAGE_SIZE}"
+            )
+
+            try:
+                extracted = await self._extract_saved_jobs_page(
+                    url, section_name="saved_jobs"
+                )
+
+                if not extracted.text or extracted.text == _RATE_LIMITED_MSG:
+                    if extracted.error:
+                        section_errors["saved_jobs"] = extracted.error
+                    break
+
+                if not total_pages_queried:
+                    total_pages_queried = True
+                    try:
+                        total_pages = await self._get_total_list_pages()
+                    except Exception as e:
+                        logger.debug("Could not read saved-jobs page count: %s", e)
+                    else:
+                        if total_pages is not None:
+                            logger.debug(
+                                "LinkedIn reports %d saved-jobs pages", total_pages
+                            )
+
+                if "/my-items/saved-jobs" not in self._page.url:
+                    logger.debug(
+                        "Unexpected page URL after saved-jobs extraction: %s — "
+                        "skipping job ID extraction",
+                        self._page.url,
+                    )
+                    page_texts.append(extracted.text)
+                    if extracted.references:
+                        page_references.extend(extracted.references)
+                    break
+
+                page_ids = await self._extract_job_ids()
+                new_ids = [jid for jid in page_ids if jid not in seen_ids]
+
+                if not new_ids:
+                    page_texts.append(extracted.text)
+                    if extracted.references:
+                        page_references.extend(extracted.references)
+                    logger.debug(
+                        "No new saved job IDs on page %d, stopping", page_num + 1
+                    )
+                    break
+
+                for jid in new_ids:
+                    seen_ids.add(jid)
+                    all_job_ids.append(jid)
+
+                page_texts.append(extracted.text)
+                if extracted.references:
+                    page_references.extend(extracted.references)
+
+            except LinkedInScraperException:
+                raise
+            except Exception as e:
+                logger.warning("Error on saved jobs page %d: %s", page_num + 1, e)
+                section_errors["saved_jobs"] = build_issue_diagnostics(
+                    e,
+                    context="get_saved_jobs",
+                    target_url=url,
+                    section_name="saved_jobs",
+                )
+                break
+
+        result: dict[str, Any] = {
+            "url": base_url,
+            "sections": {"saved_jobs": "\n---\n".join(page_texts)}
+            if page_texts
+            else {},
+            "job_ids": all_job_ids,
+        }
+        if page_references:
+            result["references"] = {
+                "saved_jobs": dedupe_references(page_references, cap=15)
+            }
+        if section_errors:
+            result["section_errors"] = section_errors
+        return result
+
     async def search_people(
         self,
         keywords: str,
@@ -4609,6 +4898,103 @@ class LinkedInExtractor:
             "url": url,
             "sections": sections,
         }
+        if references:
+            result["references"] = references
+        if section_errors:
+            result["section_errors"] = section_errors
+        return result
+
+    @staticmethod
+    def _build_content_search_url(
+        keywords: str,
+        date_posted: str | None = None,
+    ) -> str:
+        """Build a LinkedIn content (post) search URL.
+
+        Reproduces the ``FACETED_SEARCH`` URL LinkedIn produces from the
+        Posts results tab, e.g. for "Buscamos Unity" in the past week:
+        ``/search/results/content/?keywords=Buscamos+Unity&origin=FACETED_SEARCH&datePosted=%5B%22past-week%22%5D``
+
+        The ``datePosted`` facet is a one-element JSON list carrying a literal
+        LinkedIn token, URL-encoded — unlike job search, which uses
+        ``f_TPR=r<seconds>``. The value is mapped through
+        ``_CONTENT_DATE_POSTED_MAP`` so the server's own underscore spelling
+        reaches LinkedIn in the form it recognizes. An unmapped value would be
+        ignored rather than rejected, so callers validate first.
+        """
+        params = f"keywords={quote_plus(keywords)}&origin=FACETED_SEARCH"
+        if date_posted and date_posted.strip():
+            token = _CONTENT_DATE_POSTED_MAP.get(
+                date_posted.strip(), date_posted.strip()
+            )
+            params += f"&datePosted={_encode_list_facet([token])}"
+        return f"https://www.linkedin.com/search/results/content/?{params}"
+
+    async def search_posts(
+        self,
+        keywords: str,
+        date_posted: str | None = None,
+        max_pages: int = 3,
+    ) -> dict[str, Any]:
+        """Search LinkedIn posts/content and extract the results page.
+
+        Reproduces the LinkedIn "Posts" content-search tab — the surface for
+        catching informal "we're hiring" / "Buscamos ..." posts before a
+        formal job listing exists.
+
+        Args:
+            keywords: Free-text query (e.g. "Buscamos Unity", "estamos contratando").
+            date_posted: Optional recency filter, one of the keys of
+                ``_CONTENT_DATE_POSTED_MAP``. Invalid values raise
+                ``FilterValidationError`` (a ``ValueError`` subclass) rather
+                than reaching LinkedIn, which would ignore them silently and
+                return unfiltered results that look filtered.
+            max_pages: Scroll depth, expressed in result "pages" of roughly
+                ``_CONTENT_SCROLLS_PER_REQUESTED_PAGE`` scrolls each (default
+                3). Content search is an infinite scroll with no per-page URL,
+                so this caps how far the page is scrolled rather than fetching
+                discrete ``&start=`` pages.
+
+        Returns:
+            {url, sections: {search_results: text}} plus optional ``references``
+            (post authors, companies, linked jobs) and ``section_errors``.
+            Verified live: the results page carries no per-post permalink
+            anchors, so a post is addressable only through its author.
+            The LLM should parse the raw text to extract each post's author,
+            headline, body, date, and reaction counts.
+        """
+        if (
+            date_posted is not None
+            and date_posted.strip()
+            and date_posted.strip() not in _CONTENT_DATE_POSTED_MAP
+        ):
+            raise FilterValidationError(
+                f"Invalid date_posted {date_posted!r}; expected one of "
+                f"{list(_CONTENT_DATE_POSTED_MAP)!r}."
+            )
+
+        url = self._build_content_search_url(keywords, date_posted=date_posted)
+        max_scrolls = max(1, max_pages) * _CONTENT_SCROLLS_PER_REQUESTED_PAGE
+        extracted = await self.extract_page(
+            url, section_name="search_results", max_scrolls=max_scrolls
+        )
+
+        sections: dict[str, str] = {}
+        references: dict[str, list[Reference]] = {}
+        section_errors: dict[str, dict[str, Any]] = {}
+        if extracted.text and extracted.text != _RATE_LIMITED_MSG:
+            sections["search_results"] = extracted.text
+            if extracted.references:
+                references["search_results"] = extracted.references
+        elif extracted.text == _RATE_LIMITED_MSG:
+            section_errors["search_results"] = {
+                "error_type": "rate_limit",
+                "error_message": extracted.text,
+            }
+        elif extracted.error:
+            section_errors["search_results"] = extracted.error
+
+        result: dict[str, Any] = {"url": url, "sections": sections}
         if references:
             result["references"] = references
         if section_errors:

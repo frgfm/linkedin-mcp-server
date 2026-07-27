@@ -1,11 +1,19 @@
+import logging
+
 import pytest
 
 from linkedin_mcp_server.config.schema import (
     AppConfig,
+    BROWSER_HANDOFF_MARGIN_SECONDS,
     BrowserConfig,
     ConfigurationError,
+    DEFAULT_BROWSER_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_BROWSER_MIN_HOLD_SECONDS,
+    DEFAULT_BROWSER_WAIT_SECONDS,
+    MAX_BROWSER_WAIT_SECONDS,
     MAX_LOGIN_INLINE_WAIT_SECONDS,
     ServerConfig,
+    is_loopback_host,
 )
 
 
@@ -57,6 +65,127 @@ class TestBrowserConfig:
         assert config.login_inline_wait_seconds == MAX_LOGIN_INLINE_WAIT_SECONDS
 
 
+class TestProfileSharingConfig:
+    """The wait/hold/idle values that govern cross-process browser handoff.
+
+    The clamping here is not cosmetic. A hold window that outlasts the waiter's
+    budget produces spurious busy errors, and a wait budget above the ceiling
+    eats into the client's own request timeout.
+    """
+
+    def test_defaults(self):
+        config = BrowserConfig()
+        assert config.browser_wait_seconds == DEFAULT_BROWSER_WAIT_SECONDS
+        assert config.browser_min_hold_seconds == DEFAULT_BROWSER_MIN_HOLD_SECONDS
+        assert (
+            config.browser_idle_timeout_seconds == DEFAULT_BROWSER_IDLE_TIMEOUT_SECONDS
+        )
+
+    def test_defaults_leave_room_for_a_handover(self):
+        """The shipped defaults must satisfy their own clamp, unchanged."""
+        config = BrowserConfig()
+        config.validate()
+
+        assert config.browser_wait_seconds == DEFAULT_BROWSER_WAIT_SECONDS
+        assert config.browser_min_hold_seconds == DEFAULT_BROWSER_MIN_HOLD_SECONDS
+        assert (
+            config.browser_min_hold_seconds
+            <= config.browser_wait_seconds - BROWSER_HANDOFF_MARGIN_SECONDS
+        )
+
+    def test_zero_is_allowed(self):
+        """0 is a meaningful sentinel for all three, not a missing value.
+
+        Wait 0 reports busy at once, hold 0 hands over after every call, idle 0
+        keeps the browser until the process exits.
+        """
+        BrowserConfig(
+            browser_wait_seconds=0,
+            browser_min_hold_seconds=0,
+            browser_idle_timeout_seconds=0,
+        ).validate()  # No error
+
+    @pytest.mark.parametrize(
+        "bad_value", [-1.0, float("nan"), float("inf"), float("-inf")]
+    )
+    def test_rejects_a_negative_or_non_finite_wait(self, bad_value):
+        with pytest.raises(ConfigurationError, match="browser_wait_seconds"):
+            BrowserConfig(browser_wait_seconds=bad_value).validate()
+
+    @pytest.mark.parametrize(
+        "bad_value", [-1.0, float("nan"), float("inf"), float("-inf")]
+    )
+    def test_rejects_a_negative_or_non_finite_hold(self, bad_value):
+        with pytest.raises(ConfigurationError, match="browser_min_hold_seconds"):
+            BrowserConfig(browser_min_hold_seconds=bad_value).validate()
+
+    @pytest.mark.parametrize(
+        "bad_value", [-1.0, float("nan"), float("inf"), float("-inf")]
+    )
+    def test_rejects_a_negative_or_non_finite_idle_timeout(self, bad_value):
+        with pytest.raises(ConfigurationError, match="browser_idle_timeout_seconds"):
+            BrowserConfig(browser_idle_timeout_seconds=bad_value).validate()
+
+    def test_clamps_wait_to_the_ceiling(self):
+        config = BrowserConfig(browser_wait_seconds=120, browser_min_hold_seconds=0)
+        config.validate()  # Clamps, does not raise
+        assert config.browser_wait_seconds == MAX_BROWSER_WAIT_SECONDS
+
+    def test_clamps_hold_below_the_wait_budget(self):
+        """A hold window as long as the wait budget would time every waiter out.
+
+        The owner notices on a one-second poll and then has to tear Chromium
+        down, so the window has to end a margin *before* the waiter's deadline,
+        not at it.
+        """
+        config = BrowserConfig(browser_wait_seconds=10, browser_min_hold_seconds=10)
+        config.validate()
+
+        assert config.browser_min_hold_seconds == 10 - BROWSER_HANDOFF_MARGIN_SECONDS
+
+    def test_clamping_the_wait_also_reins_in_the_hold(self):
+        """The hold clamp reads the wait *after* it was itself clamped.
+
+        Ordering matters: against the raw 600s the hold would look fine, and a
+        180s hold would survive a 45s budget.
+        """
+        config = BrowserConfig(browser_wait_seconds=600, browser_min_hold_seconds=180)
+        config.validate()
+
+        assert config.browser_wait_seconds == MAX_BROWSER_WAIT_SECONDS
+        assert (
+            config.browser_min_hold_seconds
+            == MAX_BROWSER_WAIT_SECONDS - BROWSER_HANDOFF_MARGIN_SECONDS
+        )
+
+    def test_hold_never_clamps_below_zero(self):
+        """A wait budget under the margin must not produce a negative window."""
+        config = BrowserConfig(browser_wait_seconds=1, browser_min_hold_seconds=30)
+        config.validate()
+
+        assert config.browser_min_hold_seconds == 0.0
+
+    def test_zero_wait_disables_the_hold_window(self):
+        """Reporting busy immediately leaves nothing for a hold window to buy."""
+        config = BrowserConfig(browser_wait_seconds=0, browser_min_hold_seconds=25)
+        config.validate()
+
+        assert config.browser_min_hold_seconds == 0.0
+
+    def test_hold_inside_the_budget_is_left_alone(self):
+        config = BrowserConfig(browser_wait_seconds=45, browser_min_hold_seconds=5)
+        config.validate()
+
+        assert config.browser_min_hold_seconds == 5
+
+    def test_a_long_idle_timeout_is_not_clamped(self):
+        """The idle timer is a backstop, not part of the request path."""
+        config = BrowserConfig(browser_idle_timeout_seconds=86_400)
+        config.validate()
+
+        assert config.browser_idle_timeout_seconds == 86_400
+
+
 class TestServerConfig:
     def test_defaults(self):
         config = ServerConfig()
@@ -81,6 +210,84 @@ class TestAppConfig:
         config.server.port = 99999
         with pytest.raises(ConfigurationError):
             config.validate()
+
+
+class TestExposedBindWarning:
+    """The endpoint has no authentication, so the bind address is the guard.
+
+    The warning used to fire only for a literal 0.0.0.0 or ::, which meant the
+    most likely way to expose a session by accident, naming a LAN address
+    outright, happened in silence.
+    """
+
+    @staticmethod
+    def _validate_with_host(host, caplog):
+        config = AppConfig()
+        config.server.transport = "streamable-http"
+        config.server.host = host
+        with caplog.at_level(
+            logging.WARNING, logger="linkedin_mcp_server.config.schema"
+        ):
+            config.validate()
+        return caplog.text
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
+    def test_loopback_binds_are_silent(self, host, caplog):
+        assert self._validate_with_host(host, caplog) == ""
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "0.0.0.0",
+            "::",
+            "192.168.1.5",  # a LAN address warned about nothing before
+            "10.0.0.7",
+            "example.internal",
+        ],
+    )
+    def test_reachable_binds_warn(self, host, caplog):
+        text = self._validate_with_host(host, caplog)
+        assert host in text
+        assert "no authentication" in text
+
+    def test_stdio_never_warns_about_the_host(self, caplog):
+        """The host field is meaningless without an HTTP listener."""
+        config = AppConfig()
+        config.server.transport = "stdio"
+        config.server.host = "0.0.0.0"
+        with caplog.at_level(logging.WARNING):
+            config.validate()
+
+        assert "no authentication" not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("host", "expected"),
+        [
+            # Reachable only from this machine, however it was spelled.
+            ("127.0.0.1", True),
+            ("::1", True),
+            ("localhost", True),
+            ("LOCALHOST", True),  # case is not part of a hostname
+            ("  localhost  ", True),
+            ("localhost.", True),  # the root dot is the same name
+            ("127.0.0.2", True),  # the whole 127/8 range is loopback
+            ("127.255.255.254", True),
+            ("::ffff:127.0.0.1", True),  # IPv4-mapped loopback
+            ("[::1]", True),  # bracketed, as it appears in a URL
+            # Reachable from elsewhere, or not decidable without DNS.
+            ("0.0.0.0", False),
+            ("::", False),
+            ("192.168.1.5", False),
+            ("10.0.0.7", False),
+            ("example.internal", False),
+            ("localhost.evil.example", False),  # a name DNS points anywhere
+            ("", False),
+            ("   ", False),
+        ],
+    )
+    def test_is_loopback_host_fails_closed(self, host, expected):
+        """Anything not positively loopback counts as reachable."""
+        assert is_loopback_host(host) is expected
 
 
 class TestConfigSingleton:
@@ -351,6 +558,82 @@ class TestLoaders:
         assert config.browser.login_inline_wait_seconds == MAX_LOGIN_INLINE_WAIT_SECONDS
 
     @pytest.mark.parametrize(
+        ("env_key", "attribute"),
+        [
+            ("BROWSER_WAIT", "browser_wait_seconds"),
+            ("BROWSER_MIN_HOLD", "browser_min_hold_seconds"),
+            ("BROWSER_IDLE_TIMEOUT", "browser_idle_timeout_seconds"),
+        ],
+    )
+    def test_load_from_env_profile_sharing(self, monkeypatch, env_key, attribute):
+        monkeypatch.setenv(env_key, "12.5")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        assert getattr(config.browser, attribute) == 12.5
+
+    @pytest.mark.parametrize(
+        ("env_key", "attribute"),
+        [
+            ("BROWSER_WAIT", "browser_wait_seconds"),
+            ("BROWSER_MIN_HOLD", "browser_min_hold_seconds"),
+            ("BROWSER_IDLE_TIMEOUT", "browser_idle_timeout_seconds"),
+        ],
+    )
+    def test_load_from_env_profile_sharing_zero(self, monkeypatch, env_key, attribute):
+        """0 has to survive the loader: it is a sentinel, not an empty value."""
+        monkeypatch.setenv(env_key, "0")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        assert getattr(config.browser, attribute) == 0.0
+
+    @pytest.mark.parametrize(
+        "env_key", ["BROWSER_WAIT", "BROWSER_MIN_HOLD", "BROWSER_IDLE_TIMEOUT"]
+    )
+    @pytest.mark.parametrize("bad_value", ["abc", "-5", "nan", "inf", "-inf"])
+    def test_load_from_env_invalid_profile_sharing(
+        self, monkeypatch, env_key, bad_value
+    ):
+        monkeypatch.setenv(env_key, bad_value)
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        with pytest.raises(ConfigurationError, match=f"Invalid {env_key}"):
+            load_from_env(AppConfig())
+
+    @pytest.mark.parametrize(
+        ("flag", "attribute"),
+        [
+            ("--browser-wait", "browser_wait_seconds"),
+            ("--browser-min-hold", "browser_min_hold_seconds"),
+            ("--browser-idle-timeout", "browser_idle_timeout_seconds"),
+        ],
+    )
+    def test_load_from_args_profile_sharing(self, monkeypatch, flag, attribute):
+        monkeypatch.setattr("sys.argv", ["linkedin-mcp-server", flag, "8"])
+        from linkedin_mcp_server.config.loaders import load_from_args
+
+        config = load_from_args(AppConfig())
+        assert getattr(config.browser, attribute) == 8.0
+
+    def test_profile_sharing_clamped_at_validate_not_in_the_loader(self, monkeypatch):
+        """One clamp, applied after both loaders, so CLI and env agree."""
+        monkeypatch.setenv("BROWSER_WAIT", "99")
+        monkeypatch.setenv("BROWSER_MIN_HOLD", "99")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        assert config.browser.browser_wait_seconds == 99.0
+        assert config.browser.browser_min_hold_seconds == 99.0
+
+        config.validate()
+        assert config.browser.browser_wait_seconds == MAX_BROWSER_WAIT_SECONDS
+        assert (
+            config.browser.browser_min_hold_seconds
+            == MAX_BROWSER_WAIT_SECONDS - BROWSER_HANDOFF_MARGIN_SECONDS
+        )
+
+    @pytest.mark.parametrize(
         ("value", "expected"),
         [("false", False), ("true", True), ("0", False), ("1", True)],
     )
@@ -535,3 +818,266 @@ class TestImportFromBrowserValidation:
     def test_invalid_value_raises(self):
         with pytest.raises(ConfigurationError, match="not supported"):
             ServerConfig(import_from_browser="firefox").validate()
+
+
+class TestProxyConfig:
+    """Proxy parsing, validation and the guarantee that no secret escapes."""
+
+    SECRET = "s3cr3t-p@ss"
+
+    def test_defaults_are_unset(self):
+        config = BrowserConfig()
+        assert config.proxy_server is None
+        assert config.proxy_username is None
+        assert config.proxy_password is None
+        assert config.proxy_bypass is None
+        assert config.proxy_settings() is None
+
+    def test_server_only(self):
+        config = BrowserConfig(proxy_server="http://proxy.example:8080")
+        config.validate()
+        assert config.proxy_settings() == {"server": "http://proxy.example:8080"}
+
+    def test_scheme_less_server_means_http(self):
+        config = BrowserConfig(proxy_server="proxy.example:8080")
+        config.validate()
+        assert config.proxy_server == "http://proxy.example:8080"
+
+    def test_ipv6_server_keeps_brackets(self):
+        config = BrowserConfig(proxy_server="http://[::1]:8080")
+        config.validate()
+        assert config.proxy_server == "http://[::1]:8080"
+
+    def test_separate_credentials_and_bypass(self):
+        config = BrowserConfig(
+            proxy_server="https://proxy.example:443",
+            proxy_username="user",
+            proxy_password=self.SECRET,
+            proxy_bypass=".internal,localhost",
+        )
+        config.validate()
+        assert config.proxy_settings() == {
+            "server": "https://proxy.example:443",
+            "username": "user",
+            "password": self.SECRET,
+            "bypass": ".internal,localhost",
+        }
+
+    def test_embedded_credentials_are_split_out(self):
+        # Patchright drops userinfo from the server URL, so leaving it embedded
+        # would authenticate with nothing.
+        config = BrowserConfig(proxy_server=f"http://user:{self.SECRET}@gate:7000")
+        config.validate()
+        assert config.proxy_server == "http://gate:7000"
+        assert config.proxy_settings() == {
+            "server": "http://gate:7000",
+            "username": "user",
+            "password": self.SECRET,
+        }
+
+    def test_embedded_credentials_are_percent_decoded(self):
+        config = BrowserConfig(proxy_server="http://user:p%40ss@gate:7000")
+        config.validate()
+        assert config.proxy_password == "p@ss"
+
+    def test_socks_without_credentials_is_allowed(self):
+        config = BrowserConfig(proxy_server="socks5://127.0.0.1:1080")
+        config.validate()
+        assert config.proxy_settings() == {"server": "socks5://127.0.0.1:1080"}
+
+    @pytest.mark.parametrize(
+        "kwargs, match",
+        [
+            ({"proxy_username": "u"}, "without proxy_server"),
+            ({"proxy_bypass": ".internal"}, "without proxy_server"),
+            ({"proxy_server": "ftp://host:21"}, "is not supported"),
+            ({"proxy_server": "http://host"}, "explicit port"),
+            ({"proxy_server": "http://host:8080/path"}, "path, query or fragment"),
+            ({"proxy_server": "http://host:8080?a=1"}, "path, query or fragment"),
+            (
+                {"proxy_server": "http://host:8080", "proxy_password": "p"},
+                "without a username",
+            ),
+            (
+                {
+                    "proxy_server": "http://u:p@host:8080",
+                    "proxy_username": "other",
+                    "proxy_password": "other",
+                },
+                "one or the other",
+            ),
+            (
+                {
+                    "proxy_server": "socks5://host:1080",
+                    "proxy_username": "u",
+                    "proxy_password": "p",
+                },
+                "cannot authenticate",
+            ),
+        ],
+    )
+    def test_invalid_configurations_are_rejected(self, kwargs, match):
+        with pytest.raises(ConfigurationError, match=match):
+            BrowserConfig(**kwargs).validate()
+
+    def test_rejection_never_echoes_the_secret(self):
+        # Validation errors reach the console, so they must not quote the value.
+        with pytest.raises(ConfigurationError) as excinfo:
+            BrowserConfig(
+                proxy_server=f"socks5://user:{self.SECRET}@host:1080"
+            ).validate()
+        assert self.SECRET not in str(excinfo.value)
+
+    def test_password_never_appears_in_repr(self):
+        # cli_main logs the whole config at DEBUG level, and users paste those
+        # logs into issue reports.
+        config = BrowserConfig(
+            proxy_server="http://proxy.example:8080",
+            proxy_username="user",
+            proxy_password=self.SECRET,
+        )
+        assert self.SECRET not in repr(config)
+        assert self.SECRET not in repr(AppConfig(browser=config))
+
+    def test_server_stays_visible_in_repr(self):
+        # It carries no secret after normalization and is the field you need to
+        # diagnose a proxy problem.
+        config = BrowserConfig(proxy_server="http://proxy.example:8080")
+        assert "proxy.example" in repr(config)
+
+
+class TestProxyLoaders:
+    SECRET = "env-s3cr3t"
+
+    def test_load_from_env_all_fields(self, monkeypatch):
+        monkeypatch.setenv("PROXY_SERVER", "http://gate.example:7000")
+        monkeypatch.setenv("PROXY_USERNAME", "envuser")
+        monkeypatch.setenv("PROXY_PASSWORD", self.SECRET)
+        monkeypatch.setenv("PROXY_BYPASS", ".internal")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        assert config.browser.proxy_server == "http://gate.example:7000"
+        assert config.browser.proxy_username == "envuser"
+        assert config.browser.proxy_password == self.SECRET
+        assert config.browser.proxy_bypass == ".internal"
+
+    def test_env_accepts_a_provider_url_with_credentials(self, monkeypatch):
+        # The environment is not world-readable the way argv is, so the
+        # convenience form providers hand out is accepted here.
+        monkeypatch.setenv("PROXY_SERVER", f"http://envuser:{self.SECRET}@gate:7000")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        config.validate()
+        assert config.browser.proxy_server == "http://gate:7000"
+        assert config.browser.proxy_password == self.SECRET
+
+    def test_load_from_args_proxy_flags(self, monkeypatch):
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "linkedin-mcp-server",
+                "--proxy-server",
+                "http://cli.example:3128",
+                "--proxy-username",
+                "cliuser",
+                "--proxy-bypass",
+                ".internal",
+            ],
+        )
+        from linkedin_mcp_server.config.loaders import load_from_args
+
+        config = load_from_args(AppConfig())
+        assert config.browser.proxy_server == "http://cli.example:3128"
+        assert config.browser.proxy_username == "cliuser"
+        assert config.browser.proxy_bypass == ".internal"
+
+    def test_args_override_env(self, monkeypatch):
+        monkeypatch.setenv("PROXY_SERVER", "http://env.example:7000")
+        monkeypatch.setattr(
+            "sys.argv", ["linkedin-mcp-server", "--proxy-server", "http://cli:3128"]
+        )
+        from linkedin_mcp_server.config.loaders import load_from_args, load_from_env
+
+        config = load_from_args(load_from_env(AppConfig()))
+        assert config.browser.proxy_server == "http://cli:3128"
+
+    def test_cli_rejects_embedded_credentials(self, monkeypatch, capsys):
+        # There is no --proxy-password flag because argv is world-readable;
+        # accepting a credential URL here would hand that exposure back.
+        monkeypatch.setattr(
+            "sys.argv",
+            ["linkedin-mcp-server", "--proxy-server", f"http://u:{self.SECRET}@h:8080"],
+        )
+        from linkedin_mcp_server.config.loaders import load_from_args
+
+        with pytest.raises(SystemExit):
+            load_from_args(AppConfig())
+        assert self.SECRET not in capsys.readouterr().err
+
+
+class TestProxyEmptyPassword:
+    """A username with an empty password is a legitimate proxy credential.
+
+    Playwright supports it explicitly for key-style accounts, so it must not be
+    rejected, and proxy_settings() must still send it rather than dropping it
+    on truthiness.
+    """
+
+    def test_username_without_a_password_is_allowed(self):
+        config = BrowserConfig(proxy_server="http://host:8080", proxy_username="user")
+        config.validate()
+        assert config.proxy_settings() == {
+            "server": "http://host:8080",
+            "username": "user",
+        }
+
+    def test_empty_password_is_preserved(self):
+        config = BrowserConfig(
+            proxy_server="http://host:8080", proxy_username="user", proxy_password=""
+        )
+        config.validate()
+        settings = config.proxy_settings()
+        assert settings is not None
+        assert settings["password"] == ""
+
+
+class TestProxyEncodedUserinfo:
+    """A percent-encoded '@' hides credentials from the URL parser.
+
+    urlsplit reads "user%3Apass%40host" as a plain hostname, so the credentials
+    are neither split out nor hidden from the logs while staying trivially
+    decodable. Patchright cannot parse it either and falls back to a nonsense
+    host, so the browser would not reach the intended proxy anyway.
+    """
+
+    ENCODED = "http://user%3Apass%40gate.example:7000"
+
+    def test_schema_rejects_it(self):
+        with pytest.raises(ConfigurationError, match="percent-encoded"):
+            BrowserConfig(proxy_server=self.ENCODED).validate()
+
+    def test_schema_rejects_the_scheme_less_form(self):
+        with pytest.raises(ConfigurationError, match="percent-encoded"):
+            BrowserConfig(proxy_server="user%3Apass%40gate.example:7000").validate()
+
+    def test_the_rejection_does_not_echo_the_value(self):
+        with pytest.raises(ConfigurationError) as excinfo:
+            BrowserConfig(proxy_server=self.ENCODED).validate()
+        assert "user%3Apass" not in str(excinfo.value)
+
+    def test_cli_rejects_it(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "sys.argv", ["linkedin-mcp-server", "--proxy-server", self.ENCODED]
+        )
+        from linkedin_mcp_server.config.loaders import load_from_args
+
+        with pytest.raises(SystemExit):
+            load_from_args(AppConfig())
+        assert "user%3Apass" not in capsys.readouterr().err
+
+    def test_an_ordinary_address_is_unaffected(self):
+        config = BrowserConfig(proxy_server="http://gate.example:7000")
+        config.validate()
+        assert config.proxy_server == "http://gate.example:7000"
