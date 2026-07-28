@@ -4707,6 +4707,86 @@ class TestGetInbox:
         assert refs[0]["url"] == "/messaging/thread/2-abc123/"
         assert refs[0]["text"] == "Tony Chan"
 
+    async def test_merges_inbox_tabs_and_dedupes_thread_refs(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        tabs = MagicMock()
+        tabs.count = AsyncMock(return_value=2)
+        focused_tab = MagicMock()
+        focused_tab.get_attribute = AsyncMock(return_value="true")
+        focused_tab.click = AsyncMock()
+        other_tab = MagicMock()
+        other_tab.get_attribute = AsyncMock(return_value="false")
+        other_tab.click = AsyncMock()
+        tabs.nth.side_effect = [focused_tab, other_tab]
+        mock_page.locator.return_value = tabs
+
+        focused_ref = {
+            "kind": "conversation",
+            "url": "/messaging/thread/2-focused/",
+            "context": "inbox",
+        }
+        other_ref = {
+            "kind": "conversation",
+            "url": "/messaging/thread/2-other/",
+            "context": "inbox",
+        }
+
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(extractor, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                extractor,
+                "_scroll_main_scrollable_region",
+                new_callable=AsyncMock,
+            ) as scroll_mock,
+            patch.object(
+                extractor,
+                "_extract_root_content",
+                new_callable=AsyncMock,
+                side_effect=[
+                    {"text": "Focused conversation", "references": []},
+                    {"text": "Other conversation", "references": []},
+                ],
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.strip_linkedin_noise",
+                side_effect=lambda text: text,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.build_references",
+                return_value=[],
+            ),
+            patch.object(
+                extractor,
+                "_extract_conversation_thread_refs",
+                new_callable=AsyncMock,
+                side_effect=[
+                    [focused_ref],
+                    [focused_ref, other_ref],
+                ],
+            ),
+        ):
+            result = await extractor.get_inbox(limit=10)
+
+        assert result["sections"]["inbox"] == (
+            "Focused conversation\n\nOther conversation"
+        )
+        assert [ref["url"] for ref in result["references"]["inbox"]] == [
+            "/messaging/thread/2-focused/",
+            "/messaging/thread/2-other/",
+        ]
+        focused_tab.click.assert_not_awaited()
+        other_tab.click.assert_awaited_once()
+        assert scroll_mock.await_count == 2
+
 
 class TestInvitationManagement:
     def test_invitation_card_script_uses_visual_card_order(self):
@@ -6856,6 +6936,35 @@ class TestResolveConversationThreadUrls:
         )
 
         assert captured["arg"] == {"limit": 50, "nameFilter": "Jacki McMahan"}
+
+    async def test_extract_refs_keeps_rows_without_participant_labels(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.wait_for_selector = AsyncMock()
+        mock_page.evaluate = AsyncMock(
+            return_value=[{"threadId": "2-request", "ariaLabel": ""}]
+        )
+
+        refs = await extractor._extract_conversation_thread_refs(
+            limit=50, context="inbox"
+        )
+
+        assert refs == [
+            {
+                "kind": "conversation",
+                "url": "/messaging/thread/2-request/",
+                "context": "inbox",
+            }
+        ]
+        mock_page.wait_for_selector.assert_awaited_once_with(
+            'main li div[class*="listitem__link"]',
+            state="attached",
+            timeout=10000,
+        )
+        evaluate_call = mock_page.evaluate.await_args
+        assert evaluate_call is not None
+        script = evaluate_call.args[0]
+        assert "'main li div[class*=\"listitem__link\"]'" in script
+        assert "clickTarget.closest('li')" in script
 
 
 class TestSearchConversations:

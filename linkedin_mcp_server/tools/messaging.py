@@ -43,7 +43,7 @@ def register_messaging_tools(
 
         Args:
             ctx: FastMCP context for progress reporting
-            limit: Maximum number of conversations to load (1-50, default 20)
+            limit: Maximum conversations to load per inbox tab (1-50, default 20)
 
         Returns:
             Dict with url, sections (inbox -> raw text), and optional references.
