@@ -4644,7 +4644,7 @@ class TestGetInbox:
         assert result["sections"] == {}
 
     async def test_includes_conversation_thread_refs(self, mock_page):
-        """get_inbox prepends conversation thread references from click extraction."""
+        """get_inbox includes conversation thread references from click extraction."""
         extractor = LinkedInExtractor(mock_page)
         thread_refs = [
             {
@@ -4709,15 +4709,21 @@ class TestGetInbox:
 
     async def test_merges_inbox_tabs_and_dedupes_thread_refs(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
+        mock_page.wait_for_selector = AsyncMock()
         tabs = MagicMock()
-        tabs.count = AsyncMock(return_value=2)
+
+        async def count_after_hydration():
+            mock_page.wait_for_selector.assert_awaited_once()
+            return 2
+
+        tabs.count = AsyncMock(side_effect=count_after_hydration)
         focused_tab = MagicMock()
-        focused_tab.get_attribute = AsyncMock(return_value="true")
+        focused_tab.get_attribute = AsyncMock(side_effect=["true", "false"])
         focused_tab.click = AsyncMock()
         other_tab = MagicMock()
-        other_tab.get_attribute = AsyncMock(return_value="false")
+        other_tab.get_attribute = AsyncMock(side_effect=["false", "false"])
         other_tab.click = AsyncMock()
-        tabs.nth.side_effect = [focused_tab, other_tab]
+        tabs.nth.side_effect = lambda index: [focused_tab, other_tab][index]
         mock_page.locator.return_value = tabs
 
         focused_ref = {
@@ -4755,7 +4761,7 @@ class TestGetInbox:
                     {"text": "Focused conversation", "references": []},
                     {"text": "Other conversation", "references": []},
                 ],
-            ),
+            ) as root_mock,
             patch(
                 "linkedin_mcp_server.scraping.extractor.strip_linkedin_noise",
                 side_effect=lambda text: text,
@@ -4768,14 +4774,22 @@ class TestGetInbox:
                 extractor,
                 "_extract_conversation_thread_refs",
                 new_callable=AsyncMock,
-                side_effect=[
-                    [focused_ref],
-                    [focused_ref, other_ref],
-                ],
-            ),
+            ) as refs_mock,
         ):
+            ref_batches = iter([[focused_ref], [focused_ref, other_ref]])
+
+            async def refs_after_text(*_args, **_kwargs):
+                assert root_mock.await_count == 2
+                return next(ref_batches)
+
+            refs_mock.side_effect = refs_after_text
             result = await extractor.get_inbox(limit=10)
 
+        mock_page.wait_for_selector.assert_awaited_once_with(
+            'main [role="tablist"] [role="tab"], main li div[class*="listitem__link"]',
+            state="attached",
+            timeout=10000,
+        )
         assert result["sections"]["inbox"] == (
             "Focused conversation\n\nOther conversation"
         )
@@ -4783,9 +4797,9 @@ class TestGetInbox:
             "/messaging/thread/2-focused/",
             "/messaging/thread/2-other/",
         ]
-        focused_tab.click.assert_not_awaited()
-        other_tab.click.assert_awaited_once()
-        assert scroll_mock.await_count == 2
+        focused_tab.click.assert_awaited_once()
+        assert other_tab.click.await_count == 2
+        assert scroll_mock.await_count == 4
 
 
 class TestInvitationManagement:

@@ -5610,13 +5610,24 @@ class LinkedInExtractor:
         await self._wait_for_main_text(log_context="Messaging inbox")
         await handle_modal_close(self._page)
 
+        try:
+            await self._page.wait_for_selector(
+                'main [role="tablist"] [role="tab"], '
+                'main li div[class*="listitem__link"]',
+                state="attached",
+                timeout=10000,
+            )
+        except PlaywrightTimeoutError:
+            pass
+
         tabs = self._page.locator('main [role="tablist"] [role="tab"]')
         tab_count = await tabs.count()
+        tab_indexes = range(tab_count or 1)
         scrolls = max(1, limit // 10)
         cleaned_tabs: list[str] = []
         references: list[Reference] = []
 
-        for tab_index in range(tab_count or 1):
+        for tab_index in tab_indexes:
             if tab_count:
                 tab = tabs.nth(tab_index)
                 if await tab.get_attribute("aria-selected") != "true":
@@ -5633,9 +5644,16 @@ class LinkedInExtractor:
                 cleaned_tabs.append(cleaned)
                 references.extend(build_references(raw_result["references"], "inbox"))
 
-            # LinkedIn's conversation sidebar uses JS click handlers instead of
-            # <a> tags, so anchor extraction cannot capture thread IDs. Click each
-            # conversation item and read the resulting SPA URL to build references.
+        # Capture text from every tab before clicking rows changes the open thread.
+        for tab_index in tab_indexes:
+            if tab_count:
+                tab = tabs.nth(tab_index)
+                if await tab.get_attribute("aria-selected") != "true":
+                    await tab.click()
+                await self._scroll_main_scrollable_region(
+                    position="bottom", attempts=scrolls, pause_time=0.5
+                )
+
             references.extend(
                 await self._extract_conversation_thread_refs(
                     limit=limit, context="inbox"
