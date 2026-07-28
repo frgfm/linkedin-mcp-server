@@ -5610,32 +5610,61 @@ class LinkedInExtractor:
         await self._wait_for_main_text(log_context="Messaging inbox")
         await handle_modal_close(self._page)
 
+        try:
+            await self._page.wait_for_selector(
+                'main [role="tablist"] [role="tab"], '
+                'main li div[class*="listitem__link"]',
+                state="attached",
+                timeout=10000,
+            )
+        except PlaywrightTimeoutError:
+            pass
+
+        tabs = self._page.locator('main [role="tablist"] [role="tab"]')
+        tab_count = await tabs.count()
+        tab_indexes = range(tab_count or 1)
         scrolls = max(1, limit // 10)
-        await self._scroll_main_scrollable_region(
-            position="bottom", attempts=scrolls, pause_time=0.5
-        )
+        cleaned_tabs: list[str] = []
+        references: list[Reference] = []
 
-        raw_result = await self._extract_root_content(["main"])
-        raw = raw_result["text"]
-        cleaned = strip_linkedin_noise(raw) if raw else ""
-        references: list[Reference] = (
-            build_references(raw_result["references"], "inbox") if cleaned else []
-        )
+        for tab_index in tab_indexes:
+            if tab_count:
+                tab = tabs.nth(tab_index)
+                if await tab.get_attribute("aria-selected") != "true":
+                    await tab.click()
 
-        # LinkedIn's conversation sidebar uses JS click handlers instead of
-        # <a> tags, so anchor extraction cannot capture thread IDs.  Click each
-        # conversation item and read the resulting SPA URL to build references.
-        conversation_refs = await self._extract_conversation_thread_refs(
-            limit=limit, context="inbox"
-        )
-        if conversation_refs:
-            references = dedupe_references(conversation_refs + references)
+            await self._scroll_main_scrollable_region(
+                position="bottom", attempts=scrolls, pause_time=0.5
+            )
+
+            raw_result = await self._extract_root_content(["main"])
+            raw = raw_result["text"]
+            cleaned = strip_linkedin_noise(raw) if raw else ""
+            if cleaned:
+                cleaned_tabs.append(cleaned)
+                references.extend(build_references(raw_result["references"], "inbox"))
+
+        # Capture text from every tab before clicking rows changes the open thread.
+        for tab_index in tab_indexes:
+            if tab_count:
+                tab = tabs.nth(tab_index)
+                if await tab.get_attribute("aria-selected") != "true":
+                    await tab.click()
+                await self._scroll_main_scrollable_region(
+                    position="bottom", attempts=scrolls, pause_time=0.5
+                )
+
+            references.extend(
+                await self._extract_conversation_thread_refs(
+                    limit=limit, context="inbox"
+                )
+            )
 
         return self._single_section_result(
             url,
             "inbox",
-            cleaned,
-            references=references,
+            "\n\n".join(cleaned_tabs),
+            references=dedupe_references(references),
         )
 
     async def _extract_conversation_thread_refs(
@@ -5645,8 +5674,9 @@ class LinkedInExtractor:
 
         Works for both the inbox sidebar and the URL-driven search-results
         sidebar (`/messaging/?searchTerm=…`), which share the same DOM shape:
-        each conversation row is an ``<li>`` containing a ``<label>`` with an
-        ``aria-label`` attribute carrying the participant name.
+        each conversation row is an ``<li>`` containing a clickable inner div.
+        Most rows also contain a ``<label>`` whose ``aria-label`` carries the
+        participant name, but invitation/non-connection rows may omit it.
 
         LinkedIn renders the sidebar with no ``<a href>`` tags, no
         ``data-thread-id`` attributes, and no embedded URNs — clicking each
@@ -5660,30 +5690,24 @@ class LinkedInExtractor:
         scoped to the requested participant when resolving by username.
         """
         # The conversation list mounts after main text settles, so wait
-        # explicitly for at least one label rather than relying on
+        # explicitly for at least one clickable row rather than relying on
         # _wait_for_main_text alone (which only checks chrome text). LinkedIn
         # routinely takes several seconds to hydrate the messaging sidebar
         # after a navigation; an empty sidebar (zero matches) returns on
         # timeout.
         #
-        # Selector is structural (`main li label[aria-label]`) rather than
-        # text-prefix-based (`aria-label^="Select conversation"`) so it
-        # survives any LinkedIn locale — the verb in the aria-label is
-        # locale-dependent, the attribute's presence inside a list-item label
-        # is not.
-        #
         # Wait on `state="attached"` instead of the default `visible`:
-        # Ember-managed labels are reliably attached but Playwright's
+        # Ember-managed rows are reliably attached but Playwright's
         # visibility heuristic doesn't always consider them visible.
         try:
             await self._page.wait_for_selector(
-                "main li label[aria-label]",
+                'main li div[class*="listitem__link"]',
                 state="attached",
                 timeout=10000,
             )
         except PlaywrightTimeoutError:
             logger.debug(
-                "conversation labels did not appear within 10s (context=%s)",
+                "conversation rows did not appear within 10s (context=%s)",
                 context,
             )
             return []
@@ -5691,16 +5715,16 @@ class LinkedInExtractor:
         # The Ember click handler lives on an inner div; the <li> and <label>
         # don't trigger SPA navigation.  No role/aria attributes exist on the
         # clickable element, so class-name selectors are unavoidable here.
-        # The aria-label value flows through unmodified — Python strips any
-        # known locale prefix to derive a clean participant name for refs.
+        # Any aria-label flows through unmodified — Python strips a known locale
+        # prefix to derive a clean participant name for refs when one is present.
         conversations: list[dict[str, str]] = await self._page.evaluate(
             """async ({ limit, nameFilter }) => {
-                const labels = Array.from(document.querySelectorAll(
-                    'main li label[aria-label]'
+                const clickTargets = Array.from(document.querySelectorAll(
+                    'main li div[class*="listitem__link"]'
                 ));
                 const cap = (limit == null)
-                    ? labels.length
-                    : Math.min(labels.length, limit);
+                    ? clickTargets.length
+                    : Math.min(clickTargets.length, limit);
                 // Normalize the optional participant filter the same way the
                 // Python prefix-strip does (en-US "Select conversation with"
                 // verb, collapsed whitespace) so the JS-side comparison
@@ -5710,15 +5734,14 @@ class LinkedInExtractor:
                     .replace(/\\s+/g, ' ').trim().toLowerCase();
                 const results = [];
                 for (let i = 0; i < cap; i++) {
-                    const label = labels[i];
-                    const ariaLabel = label.getAttribute('aria-label') || '';
+                    const clickTarget = clickTargets[i];
+                    const ariaLabel = clickTarget.closest('li')
+                        ?.querySelector('label[aria-label]')
+                        ?.getAttribute('aria-label') || '';
                     const rowName = ariaLabel
                         .replace(/^Select conversation with\\s+/i, '')
                         .replace(/\\s+/g, ' ').trim().toLowerCase();
                     if (wanted && rowName !== wanted) continue;
-                    const clickTarget = label.closest('li')
-                        ?.querySelector('div[class*="listitem__link"]');
-                    if (!clickTarget) continue;
                     const before = location.href;
                     clickTarget.click();
                     // Poll for the SPA URL to settle on the thread route. The
