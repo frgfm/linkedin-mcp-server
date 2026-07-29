@@ -23,6 +23,7 @@ from linkedin_mcp_server.scraping.extractor import (
     _ACTION_SIGNALS_JS,
     _ARCHIVE_CONVERSATION_JS,
     _CLICK_INCOMING_ACCEPT_JS,
+    LinkedInExtractor,
 )
 
 pytestmark = pytest.mark.browser_dom
@@ -241,6 +242,50 @@ class TestClickIncomingAccept:
         await dom_page.set_content(_page_html(FOLLOW_ONLY_TOP_CARD, VIDEO_PLAYER_BAR))
         clicked = await dom_page.evaluate(_CLICK_INCOMING_ACCEPT_JS)
         assert clicked is False
+
+
+async def test_message_recipient_match_stays_with_compose_container(dom_page):
+    await dom_page.set_content(
+        """
+        <main>
+          <aside aria-label="Florent Chiappini">Florent Chiappini</aside>
+          <section id="active-conversation">
+            <header aria-label="Conversation with Another Person">
+              Another Person
+            </header>
+            <form>
+              <div id="editor" role="textbox" contenteditable="true"></div>
+            </form>
+          </section>
+        </main>
+        """
+    )
+
+    extractor = LinkedInExtractor(dom_page)
+    editor = dom_page.locator("#editor")
+    assert (
+        await extractor._compose_page_matches_recipient(
+            editor,
+            "Florent Chiappini",
+            "florent-chiappini-76201355",
+        )
+        is False
+    )
+
+    await dom_page.locator("#active-conversation header").evaluate(
+        """header => {
+            header.innerText = 'Florent Chiappini';
+            header.setAttribute('aria-label', 'Conversation with Florent Chiappini');
+        }"""
+    )
+    assert (
+        await extractor._compose_page_matches_recipient(
+            editor,
+            "Florent Chiappini",
+            "florent-chiappini-76201355",
+        )
+        is True
+    )
 
 
 async def test_archive_conversation_verifies_restore_and_is_idempotent(dom_page):
