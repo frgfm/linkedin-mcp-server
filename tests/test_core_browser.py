@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from linkedin_mcp_server.core.browser import BrowserManager, _DISABLE_IMAGES_ARG
+from linkedin_mcp_server.core.browser import BrowserManager
 
 
 def _make_cookie(
@@ -33,10 +33,8 @@ def _make_browser_manager(tmp_path) -> tuple[BrowserManager, MagicMock]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("headless", "blocks_images"), [(True, True), (False, False)])
-async def test_start_blocks_images_only_when_headless(
-    tmp_path, headless, blocks_images
-):
+@pytest.mark.parametrize("headless", [True, False])
+async def test_start_preserves_headless_and_launch_args(tmp_path, headless):
     context = MagicMock()
     context.pages = []
     context.new_page = AsyncMock(return_value=MagicMock())
@@ -49,13 +47,16 @@ async def test_start_blocks_images_only_when_headless(
         "linkedin_mcp_server.core.browser.async_playwright", return_value=starter
     ):
         await BrowserManager(
-            user_data_dir=tmp_path / "profile", headless=headless
+            user_data_dir=tmp_path / "profile",
+            headless=headless,
+            args=["--custom-flag"],
         ).start()
 
     call = playwright.chromium.launch_persistent_context.await_args
     assert call is not None
     options = call.kwargs
-    assert (_DISABLE_IMAGES_ARG in options.get("args", [])) is blocks_images
+    assert options["headless"] is headless
+    assert options["args"] == ["--custom-flag"]
 
 
 @pytest.mark.asyncio
