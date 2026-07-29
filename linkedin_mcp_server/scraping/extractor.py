@@ -4511,17 +4511,35 @@ class LinkedInExtractor:
             """(editor, { candidates }) => {
                 const normalize = value =>
                     (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                const root =
-                    editor.closest('[role="dialog"]') || editor.closest('form');
-                if (!root) return false;
-                const entries = [
-                    normalize(root.innerText),
-                    ...Array.from(root.querySelectorAll('[aria-label]'))
-                        .map(element => normalize(element.getAttribute('aria-label'))),
-                ].filter(Boolean);
-                return candidates.map(normalize).filter(Boolean).some(candidate =>
-                    entries.some(entry => entry === candidate || entry.includes(candidate))
-                );
+                const targets = candidates.map(normalize).filter(Boolean);
+                const matches = root => {
+                    const entries = [
+                        normalize(root.innerText),
+                        ...Array.from(root.querySelectorAll('[aria-label]'))
+                            .map(element =>
+                                normalize(element.getAttribute('aria-label'))
+                            ),
+                    ].filter(Boolean);
+                    return targets.some(candidate =>
+                        entries.some(
+                            entry => entry === candidate || entry.includes(candidate)
+                        )
+                    );
+                };
+
+                const dialog = editor.closest('[role="dialog"]');
+                if (dialog) return matches(dialog);
+
+                // Full-page composers keep the recipient header outside the form.
+                // Walk only its local ancestors so inbox/sidebar names cannot match.
+                for (
+                    let root = editor.closest('form');
+                    root && root.tagName !== 'MAIN' && root.tagName !== 'BODY';
+                    root = root.parentElement
+                ) {
+                    if (matches(root)) return true;
+                }
+                return false;
             }""",
             {"candidates": normalized_candidates},
         )
