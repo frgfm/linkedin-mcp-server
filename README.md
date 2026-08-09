@@ -37,9 +37,9 @@ This MCP server is **free** and **open source**, supported by [**Unipile**](http
 
 | Tool | Description | Status |
 |------|-------------|--------|
-| `get_person_profile` | Get profile info with explicit section selection (experience, education, interests, honors, languages, certifications, skills, projects, contact_info, posts) | working |
-| `get_my_profile` | Get the authenticated user's own LinkedIn profile (same sections as get_person_profile) | working |
-| `connect_with_person` | Send a connection request or accept an incoming one, with optional note | [#407](https://github.com/stickerdaniel/linkedin-mcp-server/issues/407) [#432](https://github.com/stickerdaniel/linkedin-mcp-server/issues/432) [#454](https://github.com/stickerdaniel/linkedin-mcp-server/issues/454) |
+| `get_person_profile` | Get profile info with explicit section selection (experience, education, interests, honors, languages, certifications, skills, projects, contact_info, posts) | [#590](https://github.com/stickerdaniel/linkedin-mcp-server/issues/590) |
+| `get_my_profile` | Get the authenticated user's own LinkedIn profile (same sections as get_person_profile) | [#590](https://github.com/stickerdaniel/linkedin-mcp-server/issues/590) |
+| `connect_with_person` | Send a connection request or accept an incoming one, with optional note | [#407](https://github.com/stickerdaniel/linkedin-mcp-server/issues/407) [#432](https://github.com/stickerdaniel/linkedin-mcp-server/issues/432) [#454](https://github.com/stickerdaniel/linkedin-mcp-server/issues/454) [#629](https://github.com/stickerdaniel/linkedin-mcp-server/issues/629) |
 | `get_sidebar_profiles` | Extract profile URLs from sidebar recommendation sections ("More profiles for you", "Explore premium profiles", "People you may know") on a profile page | working |
 | `get_inbox` | List recent conversations from the LinkedIn messaging inbox | working |
 | `get_conversation` | Read a messaging conversation as a structured list of messages plus participants, by username, thread ID, or invitation compose URL | [#434](https://github.com/stickerdaniel/linkedin-mcp-server/issues/434) |
@@ -148,8 +148,8 @@ When you set up or maintain this server, verify its entry in the MCP client conf
 - `--browser-min-hold SECONDS` - Shortest time this process keeps the shared browser before handing it to a waiting process (default: 20, clamped below `--browser-wait` so a waiting client is served before its own timeout; 0 = hand over after every tool call). Raising it means fewer browser restarts but longer waits for other clients.
 - `--browser-idle-timeout SECONDS` - Close an idle browser and release the shared profile after this long without a tool call (default: 600; 0 = keep it open until the server exits).
 - `--auto-import` / `--no-auto-import` - Enable or disable auto-import of a session from a locally logged-in browser on the first no-session tool call (before falling back to manual login). Auto-import is on by default across interactive and non-interactive desktop runs; pass `--no-auto-import` (or `AUTO_IMPORT_FROM_BROWSER=false`) to require `--login` / `--import-from-browser` instead. No effect under Docker or on a non-loopback HTTP bind. On macOS the keychain may prompt once for Safe Storage access.
-- `--eager-full-chromium` / `--no-eager-full-chromium` - Download full Chrome for Testing in the background right after the headless shell (`EAGER_FULL_CHROMIUM=true`), instead of lazily on the first headed login (the default). Headless setup is usable as soon as the shell is installed; this only pre-warms the headed login fallback. Pass `--no-eager-full-chromium` to override `EAGER_FULL_CHROMIUM=true` for a single run.
-- `--user-data-dir PATH` - Path to persistent browser profile directory (default: ~/.linkedin-mcp/profile)
+- `--user-data-dir PATH` - Path to persistent browser profile directory (default: ~/.linkedin-mcp/profile). Rotating or clearing a session moves and deletes this directory *and its parent*, which also holds `cookies.json`, `source-state.json` and the derived runtime profiles. A path other than the default is therefore only used once it carries a `profile-claim.json` marker, written automatically when the parent is empty or already holds a session from this server
+- `--claim-profile-root` - Take over a non-default profile directory this server will not claim on its own: one whose parent already holds other files, or one carrying an ownership marker written for a different path (a mounted volume that moved). Needed once
 - `--chrome-path PATH` - Path to Chrome/Chromium executable (for custom browser installations)
 - `--proxy-server URL` - Route the browser through a proxy, as `scheme://host:port`. Set the password via `PROXY_PASSWORD` (no flag, so it stays out of the process list)
 
@@ -218,6 +218,7 @@ while a container is running.
 - Ensure you have uv installed: `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - Check uv version: `uv --version` (should be 0.4.0 or higher)
 - On first run, `uvx` downloads all Python dependencies. On slow connections, uv's default 30s HTTP timeout may be too short. The recommended config above already sets `UV_HTTP_TIMEOUT=300` (seconds) to avoid this.
+- *Windows, `DLL load failed while importing _greenlet`*: install the [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist). The published Windows wheels for greenlet 3.3.1 through 3.5.4 need `MSVCP140.dll` from it, and neither the python.org installer nor the `uv`-managed builds carry that DLL. A greenlet built from source can need it at any version. Without administrator rights, `uvx --with "greenlet<=3.3.0" mcp-server-linkedin@latest` usually works instead: the published wheels up to 3.3.0 carry the runtime inside the extension, and they are x86-64 only. Tracked upstream as [greenlet#525](https://github.com/python-greenlet/greenlet/issues/525).
 
 **Session issues:**
 
@@ -267,6 +268,8 @@ while a container is running.
 
 - If Chrome is installed in a non-standard location, use `--chrome-path /path/to/chrome`
 - Can also set via environment variable: `CHROME_PATH=/path/to/chrome`
+- On macOS and Linux the browser must be at least as new as the one that last opened your profile, and the server refuses the launch otherwise. (Not on Windows: a browser there cannot be asked its version without starting one, so the check is off.) An older browser can silently drop stores a newer one wrote, the saved session among them, and the failure then looks exactly like an expired login. The message names both versions. Going back to the bundled Chromium after running a newer Chrome once is the usual way to meet this; either run the newer browser again, whichever one that was, or run `--login`, which moves the stored session aside and signs in fresh with the browser you have. `--logout` also clears it but discards the old session instead of keeping it recoverable, and it asks for confirmation on the terminal, so it is not usable from a server an MCP client started.
+- Only Chrome, Chromium and Chrome for Testing are compared this way. Forks number themselves differently (Vivaldi is on 7.x, Edge's build number sits far below Chrome's under the same major), so pointing `CHROME_PATH` at one turns the check off rather than producing a refusal nothing could satisfy.
 
 </details>
 
@@ -295,6 +298,7 @@ On startup, the MCP Bundle starts preparing the shared Patchright Chromium brows
 - Claude Desktop starts the bundle immediately; browser setup continues in the background
 - If the Patchright Chromium browser is still downloading, retry the tool after a short wait
 - Managed browser downloads are shared under `~/.linkedin-mcp/patchright-browsers/`
+- *Windows, the bundle exits with `DLL load failed while importing _greenlet`*: install the [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist). The published Windows wheels for greenlet 3.3.1 through 3.5.4 need `MSVCP140.dll` from it, and neither the python.org installer nor the `uv`-managed builds carry that DLL. A greenlet built from source can need it at any version. The server names this itself on startup, and only after checking that the loader cannot produce that DLL. Tracked upstream as [greenlet#525](https://github.com/python-greenlet/greenlet/issues/525).
 
 **Login issues:**
 
@@ -324,7 +328,7 @@ On startup, the MCP Bundle starts preparing the shared Patchright Chromium brows
 
 ### Authentication
 
-Docker runs headless (no browser window), so you need to create a browser profile locally first and mount it into the container.
+Docker runs full Chromium headed on a virtual display. No browser window reaches the host, so you still need to create a browser profile locally first and mount it into the container.
 
 **Step 1: Create profile on the host (one-time setup)**
 
@@ -355,7 +359,7 @@ This opens a browser window where you log in manually (5 minute timeout for 2FA,
 > Docker creates a fresh session on each startup. Sessions may expire over time — run `uvx mcp-server-linkedin@latest --login` again if you encounter authentication issues.
 
 > [!NOTE]
-> **Why can't I run `--login` in Docker?** Docker containers don't have a display server. Create a profile on your host using the [uvx setup](#-uvx-setup-recommended---universal) and mount it into Docker.
+> **Why can't I run `--login` in Docker?** The container has a virtual display for Chromium, but no viewer that can show it to you or accept the form, 2FA, or captcha. Create a profile on your host using the [uvx setup](#-uvx-setup-recommended---universal) and mount it into Docker.
 
 ### Docker Setup Help
 
@@ -385,22 +389,36 @@ This opens a browser window where you log in manually (5 minute timeout for 2FA,
 - `--browser-min-hold SECONDS` - Shortest time this process keeps the shared browser before handing it to a waiting process (default: 20, clamped below `--browser-wait` so a waiting client is served before its own timeout; 0 = hand over after every tool call). Raising it means fewer browser restarts but longer waits for other clients.
 - `--browser-idle-timeout SECONDS` - Close an idle browser and release the shared profile after this long without a tool call (default: 600; 0 = keep it open until the server exits).
 - `--auto-import` / `--no-auto-import` - Enable or disable auto-import of a session from a locally logged-in browser on the first no-session tool call (before falling back to manual login). Auto-import is on by default across interactive and non-interactive desktop runs; pass `--no-auto-import` (or `AUTO_IMPORT_FROM_BROWSER=false`) to require `--login` / `--import-from-browser` instead. No effect under Docker or on a non-loopback HTTP bind. On macOS the keychain may prompt once for Safe Storage access.
-- `--user-data-dir PATH` - Path to persistent browser profile directory (default: ~/.linkedin-mcp/profile)
+- `--user-data-dir PATH` - Path to persistent browser profile directory (default: ~/.linkedin-mcp/profile). Rotating or clearing a session moves and deletes this directory *and its parent*, which also holds `cookies.json`, `source-state.json` and the derived runtime profiles. A path other than the default is therefore only used once it carries a `profile-claim.json` marker, written automatically when the parent is empty or already holds a session from this server
+- `--claim-profile-root` - Take over a non-default profile directory this server will not claim on its own: one whose parent already holds other files, or one carrying an ownership marker written for a different path (a mounted volume that moved). Needed once
 - `--chrome-path PATH` - Path to Chrome/Chromium executable (rarely needed in Docker)
 - `--proxy-server URL` - Route the browser through a proxy, as `scheme://host:port`. Set the password via `PROXY_PASSWORD` (no flag, so it stays out of the process list)
 
 > [!NOTE]
-> `--login` and `--no-headless` are not available in Docker (no display server). Use the [uvx setup](#-uvx-setup-recommended---universal) to create profiles.
+> `--login` is not usable in Docker yet: Chromium has a virtual display, but the image has no viewer for completing the login. Docker is already headed by default; `--no-headless` therefore changes nothing. Use the [uvx setup](#-uvx-setup-recommended---universal) to create profiles. The experimental `--daemon` is also ignored in Docker because its owner can outlive the virtual display.
 
 **HTTP Mode Example (for web-based MCP clients):**
 
 ```bash
 docker run -it --rm \
   -v ~/.linkedin-mcp:/home/pwuser/.linkedin-mcp \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   stickerdaniel/linkedin-mcp-server:latest \
   --transport streamable-http --host 0.0.0.0 --port 8080 --path /mcp
 ```
+
+Both halves of that are needed, and they do different jobs. `--host 0.0.0.0`
+makes the server reachable *inside* the container: a process bound to
+`127.0.0.1` in there cannot be reached through a published port at all. The
+`127.0.0.1:` in front of `-p` is what limits it *outside*, to this machine.
+Drop that prefix and Docker publishes on every interface, which puts an
+endpoint with no authentication on your network. The server cannot tell the two
+apart, so it warns either way.
+
+Loopback publishing limits this to the machine, not to the container. Other
+containers on the same host can still reach it through `host.docker.internal`
+wherever that name resolves, which is the default on Docker Desktop and
+OrbStack but not on native Linux Docker.
 
 Runtime server logs are emitted by FastMCP/Uvicorn.
 
@@ -485,6 +503,9 @@ belongs behind something that provides it.
 
 - If Chrome is installed in a non-standard location, use `--chrome-path /path/to/chrome`
 - Can also set via environment variable: `CHROME_PATH=/path/to/chrome`
+- On macOS and Linux the browser must be at least as new as the one that last opened your profile, and the server refuses the launch otherwise. (Not on Windows: a browser there cannot be asked its version without starting one, so the check is off.) An older browser can silently drop stores a newer one wrote, the saved session among them, and the failure then looks exactly like an expired login. The message names both versions. Going back to the bundled Chromium after running a newer Chrome once is the usual way to meet this; either run the newer browser again, whichever one that was, or run `--login`, which moves the stored session aside and signs in fresh with the browser you have. `--logout` also clears it but discards the old session instead of keeping it recoverable, and it asks for confirmation on the terminal, so it is not usable from a server an MCP client started.
+- Only Chrome, Chromium and Chrome for Testing are compared this way. Forks number themselves differently (Vivaldi is on 7.x, Edge's build number sits far below Chrome's under the same major), so pointing `CHROME_PATH` at one turns the check off rather than producing a refusal nothing could satisfy.
+- In the documented Docker setup this check does not apply. The container never opens the profile you created with `--login`; it derives its own from your cookies, and by default rebuilds that from scratch on every start, so there is nothing for an older image to downgrade. With `EXPERIMENTAL_PERSIST_DERIVED_RUNTIME` the derived profile is kept, and an image tag that moves backwards then throws it away and re-derives it, again with nothing for you to do. The check matters on the host, where the server opens that profile directly. Not during `--login` itself, which moves the old profile aside before it starts a browser and so can never trip it.
 
 </details>
 
@@ -539,10 +560,10 @@ The local server uses the same managed-runtime flow as MCPB and `uvx`: it prepar
 - `--timeout MS` - Browser timeout for page operations in milliseconds (default: 5000)
 - `--tool-timeout SECONDS` - Per-tool MCP execution timeout in seconds (default: 180.0). Increase further for heavy scrapes / cold-start Chromium / slow networks.
 - `--status` - Check if current session is valid and exit
-- `--user-data-dir PATH` - Path to persistent browser profile directory (default: ~/.linkedin-mcp/profile)
+- `--user-data-dir PATH` - Path to persistent browser profile directory (default: ~/.linkedin-mcp/profile). Rotating or clearing a session moves and deletes this directory *and its parent*, which also holds `cookies.json`, `source-state.json` and the derived runtime profiles. A path other than the default is therefore only used once it carries a `profile-claim.json` marker, written automatically when the parent is empty or already holds a session from this server
+- `--claim-profile-root` - Take over a non-default profile directory this server will not claim on its own: one whose parent already holds other files, or one carrying an ownership marker written for a different path (a mounted volume that moved). Needed once
 - `--slow-mo MS` - Delay between browser actions in milliseconds (default: 0, useful for debugging)
-- `--user-agent STRING` - Custom browser user agent
-- `--viewport WxH` - Browser viewport size (default: 1280x720)
+- `--viewport WxH` - Browser viewport size (default: 1280x720). Applies to the normal windowless mode only; a headed launch (`--no-headless`, `--login`) uses the real window size
 - `--chrome-path PATH` - Path to Chrome/Chromium executable (for custom browser installations)
 - `--proxy-server URL` - Route the browser through a proxy, as `scheme://host:port`. Set the password via `PROXY_PASSWORD` (no flag, so it stays out of the process list)
 - `--help` - Show help
@@ -634,6 +655,8 @@ uv run -m linkedin_mcp_server --transport streamable-http --host 127.0.0.1 --por
 
 - If Chrome is installed in a non-standard location, use `--chrome-path /path/to/chrome`
 - Can also set via environment variable: `CHROME_PATH=/path/to/chrome`
+- On macOS and Linux the browser must be at least as new as the one that last opened your profile, and the server refuses the launch otherwise. (Not on Windows: a browser there cannot be asked its version without starting one, so the check is off.) An older browser can silently drop stores a newer one wrote, the saved session among them, and the failure then looks exactly like an expired login. The message names both versions. Going back to the bundled Chromium after running a newer Chrome once is the usual way to meet this; either run the newer browser again, whichever one that was, or run `--login`, which moves the stored session aside and signs in fresh with the browser you have. `--logout` also clears it but discards the old session instead of keeping it recoverable, and it asks for confirmation on the terminal, so it is not usable from a server an MCP client started.
+- Only Chrome, Chromium and Chrome for Testing are compared this way. Forks number themselves differently (Vivaldi is on 7.x, Edge's build number sits far below Chrome's under the same major), so pointing `CHROME_PATH` at one turns the check off rather than producing a refusal nothing could satisfy.
 
 </details>
 

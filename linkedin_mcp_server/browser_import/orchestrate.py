@@ -37,7 +37,6 @@ from linkedin_mcp_server.browser_import.extract import (
     extract_linkedin_cookies,
     read_li_at_meta,
 )
-from linkedin_mcp_server.browser_import.user_agent import synthesize_user_agent
 from linkedin_mcp_server.common_utils import harden_linkedin_tree, secure_write_text
 
 from linkedin_mcp_server.exceptions import (
@@ -47,9 +46,11 @@ from linkedin_mcp_server.exceptions import (
     NoLinkedInSessionFoundError,
 )
 from linkedin_mcp_server.profile_lease import ProfileLease, get_profile_lease
+from linkedin_mcp_server.setup import UNGUARDED, a_peer_already_signed_in
 from linkedin_mcp_server.session_state import (
     run_deferring_cancels,
     portable_cookie_path,
+    reset_source_profile,
     restore_source_profile,
     rotate_shielded,
     write_source_state,
@@ -193,6 +194,7 @@ async def import_session_from_browser(
     browser: str | None,
     *,
     user_data_dir: Path,
+    superseded_by: str | None | object = UNGUARDED,
 ) -> bool:
     """Discover, rank, decrypt, validate and persist a browser LinkedIn session.
 
@@ -242,6 +244,17 @@ async def import_session_from_browser(
         )
     release_profile = True
     try:
+        # Checked with the profile in hand, for the same reason the login checks
+        # there: two clients meeting one bad session both decide to repair it,
+        # both queue, and the one that waited is acting on an answer formed before
+        # the winner finished. The rotation below does not ask whose session it is
+        # retiring. Measured with two real processes: the loser rotated away the
+        # session the winner had just imported.
+        if superseded_by is not UNGUARDED and a_peer_already_signed_in(
+            user_data_dir, superseded_by
+        ):
+            logger.info("Another client already signed in; keeping its session")
+            return True
         return await _import_holding_the_profile(
             live, cookie_path, user_data_dir, lease
         )
@@ -323,14 +336,8 @@ async def _import_first_accepted(
             continue
         staged_any = True
 
-        # Synthesize the source browser's UA so validation and every later
-        # runtime session replay the cookie under the fingerprint it was minted
-        # with (None keeps the runtime default; file I/O, so off the loop).
-        user_agent = await asyncio.to_thread(synthesize_user_agent, profile)
-        if await validate_imported_cookies(
-            cookie_path, user_data_dir, user_agent=user_agent
-        ):
-            write_source_state(user_data_dir, user_agent=user_agent)
+        if await validate_imported_cookies(cookie_path, user_data_dir):
+            write_source_state(user_data_dir)
             logger.info(
                 "Imported LinkedIn session from %s/%s",
                 profile.browser,
@@ -340,8 +347,7 @@ async def _import_first_accepted(
 
         # Cookie was present but LinkedIn rejected it (revoked/remote logout).
         # Drop the partial artifacts and try the next-freshest browser.
-        cookie_path.unlink(missing_ok=True)
-        _reset_profile_dir(user_data_dir)
+        reset_source_profile(user_data_dir)
         logger.info(
             "%s/%s had an li_at but LinkedIn rejected the session; trying the "
             "next browser",
@@ -360,10 +366,3 @@ async def _import_first_accepted(
             "app-bound encryption). Run --login to create a session instead."
         )
     return False
-
-
-def _reset_profile_dir(user_data_dir: Path) -> None:
-    """Clear the seeded profile between failed attempts so cookies don't mix."""
-    import shutil
-
-    shutil.rmtree(user_data_dir, ignore_errors=True)

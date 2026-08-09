@@ -50,11 +50,6 @@ class SourceState:
     created_at: str
     profile_path: str
     cookies_path: str
-    # The user agent the session's cookies were minted under (synthesized from
-    # the source browser during import, see browser_import/user_agent.py). None
-    # for manual logins (the cookie is minted in the runtime browser itself, so
-    # its default UA already matches) and for pre-existing state files.
-    user_agent: str | None = None
 
 
 @dataclass
@@ -74,15 +69,32 @@ _SOURCE_STATE_FIELDS = frozenset(field.name for field in fields(SourceState))
 _RUNTIME_STATE_FIELDS = frozenset(field.name for field in fields(RuntimeState))
 
 
+def canonical(profile_dir: Path) -> Path:
+    """Expand and resolve one profile path, the only way this module spells it.
+
+    Both halves, everywhere, and the pairing is what was missing. Expanding
+    without resolving and resolving without expanding used to sit side by side
+    here: ``get_source_profile_dir`` did the first, ``auth_root_dir`` the
+    second. An ordinary relative path survives that split, because it denotes
+    the same object as its ``resolve()`` for as long as the working directory
+    holds. **A symlink does not.** ``shutil.move`` relocates the link itself
+    while the sidecars are computed from the target's parent, so a rotation
+    would move the profile out of one directory and its cookies out of another,
+    and afterwards the same name would resolve against its lexical parent
+    instead. One session, split across two roots, with no error anywhere.
+    """
+    return profile_dir.expanduser().resolve()
+
+
 def get_source_profile_dir() -> Path:
     """Return the configured source profile directory."""
-    return Path(get_config().browser.user_data_dir).expanduser()
+    return canonical(Path(get_config().browser.user_data_dir))
 
 
 def auth_root_dir(source_profile_dir: Path | None = None) -> Path:
     """Return the root directory containing auth artifacts."""
     profile_dir = source_profile_dir or get_source_profile_dir()
-    return profile_dir.expanduser().resolve().parent
+    return canonical(profile_dir).parent
 
 
 def portable_cookie_path(source_profile_dir: Path | None = None) -> Path:
@@ -126,7 +138,7 @@ def runtime_storage_state_path(
 
 def profile_exists(profile_dir: Path | None = None) -> bool:
     """Check if a browser profile directory exists and is non-empty."""
-    profile_dir = (profile_dir or get_source_profile_dir()).expanduser()
+    profile_dir = canonical(profile_dir or get_source_profile_dir())
     return profile_dir.is_dir() and any(profile_dir.iterdir())
 
 
@@ -427,15 +439,15 @@ def load_source_state(source_profile_dir: Path | None = None) -> SourceState | N
         return None
 
 
-def write_source_state(
-    source_profile_dir: Path | None = None,
-    *,
-    user_agent: str | None = None,
-) -> SourceState:
-    """Write a fresh source session generation after successful login."""
-    profile_dir = (
-        (source_profile_dir or get_source_profile_dir()).expanduser().resolve()
-    )
+def write_source_state(source_profile_dir: Path | None = None) -> SourceState:
+    """Write a fresh source session generation after successful login.
+
+    State files written before the user-agent override was removed still carry
+    a ``user_agent`` key. :func:`load_source_state` filters to the fields the
+    dataclass declares, so those files keep loading and shed the key the next
+    time this runs.
+    """
+    profile_dir = canonical(source_profile_dir or get_source_profile_dir())
     state = SourceState(
         version=1,
         source_runtime_id=get_runtime_id(),
@@ -443,7 +455,6 @@ def write_source_state(
         created_at=utcnow_iso(),
         profile_path=str(profile_dir),
         cookies_path=str(portable_cookie_path(profile_dir)),
-        user_agent=user_agent,
     )
     _write_json(source_state_path(profile_dir), asdict(state))
     return state
@@ -496,10 +507,42 @@ def write_runtime_state(
     return state
 
 
+def _owned(source_profile_dir: Path | None) -> Path:
+    """The source root, canonical, once it has proved this server owns it.
+
+    Every operation below that moves or deletes calls this on the *source* root
+    it was handed, never on a target it derived. A derived runtime profile is
+    computed from the source root and is therefore downstream of a check that
+    already passed; re-checking it there would ask about
+    ``<auth-root>/runtime-profiles/<runtime>``, a nested root nobody claims, and
+    would refuse the container.
+
+    Raises:
+        ProfileRootRefusedError: The root is neither the canonical default nor
+            claimed. Nothing has been touched when this is raised, which is the
+            reason it is called before any exists-or-empty short-circuit rather
+            than after.
+    """
+    from linkedin_mcp_server.profile_claim import require_profile_claim
+
+    return require_profile_claim(source_profile_dir or get_source_profile_dir())
+
+
 def clear_runtime_profile(
     runtime_id: str, source_profile_dir: Path | None = None
 ) -> bool:
-    """Remove one derived runtime profile and its metadata."""
+    """Remove one derived runtime profile and its metadata.
+
+    Raises like its siblings, and the one caller that must not see a raise
+    swallows it there rather than here. Two call sites want opposite things: the
+    teardown of a failed bridge is cleanup, where an ownership complaint would
+    replace the failure already in flight, while the clear at the *start* of a
+    bridge is a precondition — continuing past it would import cookies over a
+    derived profile from an earlier login generation, which is the profile
+    mixing this module exists to prevent. Reporting ``False`` from here served
+    the first and quietly broke the second.
+    """
+    source_profile_dir = _owned(source_profile_dir)
     target = runtime_dir(runtime_id, source_profile_dir)
     if not target.exists():
         return True
@@ -694,7 +737,63 @@ def _exclusive_profile(profile_dir: Path, *, action: str) -> Iterator[None]:
         lease.release()
 
 
-def rotate_source_profile(source_profile_dir: Path | None = None) -> Path | None:
+#: Distinguishes "no generation was observed" from "nothing asked for a guard".
+#: ``None`` cannot do both: a profile with no session reads as ``None``, and two
+#: clients meeting that state need protecting from each other exactly as much as
+#: two meeting a stale one. Measured with the two conflated: the second client
+#: rotated away the session the first had just created.
+UNGUARDED = object()
+
+
+class PeerSessionInPlaceError(RuntimeError):
+    """A peer replaced the session this rotation was asked to retire.
+
+    Raised rather than returned as ``None``, which already means "there was
+    nothing to retire". The two look identical to a caller and are not: one is a
+    no-op, the other means somebody else has done the work and this caller should
+    stop rather than carry on as though it had. Measured with them conflated: the
+    caller went on to promise a login window that never opened.
+    """
+
+
+def a_peer_already_signed_in(
+    user_data_dir: Path, superseded_by: str | None | object
+) -> bool:
+    """Whether a usable session other than *superseded_by* is on disk now.
+
+    Asked by every path that rotates the profile to make room for a new session,
+    which is the login here and the browser import next door, and asked only once
+    that path holds the profile lease. That is the first moment the answer cannot
+    change underneath it.
+
+    Both halves are needed. A different generation alone is not enough: an
+    abandoned attempt leaves the profile rotated and no generation at all, which
+    also reads as different, and standing down there would mean nobody ever signs
+    in. A usable session alone is not enough either, because the dead one still
+    looks usable from disk: readiness asks whether the files are there, not
+    whether LinkedIn still accepts them.
+
+    Together they mean what is wanted, because a generation is written only after
+    a login or import has validated its session and exported the cookies.
+    """
+    from linkedin_mcp_server.bootstrap import _auth_ready
+    from linkedin_mcp_server.session_state import load_source_state
+
+    state = load_source_state(user_data_dir)
+    if state is None or state.login_generation == superseded_by:
+        return False
+    # The same directory the generation came from. Asking about the configured
+    # one instead would answer a different question than the one asked, and
+    # quietly: a caller handed an explicit profile would get the default
+    # profile's verdict while rotating theirs.
+    return _auth_ready(user_data_dir)
+
+
+def rotate_source_profile(
+    source_profile_dir: Path | None = None,
+    *,
+    superseded_by: str | None | object = UNGUARDED,
+) -> Path | None:
     """Retire the current source session so the next one starts clean.
 
     Chromium mints ``machine_id``, ``session_id_generator_last_value`` and
@@ -707,17 +806,37 @@ def rotate_source_profile(source_profile_dir: Path | None = None) -> Path | None
     The retired artifacts are moved, not deleted, so a session that turns out to
     have been fine is still recoverable. ``--logout`` clears the quarantines.
 
+    *superseded_by* is the generation the caller found broken. Given one, this
+    retires nothing if a *different* usable session is on disk by the time the
+    profile is held, because somebody else has replaced it in the meantime.
+
+    The comparison belongs here rather than at the call site, and that is the
+    whole point of the argument. A caller deciding first and rotating afterwards
+    leaves a gap: measured, a peer completing a login inside it had its fresh
+    session quarantined by a process acting on a view formed before it existed.
+    Under the lease below, the answer cannot change between reading it and acting
+    on it.
+
     Returns the quarantine directory, or ``None`` when there was nothing to
     retire.
 
     Raises:
+        ProfileRootRefusedError: The configured root is not one this server owns,
+            so nothing was moved. Checked before the no-op return above, because
+            a foreign directory with none of our artifacts in it reaches that
+            return without ever being judged.
+        PeerSessionInPlaceError: Another client signed in first, so its session
+            is on disk and this rotation must not touch it. Distinct from the
+            ``None`` above, and the distinction is load-bearing: both mean "did
+            not rotate", but only one of them means a usable session now exists.
+            Conflated, the caller promised a login window it never opened.
         RuntimeError: Another process holds the profile. Rotating underneath a
             live Chromium corrupts both the old and the new session.
         OSError: A move failed. Whatever had already moved is put back first, so
             the caller always sees either the old session intact or a complete
             retirement, never one session split across both.
     """
-    profile_dir = (source_profile_dir or get_source_profile_dir()).expanduser()
+    profile_dir = _owned(source_profile_dir)
     existing = [
         target for target in _auth_state_targets(profile_dir) if target.exists()
     ]
@@ -725,6 +844,17 @@ def rotate_source_profile(source_profile_dir: Path | None = None) -> Path | None
         return None
 
     with _exclusive_profile(profile_dir, action="creating a new session"):
+        if superseded_by is not UNGUARDED and a_peer_already_signed_in(
+            profile_dir, superseded_by
+        ):
+            logger.info(
+                "Another client already signed in; leaving its session in place"
+            )
+            raise PeerSessionInPlaceError(
+                "Another LinkedIn MCP client has already signed in. Retry this "
+                "tool to use its session."
+            )
+
         # utcnow_iso() is second-resolution and rotation is now routine rather
         # than exceptional, so two rotations can land in the same second. The
         # suffix keeps them from merging into one directory.
@@ -778,12 +908,40 @@ def restore_source_profile(
     Returns ``False`` when the active paths are already occupied — the
     replacement succeeded after all, and overwriting it would be the very
     fingerprint mixing this module exists to prevent.
+
+    Raises:
+        ProfileRootRefusedError: Either the root is not ours, or *backup_dir* is
+            not one of our quarantines directly inside it. Both are checked, and
+            the second matters on its own: this reads whatever *backup_dir*
+            contains and moves the matching names into the live session, so an
+            unchecked one is a way to write a foreign directory's contents into
+            an owned root.
     """
+    profile_dir = _owned(source_profile_dir)
+    backup_dir = _our_quarantine(backup_dir, profile_dir)
     if not backup_dir.is_dir():
         return False
-    profile_dir = (source_profile_dir or get_source_profile_dir()).expanduser()
     with _exclusive_profile(profile_dir, action="restoring the previous session"):
         return _restore_source_profile_locked(backup_dir, profile_dir)
+
+
+def _our_quarantine(backup_dir: Path, profile_dir: Path) -> Path:
+    """Check *backup_dir* is a quarantine this server made in *profile_dir*'s root.
+
+    Name and location, not just location. ``_restore_source_profile_locked``
+    also parks debris at ``<backup_dir>-superseded`` and finally ``rmdir``s the
+    directory, so anything accepted here is written beside as well as read from.
+    """
+    from linkedin_mcp_server.exceptions import ProfileRootRefusedError
+
+    candidate = canonical(backup_dir)
+    root = auth_root_dir(profile_dir)
+    if candidate.parent != root or not candidate.name.startswith(QUARANTINE_PREFIX):
+        raise ProfileRootRefusedError(
+            f"Refusing to restore from {candidate}: a retired session lives in "
+            f"{root} under a name starting with {QUARANTINE_PREFIX!r}."
+        )
+    return candidate
 
 
 def _restore_source_profile_locked(backup_dir: Path, profile_dir: Path) -> bool:
@@ -855,12 +1013,17 @@ def _retire(backup_dir: Path, targets: list[Path]) -> None:
 def clear_auth_state(source_profile_dir: Path | None = None) -> bool:
     """Remove source auth artifacts, derived runtime profiles and quarantines.
 
+    The ownership marker is deliberately not among the targets. Logout is
+    exactly when the next run needs it: erasing it would leave a custom root
+    unclaimed, and the login that follows would be refused.
+
     Raises:
+        ProfileRootRefusedError: The root is not one this server owns.
         RuntimeError: Another process is using the profile. Deleting it out from
             under a live browser corrupts that session and, with several clients,
             destroys everyone's rather than just this caller's.
     """
-    profile_dir = (source_profile_dir or get_source_profile_dir()).expanduser()
+    profile_dir = _owned(source_profile_dir)
     with _exclusive_profile(profile_dir, action="clearing the stored session"):
         # Quarantines hold previous sessions' cookies, so a logout that left them
         # behind would not be the "clear all stored auth state" the CLI
@@ -880,6 +1043,25 @@ def clear_auth_state(source_profile_dir: Path | None = None) -> bool:
                 logger.warning("Could not clear auth artifact %s: %s", target, exc)
                 success = False
         return success
+
+
+def reset_source_profile(source_profile_dir: Path | None = None) -> None:
+    """Drop a half-staged session so the next attempt cannot mix with it.
+
+    Lives here rather than beside its one caller in the import path, which is
+    the point: as a private helper over there it was a bare
+    ``rmtree(user_data_dir, ignore_errors=True)`` that no guard could see. Both
+    artifacts go together because the import writes both — the staged cookies
+    first, then whatever Chromium put in the profile while validating them — and
+    leaving either behind is how the next candidate browser's session would be
+    read through the previous one's.
+
+    Best effort by design: this runs between attempts, and a failure to clean up
+    must not end an import that still has candidates left.
+    """
+    profile_dir = _owned(source_profile_dir)
+    portable_cookie_path(profile_dir).unlink(missing_ok=True)
+    shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:

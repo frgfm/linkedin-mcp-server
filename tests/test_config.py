@@ -309,6 +309,39 @@ class TestConfigSingleton:
         assert first is not second
 
 
+class TestUserAgentRefusal:
+    """Both ways of setting a user agent must stop the server, not be ignored.
+
+    Someone who set this wanted the browser to present itself differently.
+    Starting anyway would leave them believing it still applies while the
+    browser reports something else entirely, so the failure is loud and says
+    what to remove.
+    """
+
+    def test_env_user_agent_refuses_to_start(self, monkeypatch):
+        monkeypatch.setenv("USER_AGENT", "CustomAgent/1.0")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        with pytest.raises(ConfigurationError, match="USER_AGENT"):
+            load_from_env(AppConfig())
+
+    def test_empty_env_user_agent_is_not_a_setting(self, monkeypatch):
+        """An empty value is nobody's intent, so it must not block startup."""
+        monkeypatch.setenv("USER_AGENT", "")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        assert load_from_env(AppConfig()).browser.user_agent is None
+
+    def test_cli_user_agent_refuses_to_start(self, monkeypatch):
+        monkeypatch.setattr(
+            "sys.argv", ["linkedin-mcp-server", "--user-agent", "CustomAgent/1.0"]
+        )
+        from linkedin_mcp_server.config.loaders import load_from_args
+
+        with pytest.raises(ConfigurationError, match="--user-agent"):
+            load_from_args(AppConfig())
+
+
 class TestLoaders:
     def test_load_from_env_headless_false(self, monkeypatch):
         monkeypatch.setenv("HEADLESS", "false")
@@ -452,6 +485,30 @@ class TestLoaders:
 
         config = load_from_args(AppConfig())
         assert config.server.tool_timeout_seconds == 7.5
+
+    def test_claim_profile_root_defaults_off(self, monkeypatch):
+        """Taking over an occupied directory is never the default."""
+        monkeypatch.setattr("sys.argv", ["linkedin-mcp-server"])
+        from linkedin_mcp_server.config.loaders import load_from_args
+
+        assert load_from_args(AppConfig()).server.claim_profile_root is False
+
+    def test_claim_profile_root_is_reachable_from_the_command_line(self, monkeypatch):
+        monkeypatch.setattr("sys.argv", ["linkedin-mcp-server", "--claim-profile-root"])
+        from linkedin_mcp_server.config.loaders import load_from_args
+
+        assert load_from_args(AppConfig()).server.claim_profile_root is True
+
+    def test_claim_profile_root_is_not_part_of_the_owner_fingerprint(self):
+        """It decides whether a marker may be written, not what the browser is.
+
+        Listing it would change the configuration fingerprint for everyone and
+        make every existing owner unreadable, which is how an owner stops being
+        retirable at all.
+        """
+        from linkedin_mcp_server.daemon_descriptor import SHARED_CONFIG_FIELDS
+
+        assert "claim_profile_root" not in SHARED_CONFIG_FIELDS
 
     @pytest.mark.parametrize("bad_value", ["0", "-1", "abc", "nan", "inf"])
     def test_load_from_args_invalid_tool_timeout(self, monkeypatch, bad_value):
@@ -1065,6 +1122,122 @@ class TestProxyLoaders:
         with pytest.raises(SystemExit):
             load_from_args(AppConfig())
         assert self.SECRET not in capsys.readouterr().err
+
+
+class TestProxyMcpbPlaceholders:
+    """An MCPB host that left ``${user_config.NAME}`` in place means "blank".
+
+    Claude Desktop builds its substitution map from the manifest's ``default``
+    values and the user's answers. A field with neither is missing from that
+    map, so the placeholder reaches the process verbatim. The manifest now
+    declares a ``default`` for each optional field, which is what stops this at
+    the source; these cover the bundles installed before that and any host that
+    resolves user configuration differently.
+    """
+
+    PLACEHOLDERS = {
+        "PROXY_SERVER": "${user_config.proxy_server}",
+        "PROXY_USERNAME": "${user_config.proxy_username}",
+        "PROXY_PASSWORD": "${user_config.proxy_password}",
+        "PROXY_BYPASS": "${user_config.proxy_bypass}",
+    }
+
+    def test_all_four_placeholders_leave_no_proxy_configured(self, monkeypatch):
+        # The reported crash: validate() read the literal as an address, found
+        # no port, and took the whole server down at startup.
+        for key, value in self.PLACEHOLDERS.items():
+            monkeypatch.setenv(key, value)
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        config.validate()
+        assert config.browser.proxy_settings() is None
+
+    @pytest.mark.parametrize("key", sorted(PLACEHOLDERS))
+    def test_each_placeholder_alone_leaves_no_proxy_configured(
+        self, monkeypatch, key: str
+    ):
+        # Each one on its own is fatal too: without a server the other three
+        # raise "is set without proxy_server" instead.
+        monkeypatch.setenv(key, self.PLACEHOLDERS[key])
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        config.validate()
+        assert config.browser.proxy_settings() is None
+
+    def test_a_configured_proxy_is_not_given_placeholder_credentials(self, monkeypatch):
+        # The quieter half. With only the server filled in, the remaining three
+        # placeholders used to reach Chromium as a username, a password and a
+        # bypass list. That does not crash; it fails as a 407 the browser
+        # retries until the page times out, which reads as an expired session.
+        monkeypatch.setenv("PROXY_SERVER", "http://gate.example:7000")
+        for key in ("PROXY_USERNAME", "PROXY_PASSWORD", "PROXY_BYPASS"):
+            monkeypatch.setenv(key, self.PLACEHOLDERS[key])
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        config.validate()
+        assert config.browser.proxy_settings() == {"server": "http://gate.example:7000"}
+
+    def test_dropped_placeholders_are_named_once(self, monkeypatch, caplog):
+        # Silence would be the wrong default here: if a host ever failed to
+        # substitute a field the user did fill in, the browser would go out on
+        # the real address with no trace of why.
+        for key, value in self.PLACEHOLDERS.items():
+            monkeypatch.setenv(key, value)
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        with caplog.at_level(logging.WARNING, logger="linkedin_mcp_server.config"):
+            load_from_env(AppConfig())
+
+        warnings = [
+            record
+            for record in caplog.records
+            if "unsubstituted MCPB placeholder" in record.getMessage()
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        for key in self.PLACEHOLDERS:
+            assert key in message
+
+    def test_a_real_setting_that_merely_resembles_one_is_kept(self, monkeypatch):
+        # Anything that is not the exact literal stays a value and reaches
+        # validation, which can explain it.
+        monkeypatch.setenv("PROXY_SERVER", "http://user-config.example:7000")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        config.validate()
+        assert config.browser.proxy_server == "http://user-config.example:7000"
+
+    def test_a_password_shaped_like_another_placeholder_survives(self, monkeypatch):
+        # Why the comparison is against one exact string per variable and not
+        # against the shape of a placeholder. "${user_config.token}" is a legal
+        # password, and a host that never wrote it cannot be the reason it is
+        # there. Dropping it would leave the browser authenticating with
+        # nothing against a proxy that requires it.
+        secret = "${user_config.token}"
+        monkeypatch.setenv("PROXY_SERVER", "http://gate.example:7000")
+        monkeypatch.setenv("PROXY_USERNAME", "envuser")
+        monkeypatch.setenv("PROXY_PASSWORD", secret)
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        config.validate()
+        assert config.browser.proxy_password == secret
+
+    def test_a_password_keeps_its_surrounding_whitespace(self, monkeypatch):
+        # Guards the decision not to strip: trimming a password would be a
+        # wrong credential with nothing in the logs to show for it.
+        monkeypatch.setenv("PROXY_SERVER", "http://gate.example:7000")
+        monkeypatch.setenv("PROXY_USERNAME", "envuser")
+        monkeypatch.setenv("PROXY_PASSWORD", "  padded  ")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        config.validate()
+        assert config.browser.proxy_password == "  padded  "
 
 
 class TestProxyEmptyPassword:

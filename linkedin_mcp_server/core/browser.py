@@ -21,7 +21,16 @@ from linkedin_mcp_server.common_utils import (
     secure_write_text,
 )
 
-from linkedin_mcp_server.exceptions import BrowserShutdownUnconfirmedError
+from linkedin_mcp_server.browser_downgrade import refuse_a_downgrade
+from linkedin_mcp_server.exceptions import (
+    BrowserDowngradeError,
+    BrowserShutdownUnconfirmedError,
+)
+from linkedin_mcp_server.hidden_target import (
+    attaching_to_other_targets,
+    hidden_target_is_supported,
+    open_hidden_page,
+)
 
 from .exceptions import NetworkError, ProxyConnectionError
 
@@ -64,20 +73,56 @@ class BrowserManager:
         headless: bool = True,
         slow_mo: int = 0,
         viewport: dict[str, int] | None = None,
-        user_agent: str | None = None,
         **launch_options: Any,
     ):
+        # ``launch_options`` is spread straight into the context options, so a
+        # stray ``user_agent`` here would reach Patchright and take effect
+        # without anything in between noticing. Refused rather than dropped:
+        # this is the one funnel every browser in the process goes through, and
+        # an override that fails loudly cannot come back by accident. See the
+        # browser identity rules in AGENTS.md.
+        if "user_agent" in launch_options:
+            raise TypeError(
+                "BrowserManager does not accept a user_agent. The browser "
+                "reports its own identity; an override changes the string but "
+                "not the client hints, and never reaches service workers."
+            )
+
+        # Same funnel, same hazard. ``_geometry()`` is spread *before*
+        # ``launch_options``, so a stray ``no_viewport`` would win: passing
+        # ``no_viewport=False`` on a headed launch puts the emulated screen back
+        # and restores the window-larger-than-screen contradiction, and passing
+        # ``no_viewport=True`` on a headless one sends both keys at once.
+        # Nothing produces this today; it is refused so it cannot start.
+        if "no_viewport" in launch_options:
+            raise TypeError(
+                "BrowserManager decides no_viewport from the launch mode. Pass "
+                "headless= instead: a headed window must report its real size, "
+                "and a headless one needs an explicit viewport."
+            )
+
         self.user_data_dir = str(Path(user_data_dir).expanduser())
         self.headless = headless
         self.slow_mo = slow_mo
-        self.viewport = viewport or {"width": 1280, "height": 720}
-        self.user_agent = user_agent
+        # Kept as passed, including ``None``. The old ``viewport or {...}``
+        # meant "no viewport" could not be expressed at all, which is what
+        # forced an emulated screen onto a headed window and produced the
+        # measured contradiction: an outer window of 805 pixels standing on a
+        # screen the same browser reported as 720 tall.
+        self.viewport = viewport
         self.launch_options = launch_options
 
         self._playwright: Playwright | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._is_authenticated = False
+        #: Set when a headed launch was attempted and refused, which is the only
+        #: reliable way to learn that this machine has nowhere to put a window.
+        #: Per instance rather than per process, deliberately: a fresh manager
+        #: is built for each browser, so this saves a second doomed attempt
+        #: within one launch without cacheing a machine-wide answer that could
+        #: go stale when somebody logs into a desktop session.
+        self._no_window_available = False
         # False until a teardown proves Chromium exited. Pessimistic by default:
         # a launch that is cancelled before close runs must not read as clean.
         self._close_confirmed = False
@@ -97,42 +142,236 @@ class BrowserManager:
         self._close_confirmed = False
         self._close_confirmed = await self.close()
 
+    @property
+    def _windowless(self) -> bool:
+        """Whether this launch hides its page in a target rather than a mode.
+
+        Both conditions, and the second is not a preference. Asking for no
+        visible window is not enough on a machine that cannot open one: a headed
+        launch there fails outright, so the only way to run at all is Chromium's
+        headless mode, and the browser then says so on every surface. That is a
+        loss worth announcing rather than hiding, which is why it is logged.
+        """
+        return (
+            self.headless
+            and hidden_target_is_supported()
+            and not self._no_window_available
+        )
+
+    def _geometry(self) -> dict[str, Any]:
+        """The viewport options, decided by the mode this browser actually runs in.
+
+        This lives here rather than in ``build_launch_options`` because only
+        this object knows the answer. The builder is a pure function of the
+        configuration, and the configuration says ``headless=True`` by default
+        even when the manual login is about to launch headed -- the login passes
+        ``headless=False`` directly. A builder reading the configuration would
+        get it wrong for exactly the launch that puts a window on screen.
+
+        Headed gets no viewport at all, so the window reports the size it really
+        is. Headless keeps an explicit one, because a headless browser with
+        ``no_viewport`` collapses its screen to 800x600, which is its own
+        oddity.
+        """
+        if self.headless:
+            return {"viewport": self.viewport or {"width": 1280, "height": 720}}
+        return {"no_viewport": True}
+
+    def _executable_about_to_run(self) -> str | None:
+        """The binary this launch will use, or None if it cannot be named.
+
+        An explicit ``executable_path`` is the operator's own choice and wins,
+        exactly as it does inside Playwright (``_prepareToLaunch``). Otherwise
+        the registry answers, and with ``channel="chromium"`` set by
+        ``build_launch_options`` that is the same full Chrome for Testing in
+        both modes: ``getExecutableName()`` returns the channel unchanged
+        before it ever reaches the headless/shell split, and
+        ``executablePath()`` looks up the same registry entry. (Not via
+        ``isChromiumAlias``, which holds only ``chrome-for-testing``.)
+
+        None on anything unexpected, deliberately. Not being able to name the
+        binary says nothing about whether it is older than the profile, and the
+        launch that follows reports a missing browser far better than a guard
+        pretending to know one is there.
+        """
+        custom = self.launch_options.get("executable_path")
+        if custom:
+            return str(custom)
+        playwright = self._playwright
+        if playwright is None:
+            return None
+        try:
+            registry_path = playwright.chromium.executable_path
+        except Exception as exc:
+            logger.debug("Could not resolve the browser executable: %s", exc)
+            return None
+        # The registry answers with `... || ""` when nothing is installed, and
+        # an empty string is not a name. Passed on it would buy a doomed
+        # `subprocess.run(["", "--version"])` and then a warning naming no
+        # binary at all. The launch below is what reports a missing browser,
+        # and it says so with the path.
+        return str(registry_path) if registry_path else None
+
     async def start(self) -> None:
         """Start Patchright and launch persistent browser context."""
         if self._context is not None:
             raise RuntimeError("Browser already started. Call close() first.")
         try:
-            self._playwright = await async_playwright().start()
+            # Only where a hidden target is actually going to be created. The
+            # flag has to exist before the driver subprocess does, and it then
+            # lives in that process for its whole lifetime -- restoring it here
+            # afterwards does nothing to the child. So a visible login, or a
+            # platform that falls back to real headless, would otherwise spend
+            # its entire run promoting extension and other `other` targets into
+            # `context.pages` for no reason.
+            if self._windowless:
+                with attaching_to_other_targets():
+                    self._playwright = await async_playwright().start()
+            else:
+                self._playwright = await async_playwright().start()
+
+            # Before the profile directory is so much as created, and long
+            # before it is opened. The driver had to start first, because only
+            # it can say which binary the registry will hand this launch, but
+            # nothing beyond that has happened yet -- a refusal here leaves the
+            # profile exactly as it was found, which is the whole point of
+            # refusing. Off the event loop: asking a binary for its version
+            # spawns a process and waits ~35 ms for it.
+            await asyncio.to_thread(
+                refuse_a_downgrade,
+                Path(self.user_data_dir),
+                self._executable_about_to_run(),
+            )
 
             secure_mkdir(Path(self.user_data_dir))
             harden_linkedin_tree(Path(self.user_data_dir))
 
             context_options: dict[str, Any] = {
-                "headless": self.headless,
+                # Headed wherever a window can exist, in both public modes.
+                # ``self.headless`` keeps its meaning -- "no visible window" --
+                # but it is no longer how that is achieved, because Chromium's
+                # headless *mode* is what makes the browser announce itself. A
+                # windowless page comes from a hidden target instead.
+                #
+                # Where no display exists there is no choice: a headed launch
+                # dies before any of that can happen. See ``_windowless``.
+                "headless": self.headless and not self._windowless,
                 "slow_mo": self.slow_mo,
-                "viewport": self.viewport,
+                **self._geometry(),
                 **self.launch_options,
                 "locale": "en-US",
             }
 
-            if self.user_agent:
-                context_options["user_agent"] = self.user_agent
+            # No ``user_agent`` here, deliberately. Patchright leaves the client
+            # hints reporting the real browser, so an override contradicts
+            # itself on the first surface anyone checks, and it never reaches
+            # service workers at all. See the browser identity rules in
+            # AGENTS.md and the measurements in docs/browser-fingerprint.md.
+            try:
+                self._context = (
+                    await self._playwright.chromium.launch_persistent_context(
+                        self.user_data_dir,
+                        **context_options,
+                    )
+                )
+            except Exception as exc:
+                # A headed launch needs somewhere to put a window, and whether
+                # this machine has one cannot be decided from the platform name
+                # alone: a Mac reached over SSH, a launchd daemon, or a CI
+                # runner with no GUI session all look like macOS and all refuse
+                # to open one. Rather than enumerate those, let the attempt
+                # answer it -- that is the one check that cannot be wrong about
+                # a case nobody thought of.
+                #
+                # Narrow on purpose: only when a window was asked for and only
+                # once, so a genuine launch failure still surfaces rather than
+                # being retried into a different error.
+                if not self._windowless:
+                    raise
+                logger.warning(
+                    "Could not start a browser with a window (%s), so Chromium "
+                    "runs in headless mode and will identify itself as "
+                    "HeadlessChrome on every surface.",
+                    type(exc).__name__,
+                )
+                self._no_window_available = True
 
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                self.user_data_dir,
-                **context_options,
-            )
+                # The driver has to be replaced, not reused. It was started
+                # with the attach flag, and that flag lives in *its* process for
+                # its whole life -- restoring the parent environment does
+                # nothing to a child that already read it. A driver that keeps
+                # promoting `other` targets would put a component extension's
+                # page into `context.pages`, and the code below takes the first
+                # one as the page to authenticate and scrape with.
+                # Bounded, and its failure survived, for the same reason
+                # ``close()`` bounds its own cleanup: a wedged driver can hang
+                # ``stop()`` indefinitely. Turning a recoverable launch into a
+                # permanent hang would be the worse trade, so a driver that will
+                # not stop is left behind and said so.
+                try:
+                    await asyncio.wait_for(
+                        self._playwright.stop(), timeout=_CLEANUP_TIMEOUT_SECONDS
+                    )
+                except Exception as stop_exc:
+                    logger.warning(
+                        "The refused driver did not stop (%s); continuing with a "
+                        "fresh one.",
+                        type(stop_exc).__name__,
+                    )
+                self._playwright = await async_playwright().start()
+
+                context_options["headless"] = True
+                context_options.pop("no_viewport", None)
+                context_options.update(self._geometry())
+                try:
+                    self._context = (
+                        await self._playwright.chromium.launch_persistent_context(
+                            self.user_data_dir,
+                            **context_options,
+                        )
+                    )
+                except Exception as retry_exc:
+                    # Logged before it is discarded. The raise below keeps the
+                    # first error because that is the one that says what went
+                    # wrong, but losing the second entirely would leave whoever
+                    # debugs this unable to see that the fallback was even
+                    # tried, let alone how it failed.
+                    logger.warning(
+                        "The headless fallback did not start either: %s: %s",
+                        type(retry_exc).__name__,
+                        retry_exc,
+                    )
+                    # The retry is a chance, not a cover-up. If the browser
+                    # will not start either way the problem was never the
+                    # window, and the first error is the one that says what it
+                    # actually was.
+                    raise exc from None
 
             logger.info(
                 "Persistent browser launched (headless=%s, user_data_dir=%s)",
                 self.headless,
                 self.user_data_dir,
             )
+            if self.headless and not self._windowless:
+                logger.info(
+                    "Chromium runs in headless mode on this platform and so "
+                    "identifies itself as HeadlessChrome on every surface. A "
+                    "windowless page needs a browser that survives losing its "
+                    "last window, which is measured only on macOS."
+                )
 
-            if self._context.pages:
-                self._page = self._context.pages[0]
+            startup = (
+                self._context.pages[0]
+                if self._context.pages
+                else await self._context.new_page()
+            )
+            if self._windowless:
+                # Fails closed. Falling back to real headless would restore the
+                # token the caller believes is gone, and falling back to the
+                # visible window would put one on their screen unannounced.
+                self._page = await open_hidden_page(self._context, startup)
             else:
-                self._page = await self._context.new_page()
+                self._page = startup
 
             logger.info("Browser context and page ready")
 
@@ -148,7 +387,27 @@ class BrowserManager:
             # real (a tool timeout racing server shutdown), and a second one
             # landing on the shield would discard the very result that decides
             # whether the profile may be handed on.
-            if not await _await_deferring_cancels(self.close()):
+            closed = await _await_deferring_cancels(self.close())
+            if isinstance(e, BrowserDowngradeError):
+                # Through untouched, and ahead of the shutdown check rather than
+                # after it. Both wrappings below carry a recovery that would
+                # make this worse: `NetworkError` is read downstream as a
+                # missing binary and reinstalls the same old revision, and the
+                # auth path rotates the profile away, destroying an intact
+                # session whose only fault is being newer than the browser
+                # asking for it.
+                #
+                # `BrowserShutdownUnconfirmedError` would be the third, and it
+                # is the reason for the ordering. This refusal happens before
+                # `launch_persistent_context`, so no Chromium ever existed and
+                # nothing can be holding the profile -- only the driver process
+                # is up. Yet a driver that misses its 10 s stop would replace an
+                # actionable message with a generic one *and* leave the caller
+                # marking the profile busy for the rest of this process's life,
+                # over a profile that was never opened. The close still runs;
+                # only its verdict is set aside, and only here.
+                raise
+            if not closed:
                 raise BrowserShutdownUnconfirmedError(
                     "The browser failed to start and did not shut down cleanly, "
                     "so the profile is kept. Restart the server to recover."
@@ -291,7 +550,17 @@ class BrowserManager:
 
         path = Path(cookie_path) if cookie_path else self._default_cookie_path()
         try:
-            all_cookies = await self._context.cookies()
+            # Bounded like the teardown steps below it, and for a stronger
+            # reason. On close this runs *before* them, with the singleton
+            # already cleared and the profile lease still held, inside a section
+            # that defers cancellation until it finishes. A protocol call that
+            # never answers therefore strands the profile before anything
+            # bounded is reached, and raises nothing for anyone to act on: no
+            # close result, no exception, no stand-down. Losing an export costs
+            # the Docker cookie file this run, which the next close rewrites.
+            all_cookies = await asyncio.wait_for(
+                self._context.cookies(), timeout=_CLEANUP_TIMEOUT_SECONDS
+            )
             cookies = [
                 self._normalize_cookie_domain(c)
                 for c in all_cookies

@@ -90,36 +90,10 @@ async def test_interactive_login_writes_source_state_when_cookie_export_succeeds
     browser.export_cookies.assert_awaited_once_with(
         portable_cookie_path(tmp_path / "profile")
     )
-    # No UA override configured -> record None (runtime default is stable).
-    write_source_state.assert_called_once_with(tmp_path / "profile", user_agent=None)
+    write_source_state.assert_called_once_with(tmp_path / "profile")
     captured = capsys.readouterr()
     assert "cookies exported for docker portability" in captured.out.lower()
     assert "source session generation: gen-123" in captured.out.lower()
-
-
-@pytest.mark.asyncio
-async def test_interactive_login_records_override_user_agent(monkeypatch, tmp_path):
-    """A configured UA override is the fingerprint the manual-login cookie was
-    minted under, so it must be recorded in source-state (else a later replay
-    without the override falls back to a different UA)."""
-    browser = _make_browser(export_cookies=True)
-    write_source_state = MagicMock(
-        return_value=SimpleNamespace(login_generation="gen-1")
-    )
-    config = AppConfig()
-    config.browser.user_agent = "CustomAgent/1.0"
-
-    _patch_login_deps(
-        monkeypatch,
-        browser_factory=lambda **kwargs: _BrowserContextManager(browser),
-        config=config,
-        write_source_state=write_source_state,
-    )
-
-    assert await interactive_login(tmp_path / "profile") is True
-    write_source_state.assert_called_once_with(
-        tmp_path / "profile", user_agent="CustomAgent/1.0"
-    )
 
 
 @pytest.mark.asyncio
@@ -181,7 +155,6 @@ async def test_interactive_login_forwards_all_browser_params(monkeypatch, tmp_pa
     config = AppConfig()
     config.browser.chrome_path = "/custom/chrome"
     config.browser.slow_mo = 250
-    config.browser.user_agent = "CustomAgent/1.0"
     config.browser.viewport_width = 1920
     config.browser.viewport_height = 1080
 
@@ -193,9 +166,37 @@ async def test_interactive_login_forwards_all_browser_params(monkeypatch, tmp_pa
     assert captured_kwargs["user_data_dir"] == profile
     assert captured_kwargs["headless"] is False
     assert captured_kwargs["slow_mo"] == 250
-    assert captured_kwargs["user_agent"] == "CustomAgent/1.0"
     assert captured_kwargs["viewport"] == {"width": 1920, "height": 1080}
     assert captured_kwargs["executable_path"] == "/custom/chrome"
+
+
+@pytest.mark.asyncio
+async def test_login_keeps_webrtc_on_the_proxy(monkeypatch, tmp_path):
+    """The login browser needs the WebRTC restriction as much as scraping does.
+
+    This is the path that matters most. The login is where the session is
+    created, so a leak here has been attached to that session from its first
+    moment — and this path used to build its own launch options, which is
+    exactly how a setting ends up applying to scraping but not to login.
+    """
+    browser = _make_browser(export_cookies=True)
+    captured_kwargs: dict = {}
+
+    def fake_browser_manager(**kwargs):
+        captured_kwargs.update(kwargs)
+        return _BrowserContextManager(browser)
+
+    config = AppConfig()
+    config.browser.proxy_server = "http://gate.example:7000"
+
+    _patch_login_deps(monkeypatch, browser_factory=fake_browser_manager, config=config)
+
+    await interactive_login(tmp_path / "profile")
+
+    assert captured_kwargs["proxy"]["server"] == "http://gate.example:7000"
+    args = captured_kwargs["args"]
+    assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in args
+    assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in args
 
 
 @pytest.mark.asyncio
@@ -221,10 +222,15 @@ async def test_interactive_login_passes_slow_mo_to_browser_manager(
 
 
 @pytest.mark.asyncio
-async def test_interactive_login_passes_user_agent_to_browser_manager(
-    monkeypatch, tmp_path
-):
-    """When config.browser.user_agent is set, it must reach BrowserManager."""
+async def test_login_never_overrides_the_user_agent(monkeypatch, tmp_path):
+    """No user agent reaches BrowserManager, even from a config carrying one.
+
+    ``BrowserConfig.user_agent`` still exists, because the daemon's
+    configuration fingerprint hashes it and removing a field there breaks owner
+    turnover. Nothing may read it: the login is where the session is minted, so
+    a UA applied here would be the one every later contradiction is measured
+    against.
+    """
     browser = _make_browser(export_cookies=True)
     captured_kwargs: dict = {}
 
@@ -239,7 +245,7 @@ async def test_interactive_login_passes_user_agent_to_browser_manager(
 
     await interactive_login(tmp_path / "profile")
 
-    assert captured_kwargs.get("user_agent") == "CustomAgent/1.0"
+    assert "user_agent" not in captured_kwargs
 
 
 @pytest.mark.asyncio
@@ -526,3 +532,63 @@ async def test_interactive_login_without_proxy_omits_the_key(monkeypatch, tmp_pa
     await interactive_login(tmp_path / "profile")
 
     assert "proxy" not in captured_kwargs
+
+
+class TestTheExplicitCommandsStayUnguarded:
+    """`--login` and `--import-from-browser` are insistence, not a request.
+
+    Somebody typing them wants a new session whatever is on disk, so they must
+    not stand down for a peer. Asserted at the call sites rather than on the
+    helper's signature default: an earlier version checked only the default, and
+    a mutation passing `superseded_by=None` at the call site left it green while
+    the real command would have skipped the login it was asked for.
+    """
+
+    def test_login_passes_no_generation(self, monkeypatch):
+        import linkedin_mcp_server.setup as setup
+
+        seen: dict[str, object] = {}
+
+        async def capture(profile_dir=None, **kwargs):
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr(setup, "interactive_login", capture)
+
+        assert setup.run_profile_creation("/tmp/whatever") is True
+
+        assert "superseded_by" not in seen, seen
+
+    def test_import_passes_no_generation(self, monkeypatch):
+        import linkedin_mcp_server.browser_import.orchestrate as orchestrate
+
+        seen: dict[str, object] = {}
+
+        async def capture(_browser, *, user_data_dir, **kwargs):
+            seen.update(kwargs)
+            return True
+
+        from linkedin_mcp_server.config import set_config
+        from linkedin_mcp_server.config.schema import AppConfig
+
+        # Installed rather than loaded: the handler calls get_config(), which
+        # parses sys.argv, and under pytest that is pytest's own command line.
+        config = AppConfig()
+        config.server.import_from_browser = "auto"
+        set_config(config)
+
+        monkeypatch.setattr(orchestrate, "import_session_from_browser", capture)
+        monkeypatch.setattr(
+            "linkedin_mcp_server.cli_main.configure_browser_environment", lambda: None
+        )
+        monkeypatch.setattr(
+            "linkedin_mcp_server.cli_main.set_headless", lambda _v: None
+        )
+
+        from linkedin_mcp_server.cli_main import import_from_browser_and_exit
+
+        with pytest.raises(SystemExit) as caught:
+            import_from_browser_and_exit()
+
+        assert caught.value.code == 0
+        assert "superseded_by" not in seen, seen

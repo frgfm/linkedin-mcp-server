@@ -1,5 +1,6 @@
 """Tests for linkedin_mcp_server.drivers.browser runtime-aware auth startup."""
 
+import asyncio
 import json
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -927,6 +928,34 @@ class TestProxyLaunchOptions:
         assert "gate.example" in caplog.text
         assert "s3cr3t" not in caplog.text
 
+    def test_a_proxy_keeps_webrtc_off_the_direct_route(self):
+        """Without this, WebRTC hands the page the real address over UDP.
+
+        Measured against a real STUN server: the page saw the proxy's address
+        in the HTTP request and the machine's real IPv4 and IPv6 in the ICE
+        candidates simultaneously, which makes the proxy pointless against
+        anyone who correlates the two.
+        """
+        browser_module.get_config().browser.proxy_server = "http://gate.example:7000"
+        launch_options, _ = browser_module._launch_options()
+
+        args = launch_options["args"]
+        assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in args
+        # Both spellings: full Chrome reads the plain one through the
+        # command-line pref store, chrome-headless-shell reads only the
+        # --force- variant. Passing one covers half the browser ladder.
+        assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in args
+
+    def test_no_proxy_leaves_webrtc_alone(self):
+        """With a direct connection there is no bypass to prevent.
+
+        The switches do not merely mask the address, they stop ICE from
+        producing candidates at all, so applying them unconditionally would
+        disable a working browser capability for no benefit.
+        """
+        launch_options, _ = browser_module._launch_options()
+        assert "args" not in launch_options
+
     @pytest.mark.asyncio
     async def test_proxy_reaches_the_browser_manager(self, tmp_path):
         _write_source_state(tmp_path, runtime_id="macos-arm64-host")
@@ -1206,3 +1235,39 @@ class TestFeedFailureDoesNotLeakCredentials:
         assert not any("s3cr3t" in trace for trace in traces)
         assert "s3cr3t" not in caplog.text
         assert "acctzone9" not in caplog.text
+
+
+class TestTheCookieExportCannotStrandTheProfile:
+    """Closing runs the export first, and it used to be able to hang there.
+
+    ``export_cookies`` awaits a protocol call that has no deadline of its own,
+    and on close it runs before the bounded teardown, with the singleton already
+    cleared and the profile lease still held, inside a section that defers
+    cancellation. A call that never answered therefore stranded the profile
+    before anything bounded was reached and raised nothing for anyone to act on:
+    no close result, no exception, no stand-down.
+    """
+
+    async def test_an_export_that_never_answers_gives_up(self):
+        from unittest.mock import MagicMock, patch
+
+        from linkedin_mcp_server.core import browser as core
+
+        manager = core.BrowserManager.__new__(core.BrowserManager)
+        context = MagicMock()
+
+        async def never_answers():
+            await asyncio.sleep(3600)
+
+        context.cookies = never_answers
+        manager._context = context
+
+        with patch.object(core, "_CLEANUP_TIMEOUT_SECONDS", 0.2):
+            began = asyncio.get_running_loop().time()
+            exported = await manager.export_cookies("/tmp/never-written.json")
+            took = asyncio.get_running_loop().time() - began
+
+        # Reported as a failed export, not raised: the caller logs it and carries
+        # on to the teardown, which is the part that must not be skipped.
+        assert exported is False
+        assert took < 2, f"the export was still unbounded ({took:.1f}s)"

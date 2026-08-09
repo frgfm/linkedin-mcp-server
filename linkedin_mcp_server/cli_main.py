@@ -3,7 +3,8 @@
 import asyncio
 import logging
 import sys
-from typing import Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, NoReturn
 
 import inquirer
 
@@ -12,8 +13,13 @@ from linkedin_mcp_server.bootstrap import (
     ensure_browser_installed,
 )
 from linkedin_mcp_server.core import AuthenticationError
+from linkedin_mcp_server.exceptions import (
+    BrowserDowngradeError,
+    ProfileRootRefusedError,
+)
 from linkedin_mcp_server.authentication import clear_auth_state
 from linkedin_mcp_server.config import get_config
+from linkedin_mcp_server.config.schema import AppConfig, ConfigurationError
 from linkedin_mcp_server.drivers.browser import (
     experimental_persist_derived_runtime,
     close_browser,
@@ -24,6 +30,7 @@ from linkedin_mcp_server.drivers.browser import (
 )
 from linkedin_mcp_server.debug_trace import should_keep_traces
 from linkedin_mcp_server.logging_config import configure_logging, teardown_trace_logging
+from linkedin_mcp_server.profile_claim import ensure_profile_claim
 from linkedin_mcp_server.session_state import (
     get_runtime_id,
     load_runtime_state,
@@ -33,8 +40,11 @@ from linkedin_mcp_server.session_state import (
     runtime_storage_state_path,
     source_state_path,
 )
-from linkedin_mcp_server.server import create_mcp_server
+from linkedin_mcp_server.server import ServerRole, create_mcp_server
 from linkedin_mcp_server.setup import run_profile_creation
+
+if TYPE_CHECKING:
+    from linkedin_mcp_server.daemon_proxy import DaemonProxyBackend
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +255,12 @@ def profile_info_and_exit() -> None:
             return browser.is_authenticated
         except AuthenticationError:
             return False
+        except BrowserDowngradeError:
+            # Not "unexpected", and no traceback. This is the guard doing its
+            # job, the message already says which two versions and what to do,
+            # and `--status` is the first thing a puzzled user runs. The tool
+            # path treats it the same way, in `error_handler`.
+            raise
         except Exception as e:
             logger.exception(f"Unexpected error checking session: {e}")
             raise
@@ -267,6 +283,11 @@ def profile_info_and_exit() -> None:
 
     try:
         valid = asyncio.run(check_session())
+    except BrowserDowngradeError as e:
+        # Ahead of the generic handler, which would add "Check logs and browser
+        # configuration" to a message that already names the fix exactly.
+        print(f"\n❌ {e}")
+        sys.exit(1)
     except Exception as e:
         print(f"❌ Could not validate session: {e}")
         print("   Check logs and browser configuration.")
@@ -280,6 +301,84 @@ def profile_info_and_exit() -> None:
     print(f"❌ Session expired or invalid (profile: {active_profile})")
     print("   Run with --login to re-authenticate")
     sys.exit(1)
+
+
+def _obtain_shared_owner(config: AppConfig) -> "DaemonProxyBackend | None":
+    """Return the shared owner to forward to, starting one if nobody has.
+
+    Off by default, and inert when off. ``None`` means this process serves its
+    own client the way it always has: the flag is off, the transport is HTTP (one
+    server for many clients already, so there is nothing to deduplicate), or no
+    owner could be established at all.
+
+    Never fatal, and that is a decision rather than an oversight. A client that
+    refused to start because a shared browser could not be elected would fail
+    where nobody can read the reason — an MCP client reports "server failed to
+    start" and the explanation sits in a log the user has not opened. A working
+    server with a warning beats a dead one with a better excuse while the flag is
+    opt-in. It is a real trade, though: falling back means two clients can hand
+    the profile back and forth per call again, which is the cost #606 exists to
+    remove, so the warning is the only thing that says the feature was lost. The
+    balance changes when the flag becomes the default.
+
+    What keeps two processes off one profile on that fallback path is the profile
+    lease from #598, not anything here: the owner takes it when it opens Chromium
+    and hands it over when another process announces itself
+    (``drivers/browser.watch_for_handoff_requests``). The daemon lock decides who
+    *owns* the browser; the lease decides who is driving it right now.
+
+    That safety net carries more weight on Windows than elsewhere, which is worth
+    knowing before the flag becomes the default. A frontend there takes no lock
+    at all and starts a child that competes for one
+    (``daemon_election._start_contending_for_the_lock``), so a local spawn
+    failure is indistinguishable from a rival owner that holds the lock and has
+    not published yet: ``obtain_owner`` returns at once and this process falls
+    back while an owner may in fact be coming up. On POSIX the equivalent
+    outcomes are terminal, because the frontend held the lock itself. Windows
+    already carries platform gaps that gate the default flip, and this is one of
+    them.
+    """
+    from linkedin_mcp_server.daemon import daemon_would_be_used
+
+    if not daemon_would_be_used(config):
+        return None
+
+    try:
+        from linkedin_mcp_server.daemon_election import obtain_owner
+        from linkedin_mcp_server.daemon_proxy import DaemonProxyBackend
+        from linkedin_mcp_server.session_state import auth_root_dir
+
+        profile = get_profile_dir()
+        auth_root = auth_root_dir(profile)
+        outcome = obtain_owner(auth_root, profile, config)
+    except Exception:
+        logger.warning("The shared browser owner is unavailable", exc_info=True)
+        return None
+
+    attachment = outcome.attachment_lookup.attachment
+    if outcome.worth_connecting and attachment is not None:
+        logger.info("Forwarding to the shared browser owner")
+        # Handed on as the election verified it. Re-reading the descriptor or the
+        # token from disk would be a second, unproven read of a pair this one
+        # already matched and reached.
+        #
+        # The election's own inputs travel with it, because they are what finding
+        # a *replacement* would take and nothing downstream has them: the proxy
+        # layer receives no configuration, and reading the singleton there would
+        # parse whatever `sys.argv` holds.
+        return DaemonProxyBackend(
+            attachment=attachment,
+            auth_root=auth_root,
+            profile=profile,
+            config=config,
+        )
+
+    logger.warning(
+        "No shared browser owner could be started (%s); this server will "
+        "drive its own browser",
+        outcome.attachment_lookup.state.value,
+    )
+    return None
 
 
 def get_version() -> str:
@@ -313,9 +412,28 @@ def get_version() -> str:
         return "unknown"
 
 
+def _exit_on_a_bad_setting(error: ConfigurationError) -> NoReturn:
+    """Report a configuration error the way a user can act on it.
+
+    Printed, because logging is configured from the configuration that may be
+    what failed. To stderr for the same reason it carries every other
+    diagnostic here: stdout belongs to the protocol.
+    """
+    print(f"❌ Configuration error: {error}", file=sys.stderr)
+    sys.exit(1)
+
+
 def main() -> None:
     """Main application entry point."""
-    config = get_config()
+    try:
+        config = get_config()
+    except ConfigurationError as e:
+        # A bad setting used to leave the loader as an exception nothing
+        # caught, so Python printed the whole stack down through the loader and
+        # the process died. Under a stdio host that stack is all the user sees
+        # behind "Server disconnected", with the setting at fault on its last
+        # line and everything above it looking like a crash.
+        _exit_on_a_bad_setting(e)
 
     # Configure logging
     configure_logging(
@@ -335,6 +453,23 @@ def main() -> None:
     try:
         configure_browser_environment()
 
+        # Establish, once, that this process may move and delete what
+        # USER_DATA_DIR names. Before everything: the logout below deletes the
+        # whole auth root, bootstrap downloads a browser into it, and daemon
+        # election spawns an owner that would repeat this check anyway. Against
+        # the *configured* root only — a derived runtime profile has its own
+        # nested auth root, and claiming that one would protect the wrong
+        # directory while looking like protection.
+        #
+        # Read off the config already in hand rather than through
+        # `get_source_profile_dir()`. That helper reaches for the global config,
+        # which lazily parses `sys.argv`, and reaching for it a second time here
+        # would re-parse whatever argv happens to hold.
+        ensure_profile_claim(
+            Path(config.browser.user_data_dir),
+            claim_anyway=config.server.claim_profile_root,
+        )
+
         # Set headless mode from config
         set_headless(config.browser.headless)
 
@@ -342,16 +477,16 @@ def main() -> None:
         if config.server.logout:
             clear_profile_and_exit()
 
-        # Ensure browser is installed for CLI modes that launch it.
-        # Normal server startup uses async background setup instead. --login is
-        # headed and needs full chromium; --status and --import-from-browser run
-        # headless and need only the shell.
+        # Ensure the browser is installed for CLI modes that launch one. Normal
+        # server startup uses async background setup instead. All three modes
+        # need the same binary: headed and headless are modes of it, not
+        # separate products.
         if (
             config.server.login
             or config.server.status
             or config.server.import_from_browser
         ):
-            ensure_browser_installed(full=config.server.login)
+            ensure_browser_installed()
 
         # Handle --import-from-browser flag
         if config.server.import_from_browser:
@@ -383,10 +518,35 @@ def main() -> None:
                 # server was a private one. Re-validating applies the HTTP
                 # rules that were skipped when the value said stdio.
                 config.server.transport = transport
-                config.validate()
+                try:
+                    config.validate()
+                except ConfigurationError as e:
+                    # Inside the runtime `try` below, whose handler calls
+                    # logger.exception. A setting that only applies to HTTP
+                    # fails here and nowhere else, and it deserves the same
+                    # answer as one caught at startup.
+                    _exit_on_a_bad_setting(e)
+
+            # Get a shared owner running before building this process's server.
+            # It has to come first now: whether this process drives a browser or
+            # forwards to one that does depends on the answer.
+            #
+            # Reads the stored transport rather than the local above, which is
+            # why the interactive prompt writes its answer back into the config
+            # before this runs: `daemon_would_be_used` asks whether this is a
+            # stdio process, and an interactively chosen HTTP server must not
+            # elect a daemon.
+            proxy_backend = _obtain_shared_owner(config)
 
             # Create and run the MCP server
-            mcp = create_mcp_server(tool_timeout=config.server.tool_timeout_seconds)
+            if proxy_backend is None:
+                mcp = create_mcp_server(tool_timeout=config.server.tool_timeout_seconds)
+            else:
+                mcp = create_mcp_server(
+                    tool_timeout=config.server.tool_timeout_seconds,
+                    role=ServerRole.PROXY,
+                    proxy_backend=proxy_backend,
+                )
 
             if transport == "streamable-http":
                 # Validate Host and Origin. Without this a website the user
@@ -439,6 +599,17 @@ def main() -> None:
             if config.is_interactive:
                 print(f"\n❌ Server error: {e}")
             exit_gracefully(1)
+
+    except ProfileRootRefusedError as e:
+        # Printed rather than raised through, because a traceback is the wrong
+        # shape for this: nothing went wrong in the code, a path was named that
+        # this server will not delete, and the message already says what to do
+        # about it.
+        logger.error(str(e))
+        if config.is_interactive:
+            print(f"\n❌ {e}")
+        sys.exit(1)
+
     finally:
         teardown_trace_logging(keep_traces=should_keep_traces())
 

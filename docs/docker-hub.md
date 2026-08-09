@@ -27,7 +27,7 @@ A Model Context Protocol (MCP) server that connects AI assistants to LinkedIn. A
 
 ## Quick Start
 
-Create a browser profile locally, then mount it into Docker. You still need [uv](https://docs.astral.sh/uv/getting-started/installation/) installed on the host for the one-time `uvx mcp-server-linkedin@latest --login` step. Docker already includes its own Chromium runtime, so the managed Patchright Chromium browser download used by MCPB/`uvx` is not needed here.
+Create a browser profile locally, then mount it into Docker. You still need [uv](https://docs.astral.sh/uv/getting-started/installation/) installed on the host for the one-time `uvx mcp-server-linkedin@latest --login` step. Docker already includes its own full Chromium runtime, running headed on a virtual display with no window exposed to the host, so the managed Patchright Chromium browser download used by MCPB/`uvx` is not needed here.
 
 **Step 1: Create profile on the host (one-time setup)**
 
@@ -56,9 +56,17 @@ This opens a browser window where you log in manually (5 minute timeout for 2FA,
 }
 ```
 
-> **Note:** Docker containers don't have a display server, so you can't use the `--login` command in Docker. Create a source profile on your host first.
+> **Note:** The container has a virtual display for Chromium, but no viewer that can show it to you or accept the login form, 2FA, or captcha. Create a source profile on your host first. The experimental shared-browser daemon is ignored in Docker because its owner can outlive the virtual display.
 >
 > **Note:** `stdio` is the default transport. Add `--transport streamable-http` only when you specifically want HTTP mode.
+>
+> **Note:** In HTTP mode the endpoint has no authentication, so the address it
+> is published on is the only thing limiting who can use your LinkedIn session.
+> Publish to loopback: `-p 127.0.0.1:8080:8080` together with
+> `--host 0.0.0.0`. The wildcard host is required for the server to be reachable
+> inside the container at all; the `127.0.0.1:` prefix on `-p` is what keeps it
+> off your network. Without that prefix Docker publishes on every interface.
+> Only expose it more widely behind something that authenticates.
 >
 > **Note:** Tool calls are serialized to protect the shared LinkedIn browser
 > session, both within one server process and between separate ones. Only one
@@ -74,7 +82,7 @@ This opens a browser window where you log in manually (5 minute timeout for 2FA,
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `USER_DATA_DIR` | `~/.linkedin-mcp/profile` | Path to persistent browser profile directory |
+| `USER_DATA_DIR` | `~/.linkedin-mcp/profile` | Path to persistent browser profile directory. The container default is always usable; any other path needs a `profile-claim.json` marker in its parent, or one run with `--claim-profile-root` |
 | `LOG_LEVEL` | `WARNING` | Logging level: DEBUG, INFO, WARNING, ERROR |
 | `TIMEOUT` | `5000` | Browser timeout in milliseconds |
 | `TOOL_TIMEOUT` | `180` | Per-tool MCP execution timeout in seconds. Increase further for heavy scrapes (multi-section profiles, cold-start Chromium, slow networks/containers). |
@@ -84,13 +92,14 @@ This opens a browser window where you log in manually (5 minute timeout for 2FA,
 | `BROWSER_MIN_HOLD` | `20` | Shortest time (seconds) a process keeps the shared browser before handing it to a waiting process. Higher means fewer browser restarts but longer waits for other clients; clamped below `BROWSER_WAIT` so a waiting client is served before its own timeout. `0` hands over after every tool call. |
 | `BROWSER_IDLE_TIMEOUT` | `600` | Close an idle browser and release the shared profile after this many seconds without a tool call. `0` keeps it open until the server exits. |
 | `AUTO_IMPORT_FROM_BROWSER` | on by default | Auto-import a LinkedIn session from a locally logged-in browser on the first no-session tool call, before falling back to manual login. On by default across interactive and non-interactive desktop runs; set `false` to require `--login` / `--import-from-browser`. No effect in containers (no host browser or keychain) or on a non-loopback HTTP bind. On macOS the OS keychain may prompt once for Safe Storage access. |
-| `USER_AGENT` | - | Custom browser user agent |
 | `TRANSPORT` | `stdio` | Transport mode: stdio, streamable-http |
 | `HOST` | `127.0.0.1` | HTTP server host (for streamable-http transport) |
 | `PORT` | `8000` | HTTP server port (for streamable-http transport) |
 | `HTTP_PATH` | `/mcp` | HTTP server path (for streamable-http transport) |
 | `SLOW_MO` | `0` | Delay between browser actions in ms (debugging) |
-| `VIEWPORT` | `1280x720` | Browser viewport size as WIDTHxHEIGHT |
+| `HEADLESS` | `false` | Docker defaults to full headed Chromium on its virtual display. Set `true` only to deliberately use Chromium's real headless mode, which identifies itself as `HeadlessChrome`. |
+| `DAEMON_ENABLED` | `false` | The experimental shared-browser daemon is ignored in Docker. Its owner is designed to outlive a stdio frontend, while the virtual display belongs to that frontend's process group. |
+| `VIEWPORT` | `1280x720` | Browser viewport size as WIDTHxHEIGHT. Docker is headed by default and therefore uses its real Xvfb window size; this applies only when `HEADLESS=true`. |
 | `CHROME_PATH` | - | Path to Chrome/Chromium executable (rarely needed in Docker) |
 | `PROXY_SERVER` | - | Optional, and most setups are better off without one: LinkedIn advises against proxies and scores the addresses a session signs in from, so a stable known address beats a commercial exit node. Worth it when the container runs somewhere its address is obviously a data centre, and even then a WireGuard or Tailscale exit node on your own network is preferable. Route the browser through a proxy, as `scheme://host:port` (`http`, `https`, `socks4`, `socks5`). May also carry credentials directly (`http://user:pass@host:port`), which is how most providers hand them out. Inside a container `127.0.0.1` is the container itself: for a relay running on the host use `host.docker.internal` (on native Linux Docker, add `--add-host=host.docker.internal:host-gateway`). Only browser traffic is routed, not the MCP transport. |
 | `PROXY_USERNAME` | - | Username for the proxy |
