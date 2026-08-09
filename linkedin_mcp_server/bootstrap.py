@@ -16,7 +16,6 @@ from typing import NoReturn
 
 from fastmcp import Context
 
-from linkedin_mcp_server.authentication import get_authentication_source
 from linkedin_mcp_server.common_utils import secure_mkdir, secure_write_text, utcnow_iso
 from linkedin_mcp_server.config import get_config
 from linkedin_mcp_server.config.schema import is_loopback_host
@@ -30,19 +29,24 @@ from linkedin_mcp_server.exceptions import (
     AuthenticationBootstrapFailedError,
     AuthenticationInProgressError,
     AuthenticationStartedError,
+    AuthMissingOnOwnerError,
+    AuthStaleOnOwnerError,
     BrowserSetupFailedError,
     BrowserSetupInProgressError,
     DockerHostLoginRequiredError,
 )
+from linkedin_mcp_server.server_role import ServerRole, process_role
 from linkedin_mcp_server.session_state import (
+    PeerSessionInPlaceError,
     auth_root_dir,
     get_runtime_id,
+    load_source_state,
     portable_cookie_path,
     profile_exists,
     rotate_source_profile,
     source_state_path,
 )
-from linkedin_mcp_server.setup import interactive_login
+from linkedin_mcp_server.setup import UNGUARDED, interactive_login
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +65,12 @@ _REGISTRY_NAME_TO_DIR_PREFIX = {
     "chromium-headless-shell": "chromium_headless_shell-",
 }
 
-# On-disk dir prefix of the headless shell — the only binary the default
-# headless scrape + auto-import path launches.
+# On-disk dir prefix of the headless shell. Nothing launches it any more —
+# every launch names ``channel="chromium"`` — but the prefix is still needed to
+# recognise one in an install written before that change.
 _SHELL_DIR_PREFIX = "chromium_headless_shell-"
-# On-disk dir prefix of full Chrome for Testing — needed only for the headed
-# interactive-login fallback or an operator-configured --no-headless run.
+# On-disk dir prefix of full Chrome for Testing: the browser this server runs,
+# in either mode.
 _FULL_DIR_PREFIX = "chromium-"
 
 
@@ -104,21 +109,39 @@ class BootstrapState:
     import_task: asyncio.Task[bool] | None = None
     import_attempted: bool = False
     initialized: bool = False
+    #: The login generation the in-flight login was told is broken, so it can
+    #: stand down if a peer signs in first. On the state rather than the task's
+    #: signature: `_run_login_flow` is spawned as a bare task in several places
+    #: and stubbed in as many tests, and threading an argument through all of
+    #: them would change far more than the one thing that matters.
+    login_supersedes: str | None | object = UNGUARDED
 
 
 _state = BootstrapState()
 _lock = asyncio.Lock()
 
+#: Set while this process is the shared owner and has found auth it cannot fix.
+#: Deliberately not on BootstrapState: that is reset wholesale between tests, and
+#: quiescence has its own reset so the two cannot be confused for one another.
+_auth_quiescent = False
+#: The generation that was broken. ``None`` is a value (a rotated profile reads as
+#: exactly that), so it cannot double as "not set"; ``_auth_quiescent`` does that.
+_auth_quiescent_generation: str | None = None
+
 
 def reset_bootstrap_for_testing() -> None:
     """Reset bootstrap singleton state for test isolation."""
     global _state, _lock, _AUTO_IMPORT_ANNOUNCED
+    global _auth_quiescent, _auth_quiescent_generation
     for task in (_state.setup_task, _state.login_task, _state.import_task):
         if task is not None and not task.done():
             task.cancel()
     _state = BootstrapState()
     _lock = asyncio.Lock()
     _AUTO_IMPORT_ANNOUNCED = False
+    _state.login_supersedes = UNGUARDED
+    _auth_quiescent = False
+    _auth_quiescent_generation = None
     os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
     # Tolerate monkeypatched stand-ins that lack `cache_clear`.
     clear = getattr(_patchright_install_targets, "cache_clear", None)
@@ -288,11 +311,19 @@ def _metadata_shape_ok() -> Path | None:
     return configured_browsers_path
 
 
-def shell_ready() -> bool:
-    """Return whether the headless-shell binary is installed and current.
+def browser_ready() -> bool:
+    """Return whether the full Chrome for Testing is installed and current.
 
-    The default headless scrape + auto-import path launches only the headless
-    shell, so this is the readiness signal that gates a headless-mode server.
+    Only the full browser, and deliberately not the headless shell. Every launch
+    now names ``channel="chromium"``, so the shell is never started and its
+    absence is not a reason to reinstall anything.
+
+    The previous version of this checked *every* install-by-default target, so a
+    full-only install read as permanently not ready. Combined with a launch that
+    demands the full browser, that is an unbounded loop: the gate opens on a
+    shell-only install, the launch fails, only the metadata is invalidated, and
+    the next setup installs the shell again.
+
     Pure: no mutation.
     """
     configured = _metadata_shape_ok()
@@ -301,42 +332,21 @@ def shell_ready() -> bool:
     targets = _patchright_install_targets()
     if not targets:
         return False
-    revision = targets.get(_SHELL_DIR_PREFIX)
+    revision = targets.get(_FULL_DIR_PREFIX)
     if revision is None:
         return False
-    return _has_install_for(configured, _SHELL_DIR_PREFIX, revision)
-
-
-def full_chromium_ready() -> bool:
-    """Return whether every chromium binary is installed and current.
-
-    Requires both the full Chrome for Testing and the headless shell. This is
-    the readiness signal that gates a headed (``--no-headless``) server and the
-    interactive-login fallback. Pure: no mutation.
-    """
-    configured = _metadata_shape_ok()
-    if configured is None:
-        return False
-    targets = _patchright_install_targets()
-    if not targets:
-        return False
-    for prefix, revision in targets.items():
-        if not _has_install_for(configured, prefix, revision):
-            return False
-    return True
+    return _has_install_for(configured, _FULL_DIR_PREFIX, revision)
 
 
 def browser_setup_ready() -> bool:
-    """Return whether the install required for the configured launch mode is current.
+    """Return whether the browser this server launches is installed and current.
 
-    Mode-aware: a headless-mode server needs only the headless shell; a headed
-    (``--no-headless``) server needs full chromium. Pure: no mutation of
+    No longer mode-aware. ``headless`` selects a *mode*, not a binary, so it has
+    nothing to say about which install is required. Pure: no mutation of
     metadata or in-memory state. Mutation happens in
     :func:`invalidate_browser_setup`, called by the gate paths.
     """
-    if get_config().browser.headless:
-        return shell_ready()
-    return full_chromium_ready()
+    return browser_ready()
 
 
 def invalidate_browser_setup() -> None:
@@ -363,8 +373,9 @@ def _start_browser_setup_task_locked() -> None:
 async def _run_patchright_install(extra_arg: str) -> None:
     """Run one ``patchright install chromium`` stage with the given flag.
 
-    The patchright registry lock serializes concurrent installs, so the two
-    stages always run one after the other on the same browsers path.
+    The patchright registry lock serializes concurrent installs, so two
+    processes reaching this at once queue on the same browsers path rather than
+    corrupting it.
     """
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -406,105 +417,70 @@ def _write_install_metadata(
     )
 
 
-def _needs_full_chromium() -> bool:
-    """Return whether the full-chromium stage should run during background setup.
-
-    The shell alone covers the default headless scrape + auto-import path. Full
-    chromium is installed up front only for a headed (``--no-headless``) run or
-    when the operator opts into pre-warming the headed login fallback.
-    """
-    config = get_config()
-    return (not config.browser.headless) or config.browser.eager_full_chromium
-
-
 async def _run_browser_setup() -> None:
-    """Install the headless shell first, then full chromium when needed.
+    """Install full Chrome for Testing, in one stage.
 
-    Stage one (``--only-shell``) lands the headless shell + ffmpeg so the
-    headless first-run path becomes usable as early as possible; metadata is
-    written after it so a crash before stage two still records the shell as
-    ready. Stage two (``--no-shell``) adds full Chrome for Testing for the
-    headed login fallback / ``--no-headless`` mode, and runs only when needed.
+    The two-stage shell-first arrangement existed to make the headless path
+    usable sooner. Nothing launches the shell now, so staging it would download
+    92 MiB nobody runs.
+
+    Worth being straight about the effect on download size, because it cuts both
+    ways. Measured against the CDN for 148.0.7778.96 mac-arm64: this is 170 MiB,
+    against 263 MiB for anyone who previously ended up needing the full browser,
+    and against 92 MiB for the default headless user who only ever fetched the
+    shell. The second comparison is the one users will notice.
+
+    Those three figures are one revision's *and one platform's*, not a
+    constant. The bundled browser moves with the lockfile and is past 148 now,
+    and the sizes differ by platform as well: the arm64 container does not get
+    Chrome for Testing at all, it gets Playwright's own Chromium build. What
+    the argument needs is only that the full browser is substantially larger
+    than the shell everywhere, which holds; quoting these particular numbers
+    anywhere user-facing means re-measuring them for the platform in question.
     """
     browser_dir = configure_browser_environment()
     secure_mkdir(browser_dir)
 
-    await _run_patchright_install("--only-shell")
-    _write_install_metadata(
-        browser_dir,
-        {_SHELL_DIR_PREFIX: True, _FULL_DIR_PREFIX: False},
-    )
-
-    if _needs_full_chromium():
-        await _run_patchright_install("--no-shell")
-        _write_install_metadata(
-            browser_dir,
-            {_SHELL_DIR_PREFIX: True, _FULL_DIR_PREFIX: True},
-        )
-
-
-async def _ensure_full_chromium_installed() -> None:
-    """Install full chromium on demand, e.g. before the headed login launch.
-
-    A no-op once full chromium is present. Used by the lazy path so the headed
-    interactive-login fallback never launches against a shell-only install.
-    """
-    if full_chromium_ready():
-        return
-    browser_dir = configure_browser_environment()
-    secure_mkdir(browser_dir)
-    if not shell_ready():
-        await _run_patchright_install("--only-shell")
-        # Record the shell before the full stage so a --no-shell failure leaves
-        # the shell marked ready and a retry skips re-installing it.
-        _write_install_metadata(
-            browser_dir,
-            {_SHELL_DIR_PREFIX: True, _FULL_DIR_PREFIX: False},
-        )
     await _run_patchright_install("--no-shell")
     _write_install_metadata(
         browser_dir,
-        {_SHELL_DIR_PREFIX: True, _FULL_DIR_PREFIX: True},
+        {_SHELL_DIR_PREFIX: False, _FULL_DIR_PREFIX: True},
     )
 
 
-def ensure_browser_installed(*, full: bool = False) -> None:
-    """Install the Patchright Chromium binaries a CLI mode needs, if absent.
+async def _ensure_browser_installed() -> None:
+    """Install the browser on demand. A no-op once it is present."""
+    if browser_ready():
+        return
+    await _run_browser_setup()
 
-    Used by CLI modes (--login, --status, --import-from-browser) to guarantee
-    the right binary exists before launching it: ``--status`` and
-    ``--import-from-browser`` run headless and need only the shell, while
-    ``--login`` is headed and needs full chromium. The normal server path uses
-    async background setup instead (non-blocking).
+
+def ensure_browser_installed() -> None:
+    """Install the Patchright Chromium browser for a CLI mode, if absent.
+
+    Used by ``--login``, ``--status`` and ``--import-from-browser``. They no
+    longer differ in what they need: the mode each runs in selects headed or
+    headless behaviour, and both come from the same binary. The normal server
+    path uses async background setup instead (non-blocking).
     """
     configure_browser_environment()
-    if full:
-        if full_chromium_ready():
-            return
-    elif shell_ready():
+    # An operator-supplied executable is the one that gets launched, so the
+    # managed browser would be downloaded and never run. That was survivable
+    # while two of these three modes needed only the much smaller shell; now
+    # they all want the full browser, so it is the whole download spent on
+    # nothing -- and for someone whose network cannot reach the CDN, it is the
+    # difference between signing in and not.
+    if _uses_custom_chrome():
+        return
+    if browser_ready():
         return
     print("   Installing Patchright Chromium browser...")
     try:
-        if full:
-            asyncio.run(_ensure_full_chromium_installed())
-        else:
-            asyncio.run(_run_install_shell_only())
+        asyncio.run(_ensure_browser_installed())
     except Exception as exc:
         print(f"   ❌ Browser installation failed: {exc}")
         raise
     print("   Browser installed.")
-
-
-async def _run_install_shell_only() -> None:
-    """Install just the headless shell for the headless CLI modes."""
-    browser_dir = configure_browser_environment()
-    secure_mkdir(browser_dir)
-    full_present = full_chromium_ready()
-    await _run_patchright_install("--only-shell")
-    _write_install_metadata(
-        browser_dir,
-        {_SHELL_DIR_PREFIX: True, _FULL_DIR_PREFIX: full_present},
-    )
 
 
 def _safe_task_done(task: asyncio.Task[None] | None) -> bool:
@@ -556,6 +532,12 @@ async def ensure_tool_ready_or_raise(
     initialize_bootstrap()
     await _refresh_background_task_state()
 
+    # Before any branch that could reach a browser. A quiescent owner has closed
+    # Chromium and is waiting for a client to sign in; every path below would open
+    # it again on the session that just failed, because readiness is decided by
+    # whether the files exist rather than whether they work.
+    _raise_if_auth_quiescent()
+
     if get_runtime_policy() == RuntimePolicy.DOCKER:
         _raise_if_docker_auth_missing()
         return
@@ -568,7 +550,7 @@ async def ensure_tool_ready_or_raise(
         if _auth_ready():
             _state.auth_state = AuthState.READY
             return
-        await _start_login_if_needed(ctx)
+        await _start_login_if_needed(ctx, superseded_by=current_login_generation())
         return
 
     if _browser_setup_ready():
@@ -600,7 +582,12 @@ async def ensure_tool_ready_or_raise(
         _state.auth_state = AuthState.READY
         return
 
-    await _start_login_if_needed(ctx)
+    # The generation goes with it, because this call has just looked: whatever is
+    # on disk now is what it found wanting. A login started automatically by a
+    # tool call is not somebody at a terminal insisting, so if a peer signs in
+    # while this one is still getting there, standing down is right. `--login`
+    # keeps its unguarded default, which is what makes it an override.
+    await _start_login_if_needed(ctx, superseded_by=current_login_generation())
 
 
 def _raise_if_docker_auth_missing() -> None:
@@ -611,22 +598,23 @@ def _raise_if_docker_auth_missing() -> None:
     )
 
 
-def _auth_ready() -> bool:
-    profile_dir = get_profile_dir()
+def _auth_ready(profile_dir: Path | None = None) -> bool:
+    """Whether a session's files are all present under *profile_dir*.
+
+    Defaults to the configured profile, which is what every gate here means. The
+    argument exists for callers handed a directory explicitly, where asking about
+    the configured one would answer a different question than the one asked, and
+    silently: it would report the *default* profile ready while rotating another.
+    """
+    profile_dir = profile_dir or get_profile_dir()
     return (
         profile_exists(profile_dir)
         and portable_cookie_path(profile_dir).exists()
         and source_state_path(profile_dir).exists()
-        and _has_source_state()
+        # The file has to parse, not merely exist: a truncated write leaves one
+        # behind that every existence check above is happy with.
+        and load_source_state(profile_dir) is not None
     )
-
-
-def _has_source_state() -> bool:
-    try:
-        get_authentication_source()
-    except Exception:
-        return False
-    return True
 
 
 def _auto_import_allowed() -> bool:
@@ -650,6 +638,18 @@ def _auto_import_allowed() -> bool:
         return False
     if get_runtime_policy() == RuntimePolicy.DOCKER:
         # No host browser and no keychain inside a container.
+        return False
+    if process_role() is ServerRole.OWNER:
+        # The import runs headless, so the browser is not the problem: rotating
+        # the profile is. It retires the current session before validating a
+        # replacement, and the process that will actually log in needs to find
+        # that session where the owner saw it. On macOS the keychain prompt
+        # would also appear with nobody attached to approve it, so the read
+        # simply times out.
+        #
+        # The frontend does it instead, and it is the better place for both
+        # reasons: it has the desktop session, and it is the process that holds
+        # the profile while it works.
         return False
     if config.browser.proxy_server:
         # The point of configuring a proxy is that LinkedIn sees one address.
@@ -762,7 +762,15 @@ async def _try_auto_import_session(ctx: Context | None = None) -> bool:
         # reads are already bounded (security 10s / secret-tool 10s); this covers
         # the launch + navigation budget on top.
         result = await asyncio.wait_for(
-            import_session_from_browser(None, user_data_dir=user_data_dir),
+            import_session_from_browser(
+                None,
+                user_data_dir=user_data_dir,
+                # The import rotates the profile as soon as it holds the lease,
+                # exactly as the login does, so it needs the same guard. Without
+                # it a client whose keychain read ran long would retire a session
+                # a faster peer had already imported.
+                superseded_by=_state.login_supersedes,
+            ),
             timeout=60,
         )
         if not result:
@@ -795,7 +803,25 @@ async def _try_auto_import_session(ctx: Context | None = None) -> bool:
         set_headless(prev_headless)
 
 
-async def _start_login_if_needed(ctx: Context | None = None) -> None:
+async def _start_login_if_needed(
+    ctx: Context | None = None, *, superseded_by: str | None | object = UNGUARDED
+) -> None:
+    if process_role() is ServerRole.OWNER:
+        # Ahead of the lock, and ahead of every branch below, because all of them
+        # end somewhere this process cannot go: an auto-import that rotates the
+        # profile, or an interactive login window with nobody attached to answer
+        # it.
+        # Reporting from here leaves the session state exactly as the frontend
+        # will find it, which is what lets the frontend take over cleanly.
+        raise AuthMissingOnOwnerError(
+            "The shared LinkedIn browser has no usable session, and it cannot "
+            "sign in by itself. Retry this tool: the client will open a login "
+            "window.",
+            # The readiness gate runs before the tool body, so nothing has been
+            # scraped and the client may run the call again once it has signed in.
+            nothing_ran_yet=True,
+        )
+
     # Cheap check-and-claim under the lock; the slow work (auto-import browser
     # launch, then the bounded inline wait) runs AFTER the lock is released so
     # concurrent pollers never serialize on it.
@@ -823,6 +849,7 @@ async def _start_login_if_needed(ctx: Context | None = None) -> None:
             # Claim the one-shot import under the lock so only one keychain read
             # / import browser ever runs per process episode.
             _state.import_attempted = True
+            _state.login_supersedes = superseded_by
             _state.import_task = asyncio.create_task(
                 _try_auto_import_session(ctx), name="linkedin-auto-import"
             )
@@ -858,7 +885,7 @@ async def _start_login_if_needed(ctx: Context | None = None) -> None:
         # Import resolved without a session -> manual-login path. Re-enter:
         # import_attempted is now True and import_task is done, so this call
         # takes the spawn/await-login branch (no recursion loop risk).
-        return await _start_login_if_needed(ctx)
+        return await _start_login_if_needed(ctx, superseded_by=superseded_by)
 
     # No import in flight and none claimed -> the #535 manual-login + inline-wait
     # fallback. Spawn the login task if one is not already shared.
@@ -873,11 +900,12 @@ async def _start_login_if_needed(ctx: Context | None = None) -> None:
                 prior_error = None
             else:
                 prior_error = _state.last_error
-                _move_invalid_auth_state_aside()
+                _move_invalid_auth_state_aside(superseded_by)
                 _state.auth_state = AuthState.STARTING
                 _state.auth_started_at = utcnow_iso()
                 _state.last_error = None
                 _state.auth_completed_at = None
+                _state.login_supersedes = superseded_by
                 _state.login_task = asyncio.create_task(
                     _run_login_flow(), name="linkedin-login"
                 )
@@ -909,13 +937,123 @@ async def _start_login_if_needed(ctx: Context | None = None) -> None:
     raise AuthenticationInProgressError(_pending_login_message(prior_error))
 
 
-async def start_login_if_needed(ctx: Context | None = None) -> None:
+async def start_login_if_needed(
+    ctx: Context | None = None, *, superseded_by: str | None | object = UNGUARDED
+) -> None:
     """Public wrapper for starting the shared login workflow."""
-    await _start_login_if_needed(ctx)
+    await _start_login_if_needed(ctx, superseded_by=superseded_by)
+
+
+async def wait_for_login_to_finish(timeout: float) -> bool:
+    """Wait for a login this process started, and say whether one now exists.
+
+    The two functions that start a login both report "started" by raising, and
+    they raise while the browser is still open, because the person at it has not
+    typed anything yet. That is the right answer for a tool call, which cannot
+    hold a client for half an hour. It is the wrong answer for the frontend
+    repairing auth on the owner's behalf: there the raise arrives as a *failure*
+    to sign in, and the call that could now be served is refused instead.
+
+    So this is the one place that waits it out. It reads the task rather than
+    polling readiness, because a login that fails must end the wait as surely as
+    one that succeeds; and it returns filesystem truth rather than the task's
+    result, because "a session exists" is the question the caller actually has.
+
+    Returns False when the wait runs out, which leaves the login running: it owns
+    the profile and cancelling it would strand a half-finished sign-in.
+    """
+    task = _state.login_task
+    if task is not None and not task.done():
+        # `wait`, never `wait_for`: the latter cancels on timeout, and this task
+        # is a browser window somebody may be typing into.
+        await asyncio.wait({task}, timeout=timeout)
+    await _refresh_background_task_state()
+    return _auth_ready()
+
+
+def current_login_generation() -> str | None:
+    """Which login generation is on disk now, or ``None`` when there is none.
+
+    ``None`` is a value here rather than an absence: it is exactly what a rotated
+    profile reads as, so the difference between "no session" and "a session I have
+    not seen" has to be carried by something else.
+    """
+    state = load_source_state(get_profile_dir())
+    return None if state is None else state.login_generation
+
+
+def go_auth_quiescent(observed_generation: str | None) -> None:
+    """Stop this owner touching the profile until a new session appears.
+
+    Closing the browser is not enough on its own. ``get_or_create_browser`` opens
+    one whenever ``_browser`` is None, and ``_auth_ready()`` tests whether the
+    files exist rather than whether they work, so the next forwarded call would
+    reopen Chromium on the same dead session, in the middle of the login the
+    frontend is running. Measured before this existed: the call after a confirmed
+    close created a second browser.
+
+    *observed_generation* is the generation this owner found broken. The caller
+    reads it before closing the browser, which is defensive rather than currently
+    necessary: the tool middleware holds a lease reference across the whole call,
+    so nothing else can write a generation in between. It costs nothing and stops
+    a later caller, or a change that frees the lease sooner, from latching onto
+    the generation written by the login it is about to ask for.
+    """
+    global _auth_quiescent_generation, _auth_quiescent
+    _auth_quiescent = True
+    _auth_quiescent_generation = observed_generation
+    logger.warning(
+        "The shared browser cannot sign in; waiting for a client to do it "
+        "(generation %s)",
+        observed_generation or "none",
+    )
+
+
+def _auth_quiescence_lifted() -> bool:
+    """Whether a usable session has replaced the one that caused quiescence.
+
+    Both halves are needed and each alone is wrong. A changed generation alone
+    lifts on an *abandoned* login: the frontend rotates the profile first, which
+    makes the generation read as ``None``, which differs from what was observed,
+    and the owner would open Chromium on a profile with no session at all.
+    ``_auth_ready()`` alone never lifts, because it tests file existence and was
+    already true of the broken session.
+
+    Together they mean what is wanted, because a generation is only written after
+    a login has validated and exported its cookies.
+    """
+    return _auth_ready() and current_login_generation() != _auth_quiescent_generation
+
+
+def _raise_if_auth_quiescent() -> None:
+    """Report instead of opening a browser, until a new session lands."""
+    global _auth_quiescent, _auth_quiescent_generation
+    if not _auth_quiescent:
+        return
+    if _auth_quiescence_lifted():
+        logger.info("A new LinkedIn session appeared; the shared browser resumes")
+        _auth_quiescent = False
+        _auth_quiescent_generation = None
+        return
+    raise AuthStaleOnOwnerError(
+        "The shared LinkedIn browser's session stopped working, and it cannot "
+        "sign in by itself. Retry this tool: the client will open a login "
+        "window.",
+        # Raised from the readiness gate, ahead of the tool body.
+        nothing_ran_yet=True,
+        # The generation this owner latched on, not a fresh reading. Every call
+        # after the first arrives here rather than through `handle_auth_error`,
+        # so leaving it out would mean the *second* client to ask gets a marker
+        # with nothing to compare against, and repairs unguarded while the first
+        # is still signing in.
+        generation=_auth_quiescent_generation,
+    )
 
 
 async def invalidate_auth_and_trigger_relogin(
     ctx: Context | None = None,
+    *,
+    stale_generation: str | None | object = UNGUARDED,
 ) -> NoReturn:
     """Force-invalidate stale auth state and trigger interactive login.
 
@@ -924,10 +1062,42 @@ async def invalidate_auth_and_trigger_relogin(
     being present on disk.  The check-task → force-move → start-login sequence
     is atomic under ``_lock`` so an in-flight login is never corrupted.
 
+    *stale_generation* is the login generation the caller found broken, which may
+    be ``None`` when it found no session at all. Passing it is what keeps two
+    clients from destroying each other's work: ``_lock`` is process-local, so it
+    says nothing about the other process, and the rotation below is skipped when
+    the generation on disk has moved on from the one being complained about.
+
+    Left at :data:`UNGUARDED` only by a caller that has observed nothing, which
+    is why the two are distinct values. Conflating them was measured to produce
+    the worst available failure: a login that reports a window has opened, opens
+    none, keeps the dead session and leaves readiness saying it is fine.
+
     Raises:
         AuthenticationStartedError: Login browser opened.
         AuthenticationInProgressError: Login already running from a prior call.
+        PeerSessionInPlaceError: Someone else's fresh session is now on disk, so
+            there is nothing to invalidate and no login to start. The caller may
+            simply use it.
+        AuthStaleOnOwnerError: This process is the shared owner, so it reports
+            rather than rotating the profile and opening a login nobody could
+            answer.
     """
+    if process_role() is ServerRole.OWNER:
+        # Never reaches the rotation below. Retiring the session here would race
+        # the frontend's login for the same files, and the login window has
+        # nowhere to appear. The caller has already closed the browser and
+        # recorded the generation it found, which is what `go_auth_quiescent`
+        # needs, so all that is left is to say so.
+        # Reached only if something calls this directly; `handle_auth_error`
+        # raises its own first, carrying whether any work had run. Conservative
+        # here, because a direct caller has told us nothing about that.
+        raise AuthStaleOnOwnerError(
+            "The shared LinkedIn browser's session stopped working, and it "
+            "cannot sign in by itself. Retry this tool: the client will open a "
+            "login window."
+        )
+
     logger.warning("Invalidating stale auth state and triggering re-login")
     async with _lock:
         await _refresh_background_task_state()
@@ -947,7 +1117,35 @@ async def invalidate_auth_and_trigger_relogin(
             )
 
         # Force-move stale profile files (skip _auth_ready() guard).
-        _force_move_auth_state_aside()
+        #
+        # A failure here used to stop the login, and that reasoning has expired.
+        # It made sense when the login demanded the profile outright: if the
+        # rotation could not take it, neither could the login, and saying so beat
+        # claiming a browser had opened. Now the login *waits* for the profile,
+        # so a momentary holder is precisely the case it handles, and refusing
+        # here throws away the wait before it happens. Measured: with a lease held
+        # for 1.5 seconds, this raised "the browser profile is in use" and the
+        # 60-second wait was never reached.
+        #
+        # The rotation itself is not lost. `interactive_login` rotates under the
+        # profile it waited for (`setup.py`, `rotate_shielded`), which is the
+        # better place for it anyway: this one runs without holding anything, so
+        # its result was never guaranteed to survive to the login. What is lost by
+        # skipping it is only that `_auth_ready()` keeps reporting the dead
+        # session until the login retires it. On a shared owner the quiescence
+        # latch closes that window. On a single-process server nothing does, and
+        # it does not need to: the same call is already committed to starting a
+        # login, and the login retires the state itself once it holds the
+        # profile. What must not happen is the login standing down there, which
+        # is why the generation it was told about travels with it.
+        try:
+            _force_move_auth_state_aside(stale_generation)
+        except AuthenticationBootstrapFailedError as exc:
+            logger.info(
+                "Could not retire the stale session yet (%s); the login will "
+                "wait for the profile and retire it there",
+                exc,
+            )
 
         # A force-move starts a fresh no-session episode; allow auto-import to
         # be re-attempted on the next tool call (the prior latch was for the
@@ -960,6 +1158,7 @@ async def invalidate_auth_and_trigger_relogin(
         _state.auth_started_at = utcnow_iso()
         _state.last_error = None
         _state.auth_completed_at = None
+        _state.login_supersedes = stale_generation
         _state.login_task = asyncio.create_task(
             _run_login_flow(), name="linkedin-login"
         )
@@ -976,7 +1175,9 @@ async def invalidate_auth_and_trigger_relogin(
     )
 
 
-def _move_auth_state_aside(*, force: bool = False) -> None:
+def _move_auth_state_aside(
+    *, force: bool = False, superseded_by: str | None | object = UNGUARDED
+) -> None:
     """Move auth artifacts to a timestamped backup directory.
 
     Args:
@@ -985,17 +1186,27 @@ def _move_auth_state_aside(*, force: bool = False) -> None:
             knows the session is stale.
 
     Raises:
-        AuthenticationBootstrapFailedError: The state could not be retired. The
-            caller must not go on to open a login browser: that login rotates
-            the same artifacts and would fail at the same point, after telling
-            the user a browser had opened.
+        AuthenticationBootstrapFailedError: The state could not be retired.
+            Whether that stops the caller depends on the caller. It used to have
+            to: the login rotated the same artifacts and would have failed at the
+            same point, after telling the user a browser had opened. The login
+            waits for the profile now, so a caller that has one to start may
+            reasonably carry on and let it retire the state under the lease it
+            waited for.
     """
     if not force and _auth_ready():
         return
     # Quarantine creation lives in session_state so the routine rotation on a
     # new session and this stale-state path produce identically shaped backups.
     try:
-        rotate_source_profile(get_profile_dir())
+        rotate_source_profile(get_profile_dir(), superseded_by=superseded_by)
+    except PeerSessionInPlaceError:
+        # Ahead of RuntimeError, which it subclasses, and deliberately not turned
+        # into a bootstrap failure: nothing failed. Somebody else signed in, so
+        # the caller must stop rather than go on to promise a login window that
+        # will not open. Measured with it swallowed here: the caller was told
+        # "a login browser window has been opened" and none was.
+        raise
     except RuntimeError as exc:
         raise AuthenticationBootstrapFailedError(
             f"{exc} No login was started."
@@ -1006,25 +1217,38 @@ def _move_auth_state_aside(*, force: bool = False) -> None:
         ) from exc
 
 
-def _force_move_auth_state_aside() -> None:
+def _force_move_auth_state_aside(
+    superseded_by: str | None | object = UNGUARDED,
+) -> None:
     """Move auth artifacts aside unconditionally (no ``_auth_ready()`` guard)."""
-    _move_auth_state_aside(force=True)
+    _move_auth_state_aside(force=True, superseded_by=superseded_by)
 
 
-def _move_invalid_auth_state_aside() -> None:
-    _move_auth_state_aside(force=False)
+def _move_invalid_auth_state_aside(
+    superseded_by: str | None | object = UNGUARDED,
+) -> None:
+    _move_auth_state_aside(force=False, superseded_by=superseded_by)
 
 
 async def _run_login_flow() -> None:
+    """Install what a headed login needs, then run one.
+
+    The generation this login supersedes is read from the shared state rather
+    than taken as an argument, and passed on rather than checked here: this runs
+    as a background task, and the gap between this line and the profile actually
+    being held is the whole window that matters.
+    """
     _state.auth_state = AuthState.IN_PROGRESS
-    # The manual-login fallback launches headed, which needs full chromium.
-    # In the default headless flow only the shell is installed eagerly, so
-    # install full chromium here before the headed launch. A no-op once present
-    # and skipped entirely for a custom executable. The dependencies.py
-    # binary-missing backstop remains as a recovery path.
+    # An idempotent backstop rather than a staging step: background setup now
+    # installs the same browser this launch uses, so by the time anyone reaches
+    # a login there is normally nothing to do. Kept because a login can be
+    # reached before that setup finishes. Skipped for a custom executable, and
+    # the dependencies.py binary-missing path remains the recovery route.
     if not _uses_custom_chrome():
-        await _ensure_full_chromium_installed()
-    success = await interactive_login(get_profile_dir())
+        await _ensure_browser_installed()
+    success = await interactive_login(
+        get_profile_dir(), superseded_by=_state.login_supersedes
+    )
     if not success:
         raise AuthenticationBootstrapFailedError(
             "LinkedIn login was not completed. Retry the tool call to reopen the browser and continue setup."

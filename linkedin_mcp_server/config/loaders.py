@@ -89,6 +89,33 @@ def credential_free_url(value: str) -> str:
     return value
 
 
+# Refused rather than ignored. A user who set this did so to change how the
+# browser presents itself, and dropping it silently would leave them believing
+# it still applies. The setting never worked the way it reads: Patchright only
+# overrides the user-agent string, so the client hints kept reporting the real
+# browser and the page saw two different answers to the same question. Service
+# workers never received the override at all
+# (https://github.com/microsoft/playwright/issues/5237, closed upstream).
+#
+# The second sentence about a running server is not padding. A shared owner
+# started by an older version carries its user agent in the configuration
+# fingerprint, and a client of this version can only compute ``None`` because
+# the setting is refused here. ``daemon.py`` rejects a fingerprint mismatch
+# before it ever compares package versions, so that owner can no longer be
+# asked to stand down: it keeps running and keeps the profile. Removing the
+# setting is therefore only half the fix, and the other half is invisible
+# unless this message says it.
+_USER_AGENT_REMOVED = (
+    "{setting} is no longer supported and the server will not start with it "
+    "set. Overriding the user agent left the browser contradicting itself: the "
+    "string changed but the client hints did not, and service workers kept the "
+    "original either way. The browser now reports its own identity "
+    "consistently. Remove the setting to start. If a shared server from an "
+    "earlier version is still running with it, stop that process too: it "
+    "cannot be retired automatically."
+)
+
+
 class EnvironmentKeys:
     """Environment variable names used by the application."""
 
@@ -118,6 +145,61 @@ class EnvironmentKeys:
     AUTO_IMPORT_FROM_BROWSER = "AUTO_IMPORT_FROM_BROWSER"
     EAGER_FULL_CHROMIUM = "EAGER_FULL_CHROMIUM"
     DAEMON_ENABLED = "DAEMON_ENABLED"
+
+
+# What ``manifest.json`` fills from ``user_config``, and the exact string each
+# mapping leaves behind when the host does not substitute it.
+#
+# An MCPB host builds its replacement map from the manifest's ``default`` values
+# overlaid with the answers the user gave, then rewrites only the ``${...}``
+# occurrences it has a key for. A field with neither a default nor an answer is
+# absent from that map, so its placeholder is handed to the process verbatim.
+# Measured against Claude Desktop's own substitution routine.
+#
+# One exact string per variable, not a pattern for the shape. A pattern would
+# also swallow a password that happens to read ``${user_config.token}``, which
+# is a legal password and would leave the browser authenticating with nothing.
+# Spelling the mapping out costs a line each and cannot do that.
+# ``tests/test_manifest.py`` checks this table against the manifest itself, so
+# the two cannot drift.
+#
+# One collision survives and is not fixable here: a password whose value is
+# its own variable's literal. Substituted and unsubstituted are then the same
+# string, and nothing downstream can tell them apart.
+_MCPB_PLACEHOLDERS = {
+    EnvironmentKeys.PROXY_SERVER: "${user_config.proxy_server}",
+    EnvironmentKeys.PROXY_USERNAME: "${user_config.proxy_username}",
+    EnvironmentKeys.PROXY_PASSWORD: "${user_config.proxy_password}",
+    EnvironmentKeys.PROXY_BYPASS: "${user_config.proxy_bypass}",
+}
+
+
+def _env(key: str) -> str | None:
+    """Read an environment variable, treating an MCPB placeholder as unset.
+
+    The ``default`` entries in ``manifest.json`` are what keep the placeholders
+    out of the environment in the first place, and a manifest test holds that
+    line. This does not reach the bundles already installed with the broken
+    manifest: a bundle carries this source and that manifest together, so
+    whatever fixes one fixes the other. What it covers is a host that resolves
+    ``user_config`` by some other rule or ignores ``default``, and a variable
+    somebody set by hand after reading one out of an extension's own settings
+    pane.
+
+    Both failure modes are worth refusing. A literal in ``PROXY_SERVER`` aborts
+    startup, which is loud. A literal in ``PROXY_USERNAME`` is not: the browser
+    offers ``${user_config.proxy_username}`` to the proxy as a credential, and
+    an authentication that fails that way surfaces as a timeout or an expired
+    session, never as a configuration problem.
+
+    Deliberately no ``strip()``: a proxy password may legitimately begin or end
+    with a space, and silently trimming it would be a wrong password nobody can
+    see.
+    """
+    value = os.environ.get(key)
+    if not value or value == _MCPB_PLACEHOLDERS.get(key):
+        return None
+    return value
 
 
 def is_interactive_environment() -> bool:
@@ -244,9 +326,8 @@ def load_from_env(config: AppConfig) -> AppConfig:
             )
         setattr(config.browser, attribute, value)
 
-    # Custom user agent
-    if user_agent_env := os.environ.get(EnvironmentKeys.USER_AGENT):
-        config.browser.user_agent = user_agent_env
+    if os.environ.get(EnvironmentKeys.USER_AGENT):
+        raise ConfigurationError(_USER_AGENT_REMOVED.format(setting="USER_AGENT"))
 
     # HTTP server host
     if host_env := os.environ.get(EnvironmentKeys.HOST):
@@ -290,16 +371,35 @@ def load_from_env(config: AppConfig) -> AppConfig:
     # Browser proxy (validated and split in BrowserConfig.validate()). Unlike
     # the CLI flag, PROXY_SERVER may carry the credentials a provider hands out:
     # the environment is not world-readable the way a process argument list is.
-    if proxy_server_env := os.environ.get(EnvironmentKeys.PROXY_SERVER):
+    #
+    # Read through _env(), which drops a placeholder the host left behind.
+    # That is a fail-open path and it says so: a host that fails to substitute
+    # a field the user *did* fill in skips the proxy, and the browser then goes
+    # out on the real address. So the variables are named in the log once. They
+    # hold placeholders, so naming them leaks nothing.
+    if unsubstituted := [
+        key
+        for key, literal in _MCPB_PLACEHOLDERS.items()
+        if os.environ.get(key) == literal
+    ]:
+        logger.warning(
+            "Ignoring %s: the value is an unsubstituted MCPB placeholder, not "
+            "a setting, so no proxy is configured from these. Update the "
+            "extension bundle, and clear the variable from any environment "
+            "override set by hand.",
+            ", ".join(unsubstituted),
+        )
+
+    if proxy_server_env := _env(EnvironmentKeys.PROXY_SERVER):
         config.browser.proxy_server = proxy_server_env
 
-    if proxy_username_env := os.environ.get(EnvironmentKeys.PROXY_USERNAME):
+    if proxy_username_env := _env(EnvironmentKeys.PROXY_USERNAME):
         config.browser.proxy_username = proxy_username_env
 
-    if proxy_password_env := os.environ.get(EnvironmentKeys.PROXY_PASSWORD):
+    if proxy_password_env := _env(EnvironmentKeys.PROXY_PASSWORD):
         config.browser.proxy_password = proxy_password_env
 
-    if proxy_bypass_env := os.environ.get(EnvironmentKeys.PROXY_BYPASS):
+    if proxy_bypass_env := _env(EnvironmentKeys.PROXY_BYPASS):
         config.browser.proxy_bypass = proxy_bypass_env
 
     # Import a LinkedIn session from a locally logged-in browser (validated in
@@ -391,11 +491,13 @@ def load_from_args(config: AppConfig) -> AppConfig:
         help="Slow down browser actions by N milliseconds (debugging)",
     )
 
+    # Still accepted by the parser so using it produces the explanation above
+    # rather than argparse's bare "unrecognized arguments".
     parser.add_argument(
         "--user-agent",
         type=str,
         default=None,
-        help="Custom browser user agent",
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
@@ -403,7 +505,10 @@ def load_from_args(config: AppConfig) -> AppConfig:
         type=str,
         default=None,
         metavar="WxH",
-        help="Browser viewport size (default: 1280x720)",
+        help=(
+            "Browser viewport size (default: 1280x720). Applies to the normal "
+            "windowless mode only; a headed launch uses the real window size."
+        ),
     )
 
     parser.add_argument(
@@ -540,6 +645,18 @@ def load_from_args(config: AppConfig) -> AppConfig:
     )
 
     parser.add_argument(
+        "--claim-profile-root",
+        action="store_true",
+        help=(
+            "Take over a non-default profile directory that this server will "
+            "not claim on its own: one whose parent already holds other files, "
+            "or one carrying an ownership marker written for a different path. "
+            "Needed once; this server moves and deletes that whole parent when "
+            "it rotates or clears a session"
+        ),
+    )
+
+    parser.add_argument(
         "--import-from-browser",
         nargs="?",
         const="auto",
@@ -577,27 +694,24 @@ def load_from_args(config: AppConfig) -> AppConfig:
         ),
     )
 
+    # Accepted and inert. There is one browser now, so "up front" and "lazily"
+    # describe the same install. Kept rather than removed so an existing command
+    # line or compose file does not stop working over a setting that no longer
+    # decides anything; hidden from help so nobody adopts it.
     eager_full_group = parser.add_mutually_exclusive_group()
     eager_full_group.add_argument(
         "--eager-full-chromium",
         dest="eager_full_chromium",
         action="store_true",
         default=None,
-        help=(
-            "Install full Chrome for Testing up front during browser setup "
-            "instead of lazily on the first headed login (pre-warms the headed "
-            "login fallback at the cost of a larger initial download)"
-        ),
+        help=argparse.SUPPRESS,
     )
     eager_full_group.add_argument(
         "--no-eager-full-chromium",
         dest="eager_full_chromium",
         action="store_false",
         default=None,
-        help=(
-            "Install full Chrome for Testing lazily on the first headed login "
-            "(default; overrides EAGER_FULL_CHROMIUM=true)."
-        ),
+        help=argparse.SUPPRESS,
     )
 
     daemon_group = parser.add_mutually_exclusive_group()
@@ -646,7 +760,7 @@ def load_from_args(config: AppConfig) -> AppConfig:
         config.browser.slow_mo = args.slow_mo
 
     if args.user_agent:
-        config.browser.user_agent = args.user_agent
+        raise ConfigurationError(_USER_AGENT_REMOVED.format(setting="--user-agent"))
 
     # Viewport (validated in BrowserConfig.validate())
     if args.viewport:
@@ -705,6 +819,9 @@ def load_from_args(config: AppConfig) -> AppConfig:
 
     if args.user_data_dir:
         config.browser.user_data_dir = args.user_data_dir
+
+    if args.claim_profile_root:
+        config.server.claim_profile_root = True
 
     if args.import_from_browser is not None:
         value = args.import_from_browser.strip().lower()

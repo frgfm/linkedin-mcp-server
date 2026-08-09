@@ -6,8 +6,9 @@ moves on nearly every call, and every move reopens Chromium and revalidates the
 session against ``/feed/``. One long-lived owner removes that traffic entirely.
 
 This module is only the discovery half: it answers "is there an owner I should
-be talking to, and may I trust it with a token". Electing one, spawning it and
-forwarding to it build on this and land with the code that does them.
+be talking to, and may I trust it with a token". Electing one and spawning it
+live in :mod:`linkedin_mcp_server.daemon_election`, and forwarding to what it
+returns in :mod:`linkedin_mcp_server.daemon_proxy`.
 
 Finding an owner takes a wait rather than a single read, because the interesting
 case is neither "an owner exists" nor "none does", but the window in between. An
@@ -251,6 +252,24 @@ def daemon_would_be_used(config: AppConfig) -> bool:
     if not config.server.daemon_enabled:
         return False
     # An explicit HTTP bind is already one server for many clients, so there is
-    # nothing for a daemon to deduplicate. Only stdio spawns a process per
-    # client, which is the whole reason this exists.
-    return config.server.transport == "stdio"
+    # nothing for a daemon to deduplicate. Settle that before container policy:
+    # DAEMON_ENABLED on HTTP is inert everywhere, and warning that Docker
+    # ignored it because of the display would describe a refusal that never
+    # happened.
+    if config.server.transport != "stdio":
+        return False
+    if get_runtime_id().endswith("-container"):
+        # Xvfb belongs to PID 1's process group. The daemon owner deliberately
+        # starts a new session so it can outlive an ordinary stdio frontend;
+        # inside the image that gives the browser an owner which outlives the
+        # display it needs. Measured: the owner had a distinct process group and
+        # was still alive when EOF ended the frontend, then the container's PID
+        # namespace killed it with the display. A display supervisor would make
+        # the experimental daemon much larger than the problem it solves here,
+        # so the container keeps one browser per frontend instead.
+        logger.warning(
+            "DAEMON_ENABLED is ignored in a container; the shared-browser "
+            "daemon cannot outlive the virtual display owned by this server"
+        )
+        return False
+    return True
