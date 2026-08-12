@@ -23,6 +23,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DOCKERFILE = (_REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
 _ENTRYPOINT_PATH = _REPO_ROOT / "docker-entrypoint.sh"
 _ENTRYPOINT = _ENTRYPOINT_PATH.read_text(encoding="utf-8")
+_README = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+_DOCKER_GUIDE = (_REPO_ROOT / "docs" / "docker-hub.md").read_text(encoding="utf-8")
 
 
 def test_the_image_installs_only_the_full_browser() -> None:
@@ -36,11 +38,32 @@ def test_the_image_defaults_to_headed_on_a_virtual_display() -> None:
     assert 'Xvfb "$DISPLAY" -screen 0 1920x1080x24 -nolisten tcp' in _ENTRYPOINT
 
 
-def test_tini_signals_the_whole_display_group() -> None:
-    """Python must receive TERM before the PID namespace tears it down."""
-    assert 'ENTRYPOINT ["tini", "-g"' in _DOCKERFILE
+def test_the_image_seeds_the_default_authentication_root_for_named_volumes() -> None:
+    creation = _DOCKERFILE.index(
+        "RUN install -d -m 0700 -o pwuser -g pwuser /home/pwuser/.linkedin-mcp"
+    )
+    unprivileged_runtime = _DOCKERFILE.index("USER pwuser")
+
+    assert creation < unprivileged_runtime
+
+
+def test_the_documented_bind_mount_is_created_by_the_host_user() -> None:
+    for document in (_README, _DOCKER_GUIDE):
+        assert "mkdir -p ~/.linkedin-mcp" in document
+        assert 'sudo chown -R "$(id -u):$(id -g)" ~/.linkedin-mcp' in document
+        assert "created by the Docker viewer" in document
+        assert "belongs to a foreign runtime" in document
+
+
+def test_the_supervisor_stops_python_before_the_display() -> None:
+    """Browser cleanup must retain Xvfb until Python has exited."""
+    assert 'ENTRYPOINT ["tini", "-e", "143"' in _DOCKERFILE
+    assert 'ENTRYPOINT ["tini", "-g"' not in _DOCKERFILE
     assert "wait -n -p first_child" in _ENTRYPOINT
-    assert 'kill -TERM "$server_pid" "$xvfb_pid"' in _ENTRYPOINT
+    server_term = _ENTRYPOINT.index('kill -TERM "$server_pid"')
+    server_wait = _ENTRYPOINT.index('wait "$server_pid"', server_term)
+    display_term = _ENTRYPOINT.index('kill -TERM "$xvfb_pid"', server_wait)
+    assert server_term < server_wait < display_term
     assert "xvfb-run" not in _DOCKERFILE
 
 
