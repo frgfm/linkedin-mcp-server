@@ -495,6 +495,13 @@ async (anchor) => {
       return rect.left + rect.width / 2 >= eventRect.left;
     });
   for (const button of menuButtons) {
+    if (findAction('restore')) {
+      return {
+        clicked: false,
+        verified: true,
+        alreadyArchived: true,
+      };
+    }
     button.click();
     for (let waits = 0; waits < 10; waits++) {
       await new Promise(resolve => setTimeout(resolve, 100));
