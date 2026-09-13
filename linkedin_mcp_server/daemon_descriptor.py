@@ -979,6 +979,10 @@ class DaemonDescriptor:
         # accepts "localhost" by name, which says nothing about where the
         # resolver on this machine actually sends it.
         hostname = parsed.hostname or ""
+        if hostname.endswith("."):
+            raise DescriptorError(
+                f"The daemon descriptor's host {self.host!r} has a trailing dot"
+            )
         try:
             # An address literal is its own answer, and asking the resolver
             # about one would be a needless trip through a component that can

@@ -1,0 +1,149 @@
+"""Feed permalink recognition across DOM anchors and SDUI payloads."""
+
+from __future__ import annotations
+
+from typing import Any
+from urllib.parse import urlparse
+
+import re
+
+from linkedin_mcp_server.scraping.link_metadata import (
+    FeedAuthor,
+    FeedMedia,
+    FeedPost,
+    Reference,
+    build_references,
+    dedupe_references,
+)
+
+_FEED_AGE_RE = re.compile(r"^\d+(?:min|h|d|w|mo|y)$")
+_FEED_DEGREE_RE = re.compile(r"^(?:\d(?:st|nd|rd)\+?)$", re.IGNORECASE)
+
+
+def _optional_text(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _normalize_feed_post(raw: Any) -> FeedPost | None:
+    """Validate one browser-extracted structured feed post."""
+    if not isinstance(raw, dict):
+        return None
+    raw_author = raw.get("author") if isinstance(raw.get("author"), dict) else {}
+    degree = _optional_text(raw_author.get("degree"))
+    if degree:
+        degree = degree.lstrip("·• ").strip()
+        degree = degree.lower()
+        if not _FEED_DEGREE_RE.fullmatch(degree):
+            degree = None
+    age = _optional_text(raw.get("post_age"))
+    if age and not _FEED_AGE_RE.fullmatch(age):
+        age = None
+    media_value = raw.get("media")
+    media: FeedMedia | None = None
+    if isinstance(media_value, dict):
+        media_type = media_value.get("type")
+        media_url = _optional_text(media_value.get("url"))
+        if media_type in {"link", "image", "video"} and media_url:
+            media = {"type": media_type, "url": media_url}
+
+    def count(value: Any) -> int | None:
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    author: FeedAuthor = {
+        "name": _optional_text(raw_author.get("name")),
+        "profile_url": _optional_text(raw_author.get("profile_url")),
+        "headline": _optional_text(raw_author.get("headline")),
+        "degree": degree,
+    }
+    post: FeedPost = {
+        "url": _optional_text(raw.get("url")),
+        "post_age": age,
+        "author": author,
+        "content": _optional_text(raw.get("content")),
+        "is_promoted": bool(raw.get("is_promoted")),
+        "media": media,
+        "reactions_count": count(raw.get("reactions_count")),
+        "comment_count": count(raw.get("comment_count")),
+        "repost_count": count(raw.get("repost_count")),
+    }
+    return post if post["url"] or post["content"] or author["name"] else None
+
+
+normalize_feed_post = _normalize_feed_post
+
+_FEED_RSC_MARKER = "sduiid=com.linkedin.sdui.pagers.feed.mainFeed"
+# Matches a LinkedIn post permalink in either plain or JSON-escaped form
+# (the initial /feed/ HTML embeds the RSC flight data with \u002f for slashes,
+# while paginated responses use plain slashes). Captures the slug portion so
+# we can rebuild a canonical URL regardless of the source encoding.
+POST_SLUG_URL_RE = re.compile(
+    r"linkedin\.com(?:\\u002[fF]|/)posts(?:\\u002[fF]|/)"
+    r"(?P<slug>[A-Za-z0-9_-]+?-(?:ugcPost|activity|share)-\d+-[A-Za-z0-9_-]+)"
+)
+_FEED_DOCUMENT_URLS = {
+    "https://www.linkedin.com/feed",
+    "https://www.linkedin.com/feed/",
+}
+
+
+def is_feed_payload_response(url: str) -> bool:
+    """True if the response URL is one that carries `postSlugUrl` fields."""
+    if _FEED_RSC_MARKER in url:
+        return True
+    return url.split("?", 1)[0] in _FEED_DOCUMENT_URLS
+
+
+def build_feed_references(
+    raw_references: list[Any],
+    captured_urls: list[str],
+) -> list[Reference]:
+    """Compose feed references from DOM anchors + SDUI captures.
+
+    The feed page renders many anchors that are not post permalinks:
+    sidebar widgets, profile cards, employer logos, etc. Mixing them
+    into ``references["feed"]`` blurs the contract and competes with
+    SDUI permalinks for the per-section cap. We keep only the
+    ``feed_post`` slice from the DOM:
+
+    - DOM anchors → ``feed_post`` entries with ``/feed/update/<urn>/``
+      URLs (whatever ``classify_link`` recognises).
+    - SDUI captures → ``feed_post`` entries with ``/posts/<slug>`` URLs
+      for permalinks that the DOM does not surface as an anchor.
+
+    Both are deduped on exact URL string. The two shapes pointing at
+    the same underlying post will *not* collapse — ``dedupe_references``
+    matches strings, not URNs. Both are valid LinkedIn permalinks, so
+    consumers should treat ``feed_post`` as polymorphic on URL form;
+    URN-based equivalence is left to the consumer.
+    """
+    refs = [
+        ref
+        for ref in build_references(raw_references, "feed")
+        if ref["kind"] == "feed_post"
+    ]
+    existing = {r["url"] for r in refs}
+    for sdui_url in captured_urls:
+        # AGENTS.md mandates relative paths for LinkedIn references.
+        # The SDUI capture carries fully-qualified URLs like
+        # https://www.linkedin.com/posts/<slug>; strip the host so the
+        # relative-path convention holds. ``classify_link`` does not
+        # currently route ``/posts/<slug>`` paths to any kind, so we
+        # bypass it for this fallback append.
+        parsed = urlparse(sdui_url)
+        if not parsed.path.startswith("/posts/"):
+            continue
+        relative = parsed.path
+        if relative in existing:
+            continue
+        refs.append({"kind": "feed_post", "url": relative, "context": "feed"})
+        existing.add(relative)
+    # Cap kept in sync with _REFERENCE_CAPS["feed"] in link_metadata.py;
+    # changing one without the other will drop or duplicate entries
+    # silently. Matches get_feed's num_posts ceiling (Field(ge=1, le=50)).
+    return dedupe_references(refs, cap=50)

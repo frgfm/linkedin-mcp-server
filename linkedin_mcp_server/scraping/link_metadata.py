@@ -273,6 +273,10 @@ _SECTION_CONTEXTS = {
     "job_posting": "job posting",
     "inbox": "inbox",
     "conversation": "conversation",
+    "invitations": "invitations",
+    "jobs": "jobs",
+    "saved_jobs": "saved jobs",
+    "feed": "feed",
 }
 
 _DEFAULT_REFERENCE_CAP = 12
@@ -298,7 +302,7 @@ _REFERENCE_CAPS = {
     "conversation": 12,
     "invitations": 100,
     # Headroom for get_feed's num_posts ceiling (Field(ge=1, le=50)).
-    # Kept in sync with the literal cap=50 in extractor._build_feed_references
+    # Kept in sync with the literal cap=50 in feed_payload.build_feed_references
     # where SDUI-derived /posts/<slug> permalinks are appended.
     "feed": 50,
 }

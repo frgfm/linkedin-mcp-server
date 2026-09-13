@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
-from linkedin_mcp_server.scraping.extractor import LinkedInExtractor
+from linkedin_mcp_server.scraping.message_sender import MessageSender
+from linkedin_mcp_server.scraping.navigation import PageNavigator
+from linkedin_mcp_server.scraping.session import ScrapingSession
 
 
 @pytest.fixture
@@ -28,25 +30,26 @@ def keyboard_mock() -> MagicMock:
 
 
 @pytest.fixture
-def extractor(keyboard_mock: MagicMock) -> LinkedInExtractor:
+def sender(keyboard_mock: MagicMock) -> MessageSender:
     page = MagicMock()
     page.keyboard = keyboard_mock
-    return LinkedInExtractor(page)
+    session = ScrapingSession(page)
+    return MessageSender(session, PageNavigator(session))
 
 
 class TestTypeMessageWithNewlines:
     async def test_single_line_uses_type_only(
-        self, extractor: LinkedInExtractor, keyboard_mock: MagicMock
+        self, sender: MessageSender, keyboard_mock: MagicMock
     ) -> None:
-        await extractor._type_message_with_newlines("Hello there")
+        await sender._type_message_with_newlines("Hello there")
 
         keyboard_mock.type.assert_awaited_once_with("Hello there", delay=15)
         keyboard_mock.press.assert_not_awaited()
 
     async def test_double_newline_splits_with_shift_enter(
-        self, extractor: LinkedInExtractor, keyboard_mock: MagicMock
+        self, sender: MessageSender, keyboard_mock: MagicMock
     ) -> None:
-        await extractor._type_message_with_newlines("First\n\nSecond")
+        await sender._type_message_with_newlines("First\n\nSecond")
 
         # Empty middle segment is skipped, but the two newlines still emit
         # two Shift+Enter presses so the paragraph break is preserved.
@@ -58,9 +61,9 @@ class TestTypeMessageWithNewlines:
         ]
 
     async def test_crlf_normalized_to_lf(
-        self, extractor: LinkedInExtractor, keyboard_mock: MagicMock
+        self, sender: MessageSender, keyboard_mock: MagicMock
     ) -> None:
-        await extractor._type_message_with_newlines("a\r\nb")
+        await sender._type_message_with_newlines("a\r\nb")
 
         assert keyboard_mock.mock_calls == [
             call.type("a", delay=15),
@@ -69,9 +72,9 @@ class TestTypeMessageWithNewlines:
         ]
 
     async def test_trailing_newline_emits_shift_enter_only(
-        self, extractor: LinkedInExtractor, keyboard_mock: MagicMock
+        self, sender: MessageSender, keyboard_mock: MagicMock
     ) -> None:
-        await extractor._type_message_with_newlines("a\n")
+        await sender._type_message_with_newlines("a\n")
 
         assert keyboard_mock.mock_calls == [
             call.type("a", delay=15),

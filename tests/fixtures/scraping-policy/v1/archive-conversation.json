@@ -1,0 +1,13 @@
+{
+  "call": {
+    "arguments": {},
+    "method": "archive_conversation"
+  },
+  "events": [],
+  "result": {
+    "status": "action_unavailable",
+    "url": "https://www.linkedin.com/messaging/thread/2-abc/"
+  },
+  "scenario": "archive_conversation__baseline",
+  "schema_version": 1
+}

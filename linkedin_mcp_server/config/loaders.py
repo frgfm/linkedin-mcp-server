@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import sys
+from collections.abc import Sequence
 from typing import Literal, cast
 from urllib.parse import unquote, urlsplit
 
@@ -145,6 +146,7 @@ class EnvironmentKeys:
     AUTO_IMPORT_FROM_BROWSER = "AUTO_IMPORT_FROM_BROWSER"
     EAGER_FULL_CHROMIUM = "EAGER_FULL_CHROMIUM"
     DAEMON_ENABLED = "DAEMON_ENABLED"
+    INSTALLER_TEMP_DIR = "INSTALLER_TEMP_DIR"
 
 
 # What ``manifest.json`` fills from ``user_config``, and the exact string each
@@ -250,6 +252,10 @@ def load_from_env(config: AppConfig) -> AppConfig:
     # Persistent browser profile directory
     if user_data_dir := os.environ.get(EnvironmentKeys.USER_DATA_DIR):
         config.browser.user_data_dir = user_data_dir
+
+    # Temporary directory parent used during browser installation bootstrap
+    if installer_temp_dir := os.environ.get(EnvironmentKeys.INSTALLER_TEMP_DIR):
+        config.browser.installer_temp_dir = installer_temp_dir
 
     # Timeout for page operations (validated in BrowserConfig.validate())
     if timeout_env := os.environ.get(EnvironmentKeys.TIMEOUT):
@@ -436,7 +442,7 @@ def load_from_env(config: AppConfig) -> AppConfig:
     return config
 
 
-def load_from_args(config: AppConfig) -> AppConfig:
+def load_from_args(config: AppConfig, argv: Sequence[str]) -> AppConfig:
     """Load configuration from command line arguments."""
     parser = argparse.ArgumentParser(
         description="LinkedIn MCP Server - A Model Context Protocol server for LinkedIn integration"
@@ -654,6 +660,14 @@ def load_from_args(config: AppConfig) -> AppConfig:
     )
 
     parser.add_argument(
+        "--installer-temp-dir",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Path to temporary parent directory for browser installation bootstrap",
+    )
+
+    parser.add_argument(
         "--claim-profile-root",
         action="store_true",
         help=(
@@ -742,7 +756,7 @@ def load_from_args(config: AppConfig) -> AppConfig:
         help="Give every stdio client its own browser (default; overrides DAEMON_ENABLED=true).",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Update configuration with parsed arguments
     if args.no_headless:
@@ -832,6 +846,9 @@ def load_from_args(config: AppConfig) -> AppConfig:
     if args.user_data_dir:
         config.browser.user_data_dir = args.user_data_dir
 
+    if args.installer_temp_dir:
+        config.browser.installer_temp_dir = args.installer_temp_dir
+
     if args.claim_profile_root:
         config.server.claim_profile_root = True
 
@@ -851,14 +868,13 @@ def load_from_args(config: AppConfig) -> AppConfig:
     return config
 
 
-def load_config() -> AppConfig:
+def load_config(argv: Sequence[str] | None = None) -> AppConfig:
     """
     Load configuration with clear precedence order.
 
-    Configuration is loaded in the following priority order:
-    1. Command line arguments (highest priority)
-    2. Environment variables
-    3. Defaults (lowest priority)
+    Explicit command line arguments have highest priority, followed by
+    environment variables and defaults. Without *argv*, only environment
+    variables and defaults are loaded.
 
     Returns:
         Fully configured application settings
@@ -873,8 +889,9 @@ def load_config() -> AppConfig:
     # Override with environment variables
     config = load_from_env(config)
 
-    # Override with command line arguments (highest priority)
-    config = load_from_args(config)
+    # Override with explicit command line arguments (highest priority)
+    if argv is not None:
+        config = load_from_args(config, argv)
 
     # Validate final configuration
     config.validate()
