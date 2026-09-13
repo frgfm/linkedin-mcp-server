@@ -1,0 +1,13 @@
+{
+  "call": {
+    "arguments": {},
+    "method": "get_pending_invitations"
+  },
+  "events": [],
+  "result": {
+    "invitations": [],
+    "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/"
+  },
+  "scenario": "get_pending_invitations__baseline",
+  "schema_version": 1
+}

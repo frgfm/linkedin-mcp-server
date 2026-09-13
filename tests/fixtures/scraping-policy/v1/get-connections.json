@@ -1,0 +1,13 @@
+{
+  "call": {
+    "arguments": {},
+    "method": "get_connections"
+  },
+  "events": [],
+  "result": {
+    "connections": [],
+    "url": "https://www.linkedin.com/mynetwork/invite-connect/connections/"
+  },
+  "scenario": "get_connections__baseline",
+  "schema_version": 1
+}

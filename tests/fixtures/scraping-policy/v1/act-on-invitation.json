@@ -1,0 +1,13 @@
+{
+  "call": {
+    "arguments": {},
+    "method": "act_on_invitation"
+  },
+  "events": [],
+  "result": {
+    "status": "ignored",
+    "url": "https://www.linkedin.com/in/ada-lovelace/"
+  },
+  "scenario": "act_on_invitation__baseline",
+  "schema_version": 1
+}

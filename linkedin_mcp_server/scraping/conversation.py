@@ -43,6 +43,79 @@ _DELETED_BODY_TEXTS_EN_US: frozenset[str] = frozenset(
     {"This message has been deleted."}
 )
 
+_ARCHIVE_CONVERSATION_JS = r"""
+async (anchor) => {
+  const visible = el => !el.disabled && el.getClientRects().length > 0;
+  const text = el =>
+    (el.getAttribute('aria-label') || el.innerText || el.textContent || '')
+      .replace(/\s+/g, ' ').trim().toLowerCase();
+  const root = anchor?.closest('[role="dialog"]') || document.querySelector('main');
+  if (!root) return { clicked: false, verified: false, reason: 'no_root' };
+  const event = root.querySelector('[data-event-urn^="urn:li:msg_message:"]');
+  if (!event) return { clicked: false, verified: false, reason: 'no_messages' };
+
+  const eventRect = event.getBoundingClientRect();
+  // BrowserManager forces en-US, so LinkedIn's menu labels are stable here.
+  const actionItems = () => Array.from(root.querySelectorAll(
+    '[role="menuitem"], [role="menu"] button, [role="button"]'
+  )).filter(visible);
+  const findAction = action => actionItems().find(item =>
+    text(item) === action || text(item) === `${action} conversation`
+  );
+  const menuButtons = Array.from(root.querySelectorAll(
+    'button[aria-haspopup="menu"], button[aria-expanded]'
+  ))
+    .filter(visible)
+    .filter(button => {
+      const rect = button.getBoundingClientRect();
+      return rect.left + rect.width / 2 >= eventRect.left;
+    });
+  for (const button of menuButtons) {
+    if (findAction('restore')) {
+      return {
+        clicked: false,
+        verified: true,
+        alreadyArchived: true,
+      };
+    }
+    button.click();
+    for (let waits = 0; waits < 10; waits++) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      if (findAction('restore')) {
+        return {
+          clicked: false,
+          verified: true,
+          alreadyArchived: true,
+        };
+      }
+      const archive = findAction('archive');
+      if (!archive) continue;
+
+      archive.click();
+      let reopened = false;
+      for (let verifies = 0; verifies < 20; verifies++) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (findAction('restore')) {
+          return { clicked: true, verified: true, alreadyArchived: false };
+        }
+        if (
+          !reopened &&
+          verifies >= 2 &&
+          button.isConnected &&
+          button.getAttribute('aria-expanded') !== 'true'
+        ) {
+          button.click();
+          reopened = true;
+        }
+      }
+      return { clicked: true, verified: false };
+    }
+    if (button.getAttribute('aria-expanded') === 'true') button.click();
+  }
+  return { clicked: false, verified: false, reason: 'archive_action_not_found' };
+}
+"""
+
 _MONTH_ABBREVS_EN_US: dict[str, int] = {
     "jan": 1,
     "feb": 2,
