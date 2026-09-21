@@ -19,6 +19,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Scraping Rules
 
+- **Voyager / private API.** Out of scope. [Read the rendered page](docs/decisions/2026-09-16-rendered-page.md).
 - **One section = one navigation.** Each entry in `PERSON_SECTIONS` / `COMPANY_SECTIONS` (`scraping/fields.py`) maps to exactly one page navigation. Never combine multiple URLs behind a single section.
 - **Minimize DOM dependence.** Prefer innerText and URL navigation over DOM selectors. When DOM access is unavoidable, use minimal generic selectors (`a[href*="/jobs/view/"]`) — never class names tied to LinkedIn's layout.
 - **Detection must be locale-independent.** Classification logic — connection state, action availability, button identity — must rely on URL patterns (`/preload/custom-invite/?vanityName=USER`, `/in/USER/edit/intro/`, `/messaging/compose/`), attribute *presence* (`aria-label` exists, `aria-expanded` exists, `aria-disabled` exists), or structural counts — never on text values like "Connect", "Follow", "Message", "1st", "Pending". The verb in an `aria-label` is locale-dependent; whether the attribute exists is not. Where text is genuinely the only signal, guard it behind an explicit per-locale table and document the limitation in code.
@@ -146,7 +147,10 @@ Optional additional keys:
 - `section_errors: {section_name: {error_type, error_message, issue_template_path, runtime, ...}}`
 - `unknown_sections: [name, ...]`
 - `job_ids: [id, ...]` (search_jobs and get_saved_jobs)
+- `total: {count, exact}` (search_jobs only) — the result count LinkedIn advertises on the first page; `exact` is false for a lower bound such as "500+"
+- `promoted_job_ids: [id, ...]` (search_jobs only) — the subset of `job_ids` shown as promoted; present only when every page could be read, so an empty list means none were
 - `references["feed"]` (get_feed only) — every entry is `kind: "feed_post"`; non-post anchors (sidebar profiles, employer logos) are filtered. URLs may carry either `/feed/update/<urn>/` (DOM-anchor-derived) or `/posts/<slug>` (SDUI-derived) form; both are valid LinkedIn permalinks. Cap is 50 entries, matching `get_feed`'s `num_posts` ceiling.
+- `references["search_results"]` (search_posts only) — DOM references first, then up to 50 `kind: "feed_post"` permalinks read from the page's JSON/document payload responses (`/feed/update/<urn>/` or `/posts/<slug>`, both valid). Captured permalinks are appended, not aligned to result order.
 
 `get_feed`'s `sections["feed"]`, `get_conversation`, and `get_person_profile`'s `main_profile` section break the `{section_name: raw_text}` shape.
 
@@ -158,23 +162,25 @@ Optional additional keys:
 
 ## Tests
 
-- **A test that cannot fail is not a test.** Before committing one, mutate
-  the code it covers and watch it fail. A test that survives the mutation
-  asserts something every implementation satisfies (a count that holds
-  either way, a branch merely touched), and the usual repair is to assert
-  the log line, the elapsed time, or a count scoped to the thing under
-  test. Fixtures that reload on every scroll event mask a premature stop:
-  slow them down until one batch lands per round, or the mutation survives
-  for the wrong reason.
- - **Browser-DOM tests belong where the unit suite mocks `page.evaluate`.**
-   Extractor JS never executes under a mock, so a `browser_dom` test is its
-   only coverage. Prefer a unit test elsewhere, and keep in mind that a
-   fixture imitating LinkedIn's markup is a claim about LinkedIn, while one
-   driving a synthetic container is a claim about the algorithm only.
+- **Tautologies.** Assert an observable contract independent of the
+  implementation; a test that cannot fail is not a test. Before committing
+  one, mutate the covered behaviour to introduce a plausible regression and
+  watch that test fail. Reject language restatements and redundant assertions.
+  A test that survives the mutation may assert something every implementation
+  satisfies (a count that holds either way, a branch merely touched). Prefer
+  asserting the log line, elapsed time, or a count scoped to the behaviour
+  under test. Pin an always-loaded instruction pointer. A sentence in a
+  disclosed doc is not a test. For scroll-stop tests, slow fixtures until one
+  batch lands per round so a premature stop fails for the right reason.
+- **Browser-DOM tests belong where the unit suite mocks `page.evaluate`.**
+  Extractor JS never executes under a mock, so a `browser_dom` test is its
+  only coverage. Prefer a unit test elsewhere, and keep in mind that a
+  fixture imitating LinkedIn's markup is a claim about LinkedIn, while one
+  driving a synthetic container is a claim about the algorithm only.
 
 ## Verifying Bug Reports
 
-Always verify scraping bugs end-to-end against live LinkedIn, not just code analysis. Use `uv run`, not `uvx`, so the running process reflects your workspace. Use `uvx` only for packaged distribution verification. For live Docker investigations, refresh the source session first with `uv run -m linkedin_mcp_server --login` before testing each materially different approach. Assume a valid login profile already exists at `~/.linkedin-mcp/profile/`.
+Evaluate bug reports from the reporter's packet and the matching source. Live LinkedIn reproduction is optional. State which account variant and code version each observation covers. For a chosen local live check, use `uv run` to test the workspace or the reported launcher to test a packaged installation. Ask before login, session changes, or LinkedIn writes.
 
 ```bash
 # Start server
@@ -261,16 +267,10 @@ for that.
 
 Always read [`CONTRIBUTING.md`](CONTRIBUTING.md) before filing an issue or working on this repository.
 
-- Write a short synthetic prompt that would reproduce the PR diff if given to a fresh Claude Code session. Don't copy the user's first message — distill the conversation into a single instruction that captures the full scope of changes. This tells the maintainer what was intended, which is often more useful than reviewing the full diff. Use a Markdown blockquote under a `## Synthetic prompt` heading, followed by the model attribution:
-  ```
-  ## Synthetic prompt
-
-  > Add `skills` and `projects` sections to `get_person_profile`, following the certifications PR pattern. Update fields, tests, docs, and manifest.
-
-  Generated with <model name and version>
-  ```
+- Write a short synthetic prompt that would reproduce the PR diff if given to a fresh Claude Code session. Don't copy the user's first message — distill the conversation into a single instruction that captures the full scope of changes. This tells the maintainer what was intended, which is often more useful than reviewing the full diff. Use a Markdown blockquote under a `## Synthetic prompt` heading.
+- The final non-empty line of every PR body must disclose every model used. CI accepts `Generated with <model>` or `Generated with <model>.` as the minimum. The final period is optional only for this model-only form. Prefer the detailed form `Generated with <model> for <job> in <harness>.`; for example, `Generated with Claude Opus 5 for implementation in Claude Code via T3 Code.` A harness is the coding-agent runtime that invokes the model and tools, such as Claude Code or Codex CLI. Add an outer host or wrapper with optional `via <host>`. For multiple models, use `Generated with <model 1> for <job 1> and <model 2> for <job 2> in <harness>.`; `and` separates model/job pairs exclusively, and commas or `/` list multiple jobs for one model.
 - When implementing a new feature/fix:
-  1. Check open issues. If no issue exists, create one following the templates in `.github/ISSUE_TEMPLATE/`. Fill in every section; delete optional sections if not applicable.
+  1. Packet: before filing or commenting on a GitHub issue, read [.agents/skills/issue-packet/SKILL.md](.agents/skills/issue-packet/SKILL.md).
   2. Branch from `main`: `feature/issue-number-short-description`
   3. Implement and test
   4. Update README.md and docs/docker-hub.md if relevant

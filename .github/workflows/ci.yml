@@ -9,6 +9,22 @@ on:
   # entirely for the stacks this repository's workflow produces.
   pull_request:
 
+# One run per pull request branch. Restacking a stacked pull request pushes
+# every branch in the stack, and without this every superseded push kept its
+# whole matrix alive to completion, Windows legs included. Those are the ones
+# that cost anything: macOS and Linux bill at zero here while Windows is the
+# entire spend.
+#
+# Pushes to main get a group of their own per run, never a shared one. A shared
+# group does not merely decline to cancel the running job; GitHub also evicts
+# whichever run is already waiting when a newer one arrives, so merging three
+# pull requests in quick succession would leave the middle commit with no CI
+# result at all. Keying on run_id makes every main run its own group, which is
+# the only arrangement where each commit on main keeps a result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint-and-check:
     runs-on: ubuntu-latest
@@ -78,11 +94,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.12.4 exactly, because it is the declared floor and the one version
-        # where private state creation on Windows became possible at all. The
-        # others follow their newest patch, so nothing else here would notice a
-        # daemon path reaching for something added after it.
-        python-version: ["3.12.4", "3.12", "3.13", "3.14"]
+        # 3.12.4 exactly, because it is the declared floor, the one version
+        # where private state creation on Windows became possible at all, and it
+        # carries the eight-client election stress again. 3.12.10 historically
+        # crashed a frontend with 0xC0000005 while 3.12.4, 3.13 and 3.14 passed.
+        # That incident is why no version here may be dropped on the argument
+        # that a middle release can only fail where an endpoint already does: in
+        # this subsystem one demonstrably did. The floating `3.12` entry remains
+        # absent so product CI does not silently move between patch releases.
+        python-version: ["3.12.4", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -93,10 +113,31 @@ jobs:
 
       - run: uv sync --group dev
 
+      # #838: a frontend in this job has twice exited 0xC0000005 with no fault
+      # location. `faulthandler` cannot always supply one, because the report
+      # is written by the process that is already failing; Windows Error
+      # Reporting writes from outside it, so a dump survives what the process
+      # could not report. `DumpType` 1 is a minidump: the faulting stack is the
+      # missing evidence, and a full heap dump of eight Python processes is
+      # hundreds of megabytes per crash. Costs nothing on a green run, which is
+      # every run since the crashing interpreter left the matrix.
+      - name: Arm a crash dump for #838
+        shell: pwsh
+        run: |
+          $folder = Join-Path $env:RUNNER_TEMP 'crash-dumps'
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Path $key -Force | Out-Null
+          Set-ItemProperty -Path $key -Name DumpFolder -Value $folder -Type ExpandString
+          Set-ItemProperty -Path $key -Name DumpCount -Value 16 -Type DWord
+          Set-ItemProperty -Path $key -Name DumpType -Value 1 -Type DWord
+
       - name: Run daemon protocol and containment tests
         run: >-
           uv run pytest
           tests/test_daemon_election.py::TestAtomicStartupCommit
+          tests/test_daemon_election.py::TestElectionSettlement
+          tests/test_daemon_election.py::TestOwnerBootstrapOrdering
           tests/test_daemon_election.py::TestPublishingLast
           tests/test_daemon_election.py::TestRealOwner::test_an_owner_is_started_and_answers
           tests/test_daemon_election.py::TestRealOwner::test_a_crashed_owner_is_replaced
@@ -110,7 +151,20 @@ jobs:
           tests/test_installer_supervisor.py
           tests/test_installer_worker.py
           tests/test_process_tree.py
+          tests/test_windows_guardian_probe.py
           tests/test_private_state.py
+
+      # Only on failure, and tolerant of an empty folder: a Python exception
+      # fails this job without ever reaching Windows Error Reporting, and that
+      # is the ordinary red run.
+      - name: Upload the crash dump
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crash-dumps-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/crash-dumps
+          if-no-files-found: ignore
+          retention-days: 14
 
       - run: uv cache prune --ci
 
@@ -203,8 +257,8 @@ jobs:
 
       - run: uv cache prune --ci
 
-  # Everything here coordinates or protects state through the operating system
-  # rather than through Python, so each platform runs a different
+  # Everything here coordinates, protects or queries state through the operating
+  # system rather than through Python, so each platform runs a different
   # implementation: the lease locks with flock or with LockFileEx, and
   # owner-only storage is a permission bit or an access control list. The
   # Ubuntu job above executes neither Windows path. Serial by choice: the lease
@@ -254,6 +308,7 @@ jobs:
           tests/test_profile_lease.py
           tests/test_profile_lease_integration.py
           tests/test_private_state.py
+          tests/test_session_state.py::test_the_native_machine_api_answers_on_windows
           tests/test_daemon_lock.py
           tests/test_process_tree.py
           tests/test_greenlet_runtime.py

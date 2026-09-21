@@ -1,6 +1,6 @@
 # Contributing
 
-Contributions are welcome! Please [open an issue](https://github.com/stickerdaniel/linkedin-mcp-server/issues) first to discuss the feature or bug fix before submitting a PR.
+Contributions are welcome! Packet: search first, then add evidence to an existing issue or prepare a new report. Agents follow the [packet skill](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/.agents/skills/issue-packet/SKILL.md). Humans use the [issue forms](https://github.com/stickerdaniel/linkedin-mcp-server/issues/new/choose).
 
 ## Development Setup
 
@@ -64,6 +64,8 @@ for section_name, (suffix, is_overlay) in PERSON_SECTIONS.items():
 # `sender` is an integer index into `members`; members[0].is_self is the auth user.
 # Member.url is optional — omitted on the self member when no /in/ anchor was observed.
 {"url": str, "sections": {"messages": [{timestamp, status, sender: int, content}, ...], "members": [{kind: "person", url?, name?, is_self: bool}, ...]}}
+# search_jobs may add the advertised result count and the promoted subset:
+{..., "total": {"count": int, "exact": bool}, "promoted_job_ids": [id, ...]}
 ```
 
 `sections` remains the main readable payload. `references` is a compact supplement for entity/article traversal. LinkedIn references are emitted as relative paths to minimize token use. `get_conversation` parses message-thread DOM into structured turns instead of emitting cluttered innerText — see [`scraping/conversation.py`](linkedin_mcp_server/scraping/conversation.py) (`extract_conversation`) for the en-US locale assumptions baked into timestamp and deleted-status detection.
@@ -104,6 +106,7 @@ When adding an entirely new MCP tool (e.g., `search_companies`):
 ### Code
 
 - [ ] Add the workflow to its canonical owner module from `docs/scraping-architecture.md`; keep `LinkedInExtractor` in `scraping/extractor.py` as a thin delegate only if the stable facade needs a new method
+- [ ] No LinkedIn private API (Voyager). See [Read the rendered page](docs/decisions/2026-09-16-rendered-page.md)
 - [ ] Add or extend tool registration function (`tools/*.py`)
 - [ ] Register tools in `create_mcp_server()` if new file (`server.py`)
 
@@ -156,14 +159,19 @@ when the reviewed policy change is intentional.
 
 ## Workflow
 
-1. [Open an issue](https://github.com/stickerdaniel/linkedin-mcp-server/issues) using the correct GitHub issue template. Fill in every section; delete optional sections if not applicable.
+1. Link the canonical issue for the change. Follow the packet procedure above when adding a report.
 2. Create a branch: `feature/<issue-number>-<short-description>` or `fix/<issue-number>-<short-description>`
 3. Implement, test, and update docs (see checklists above)
 4. Open a PR — AI agents review first, then manual review
-5. PRs are squash-merged into `main`, so the PR title becomes the commit
+5. Complete the model attribution line supplied by the PR template. CI requires
+   the model before merge; the job and coding-agent harness are preferred
+   provenance, with an outer host or wrapper optionally added as `via <host>`
+6. PRs are squash-merged into `main`, so the PR title becomes the commit
    subject; commits inside a PR are for review only
 
 ## Scraping Philosophy: Minimize DOM Dependence
+
+Voyager and other LinkedIn private APIs are out of scope. See [Read the rendered page](docs/decisions/2026-09-16-rendered-page.md).
 
 This project favours **innerText extraction and URL navigation** over DOM selectors. LinkedIn's markup changes frequently — class names, `data-` attributes, and component structure are unstable. Our scraping engine is deliberately built to survive those changes:
 
