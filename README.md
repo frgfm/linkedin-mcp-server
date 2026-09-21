@@ -9,34 +9,36 @@
   <a href="https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/LICENSE" target="_blank"><img src="https://img.shields.io/badge/License-Apache%202.0-%233fb950?labelColor=32383f" alt="License"></a>
 </p>
 
-> **Disclaimer:** This is an independent, community project. It is not affiliated with, authorized by, endorsed by, or sponsored by LinkedIn Corporation or Microsoft. "LinkedIn" is a registered trademark of LinkedIn Corporation and is used here only descriptively to identify the third-party service this software interoperates with.
+An MCP server that connects AI assistants like Claude to LinkedIn through your own logged-in browser session. Look up profiles and companies, send messages, manage your inbox, or search for jobs. All browser actions run locally on your machine.
 
-An MCP server that lets AI assistants like Claude read LinkedIn data through your own logged-in browser session. Access profiles and companies, search for jobs, or get job details.
+> This is an independent open-source project, not affiliated with, authorized by, endorsed by, or sponsored by LinkedIn or Microsoft. LinkedIn is a trademark of LinkedIn Corporation and is used here only to identify the service this software interacts with.
 
-## Sponsor
+<br/>
+<details open>
+<summary><strong>LinkedIn MCP Sponsor</strong></summary>
+<br/>
+<a href="https://golink.onl/unipile-banner" target="_blank">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/c2e7f3b4-6812-4f28-8728-10f882a44e0e">
+    <img src="https://github.com/user-attachments/assets/89ab8932-ae79-41c2-8416-a699e924218b" alt="Unipile, one API for every LinkedIn feature" width="100%">
+  </picture>
+</a>
 
-<p align="center">
-  <a href="https://golink.onl/unipile-banner" target="_blank">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/c2e7f3b4-6812-4f28-8728-10f882a44e0e">
-      <img src="https://github.com/user-attachments/assets/89ab8932-ae79-41c2-8416-a699e924218b" alt="Unipile, one API for every LinkedIn feature" width="100%">
-    </picture>
-  </a>
-</p>
+> This MCP server is supported by [**Unipile**](https://golink.onl/unipile-link). Unipile is the fully managed cloud option for developers: a hosted LinkedIn API for Classic, Sales Navigator, and Recruiter that handles auth, sessions, and infrastructure for you.
 
-This MCP server is **free** and **open source**, supported by [**Unipile**](https://golink.onl/unipile-link). It runs locally with your own browser session. Unipile is the fully managed cloud alternative: a hosted LinkedIn API for Classic, Sales Navigator, and Recruiter that handles auth, sessions, and infrastructure for you. [Try it free for 7 days →](https://golink.onl/unipile-free-trial)
+[Try Unipile free for 7 days →](https://golink.onl/unipile-free-trial)
+</details>
 
 ---
 
 <a id="installation-methods"></a>
 
-## Installation Methods - MCP Server for LinkedIn
+## Installation Methods - LinkedIn MCP Server
 
-[![uvx](https://img.shields.io/badge/uvx-Quick_Install-de5fe9?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDEiIGhlaWdodD0iNDEiIHZpZXdCb3g9IjAgMCA0MSA0MSIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTS01LjI4NjE5ZS0wNiAwLjE2ODYyOUwwLjA4NDMwOTggMjAuMTY4NUwwLjE1MTc2MiAzNi4xNjgzQzAuMTYxMDc1IDM4LjM3NzQgMS45NTk0NyA0MC4xNjA3IDQuMTY4NTkgNDAuMTUxNEwyMC4xNjg0IDQwLjA4NEwzMC4xNjg0IDQwLjA0MThMMzEuMTg1MiA0MC4wMzc1QzMzLjM4NzcgNDAuMDI4MiAzNS4xNjgzIDM4LjIwMjYgMzUuMTY4MyAzNlYzNkwzNy4wMDAzIDM2TDM3LjAwMDMgMzkuOTk5Mkw0MC4xNjgzIDM5Ljk5OTZMMzkuOTk5NiAtOS45NDY1M2UtMDdMMjEuNTk5OCAwLjA3NzU2ODlMMjEuNjc3NCAxNi4wMTg1TDIxLjY3NzQgMjUuOTk5OEwyMC4wNzc0IDI1Ljk5OThMMTguMzk5OCAyNS45OTk4TDE4LjQ3NzQgMTYuMDMyTDE4LjM5OTggMC4wOTEwNTkzTC01LjI4NjE5ZS0wNiAwLjE2ODYyOVoiIGZpbGw9IiNERTVGRTkiLz4KPC9zdmc+Cg==)](#-uvx-setup-recommended---universal)
+[![uvx](https://img.shields.io/badge/uvx-Quick_Install-de5fe9?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDEiIGhlaWdodD0iNDEiIHZpZXdCb3g9IjAgMCA0MSA0MSIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTS01LjI4NjE5ZS0wNiAwLjE2ODYyOUwwLjA4NDMwOTggMjAuMTY4NUwwLjE1MTc2MiAzNi4xNjgzQzAuMTYxMDc1IDM4LjM3NzQgMS45NTk0NyA0MC4xNjA3IDQuMTY4NTkgNDAuMTUxNEwyMC4xNjg0IDQwLjA4NEwzMC4xNjg0IDQwLjA0MThMMzEuMTg1MiA0MC4wMzc1QzMzLjM4NzcgNDAuMDI4MiAzNS4xNjgzIDM4LjIwMjYgMzUuMTY4MyAzNlYzNkwzNy4wMDAzIDM2TDM3LjAwMDMgMzkuOTk5Mkw0MC4xNjgzIDM5Ljk5OTZMMzkuOTk5NiAtOS45NDY1M2UtMDdMMjEuNTk5OCAwLjA3NzU2ODlMMjEuNjc3NCAxNi4wMTg1TDIxLjY3NzQgMjUuOTk5OEwyMC4wNzc0IDI1Ljk5OThMMTguMzk5OCAyNS45OTk4TDE4LjQ3NzQgMTYuMDMyTDE4LjM5OTggMC4wOTEwNTkzTC01LjI4NjE5ZS0wNiAwLjE2ODYyOVoiIGZpbGw9IiNERTVGRTkiLz4KPC9zdmc+Cg==)](#-uvx-setup-recommended)
 [![Install MCP Bundle](https://img.shields.io/badge/Claude_Desktop_MCPB-d97757?style=for-the-badge&logo=anthropic)](#-claude-desktop-mcp-bundle-formerly-dxt)
-[![Codex Plugin](https://img.shields.io/badge/Codex-Plugin-24292f?style=for-the-badge&logo=openai&logoColor=white)](#-codex-plugin)
+[![Codex Plugin](https://img.shields.io/badge/Codex-Plugin-24292f?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0iI2ZmZmZmZiIgZmlsbC1ydWxlPSJldmVub2RkIiBjbGlwLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik04LjA4Ni40NTdhNi4xMDUgNi4xMDUgMCAwMTMuMDQ2LS40MTVjMS4zMzMuMTUzIDIuNTIxLjcyIDMuNTY0IDEuN2EuMTE3LjExNyAwIDAwLjEwNy4wMjljMS40MDgtLjM0NiAyLjc2Mi0uMjI0IDQuMDYxLjM2NmwuMDYzLjAzLjE1NC4wNzZjMS4zNTcuNzAzIDIuMzMgMS43NyAyLjkxOCAzLjE5OC4yNzguNjc5LjQxOCAxLjM4OC40MjEgMi4xMjZhNS42NTUgNS42NTUgMCAwMS0uMTggMS42MzEuMTY3LjE2NyAwIDAwLjA0LjE1NSA1Ljk4MiA1Ljk4MiAwIDAxMS41NzggMi44OTFjLjM4NSAxLjkwMS0uMDEgMy42MTUtMS4xODMgNS4xNGwtLjE4Mi4yMmE2LjA2MyA2LjA2MyAwIDAxLTIuOTM0IDEuODUxLjE2Mi4xNjIgMCAwMC0uMTA4LjEwMmMtLjI1NS43MzYtLjUxMSAxLjM2NC0uOTg3IDEuOTkyLTEuMTk5IDEuNTgyLTIuOTYyIDIuNDYyLTQuOTQ4IDIuNDUxLTEuNTgzLS4wMDgtMi45ODYtLjU4Ny00LjIxLTEuNzM2YS4xNDUuMTQ1IDAgMDAtLjE0LS4wMzJjLS41MTguMTY3LTEuMDQuMTkxLTEuNjA0LjE4NWE1LjkyNCA1LjkyNCAwIDAxLTIuNTk1LS42MjIgNi4wNTggNi4wNTggMCAwMS0yLjE0Ni0xLjc4MWMtLjIwMy0uMjY5LS40MDQtLjUyMi0uNTUxLS44MjFhNy43NCA3Ljc0IDAgMDEtLjQ5NS0xLjI4MyA2LjExIDYuMTEgMCAwMS0uMDE3LTMuMDY0LjE2Ni4xNjYgMCAwMC4wMDgtLjA3NC4xMTUuMTE1IDAgMDAtLjAzNy0uMDY0IDUuOTU4IDUuOTU4IDAgMDEtMS4zOC0yLjIwMiA1LjE5NiA1LjE5NiAwIDAxLS4zMzMtMS41ODkgNi45MTUgNi45MTUgMCAwMS4xODgtMi4xMzJjLjQ1LTEuNDg0IDEuMzA5LTIuNjQ4IDIuNTc3LTMuNDkzLjI4Mi0uMTg4LjU1LS4zMzQuODAyLS40MzguMjg2LS4xMi41NzMtLjIyLjg2MS0uMzA0YS4xMjkuMTI5IDAgMDAuMDg3LS4wODdBNi4wMTYgNi4wMTYgMCAwMTUuNjM1IDIuMzFDNi4zMTUgMS40NjQgNy4xMzIuODQ2IDguMDg2LjQ1N3ptLS44MDQgNy44NWEuODQ4Ljg0OCAwIDAwLTEuNDczLjg0MmwxLjY5NCAyLjk2NS0xLjY4OCAyLjg0OGEuODQ5Ljg0OSAwIDAwMS40Ni44NjRsMS45NC0zLjI3MmEuODQ5Ljg0OSAwIDAwLjAwNy0uODU0bC0xLjk0LTMuMzkzem01LjQ0NiA2LjI0YS44NDkuODQ5IDAgMDAwIDEuNjk1aDQuODQ4YS44NDkuODQ5IDAgMDAwLTEuNjk2aC00Ljg0OHoiLz48L3N2Zz4%3D)](#-codex-plugin)
 [![Docker](https://img.shields.io/badge/Docker-Universal_MCP-008fe2?style=for-the-badge&logo=docker&logoColor=008fe2)](#-docker-setup)
-[![Development](https://img.shields.io/badge/Development-Local-ffdc53?style=for-the-badge&logo=python&logoColor=ffdc53)](#-local-setup-develop--contribute)
 
 | Tool | Description | Status |
 |------|-------------|--------|
@@ -63,7 +65,7 @@ This MCP server is **free** and **open source**, supported by [**Unipile**](http
 | `search_people` | Search for people by keywords, location, connection degree (1st/2nd/3rd), and current company | [#526](https://github.com/stickerdaniel/linkedin-mcp-server/issues/526) |
 | `get_job_details` | Get detailed information about a specific job posting | working |
 | `get_feed` | Get recent posts from the authenticated user's home feed | working |
-| `search_posts` | Search posts/content globally by keyword (the "Posts" tab) with an optional recency filter (past-24h/past-week/past-month) | working |
+| `search_posts` | Search posts/content globally by keyword (the "Posts" tab) with an optional recency filter (past-24h/past-week/past-month); returns unordered candidate permalinks in references | working |
 | `close_session` | Close browser session and clean up resources | working |
 
 `get_pending_invitations` returns `{url, invitations}`. Received invitations
@@ -88,7 +90,7 @@ read conversations that remain scoped to a pending invitation.
 <br/>
 <br/>
 
-## 🚀 uvx Setup (Recommended - Universal)
+## 🚀 uvx Setup (Recommended)
 
 **Prerequisites:** [Install uv](https://docs.astral.sh/uv/getting-started/installation/).
 
@@ -362,8 +364,7 @@ On startup, the MCP Bundle starts preparing the shared Patchright Chromium brows
 
 ## 🧩 Codex plugin
 
-This repository includes an opt-in Codex plugin that bundles the MCP server and
-its LinkedIn workflow guidance. Add the repository marketplace, then install the
+This repository includes an opt-in Codex plugin that bundles the MCP server. Add the repository marketplace and install the
 plugin:
 
 ```bash
@@ -371,25 +372,13 @@ codex plugin marketplace add stickerdaniel/linkedin-mcp-server
 codex plugin add linkedin-mcp-server@linkedin-mcp-server
 ```
 
-The plugin pins the MCP package to the same version as the plugin release. It
-does not install by default or override the user's enabled state. The plugin can
-be disabled in Codex settings, and its bundled MCP server can be disabled
-independently in `~/.codex/config.toml`:
-
-```toml
-[plugins."linkedin-mcp-server".mcp_servers.linkedin]
-enabled = false
-```
-
-Installing or enabling the plugin does not open a browser or sign in. A
-LinkedIn data request may start the managed browser, import an existing local
-session, or require a visible login window.
-
 <br/>
 <br/>
 
 ## 🐳 Docker Setup
 
+<details>
+<summary><strong>I know what I'm doing</strong></summary>
 **Prerequisites:** Make sure [Docker](https://www.docker.com/get-started/) is installed and running.
 
 ### Authentication
@@ -655,12 +644,74 @@ belongs behind something that provides it.
 
 </details>
 
+</details>
+
+<br/>
+<br/>
+
+
+<a id="using-a-proxy"></a>
+
+## 🛡️ Using a proxy
+
+<details open>
+<summary><strong>Sponsored proxy providers</strong></summary>
+
+<br/>
+<a href="https://www.swiftproxy.net/?ref=stickerdaniel">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/872f4efb-f329-4f3c-b864-cd1fac7a331b" />
+    <img src="https://github.com/user-attachments/assets/c413a236-a49f-4480-8dcc-b67de3093920" alt="Swiftproxy logo" width="240">
+  </picture>
+</a>
+
+> Swiftproxy offers residential proxies with sticky sessions and worldwide geo-targeting. Its dedicated static ISP options include networks such as AT&T, Sky UK, and Rogers, with unlimited traffic and renewable addresses.
+
+Use code <strong>PROXY90</strong> for 10% off <a href="https://www.swiftproxy.net/?ref=stickerdaniel">Try Swiftproxy →</a>
+<br/>
+
+<a href="https://www.rapidproxy.io/?ref=linkedin">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/47680db7-360f-4128-9e66-73f784c0fa85" />
+    <img src="https://github.com/user-attachments/assets/3daa30e1-ead1-4884-8388-b3024c026ba9" alt="RapidProxy logo" width="240">
+  </picture>
+</a>
+
+> RapidProxy offers 90M+ residential IPs worldwide for LinkedIn automation and browser workflows, with sticky sessions, geo-targeting, and high-concurrency support. Plans start at $0.55/GB with non-expiring traffic.
+
+Use code <strong>RAPID10</strong> for 10% off <a href="https://www.rapidproxy.io/?ref=linkedin">Try RapidProxy for free →</a>
+<br/>
+
+<br/>
+</details>
+
+LinkedIn scores the address a session signs in from. Your account's usual IP address is the safe one. You should use a proxy in your country when the server cannot use it: a VPS, another country, or a second account that must not share the first one's address.
+
+With a paid provider, use a sticky residential session that holds one address (never per-request rotation). A WireGuard full tunnel or Tailscale exit node on your home network works when the server should use your usual home address.
+
+**Setup:**
+
+- Set the proxy up **before** `--login`. Moving an existing session to a new address triggers a LinkedIn checkpoint. That includes a session from `--import-from-browser`, which was created on your real address.
+- `--proxy-server scheme://host:port` or `PROXY_SERVER`, with `http`, `https`, `socks4` or `socks5`. Only browser traffic is routed, not the MCP transport.
+- Pass credentials through `PROXY_USERNAME` and `PROXY_PASSWORD`, or include them in `PROXY_SERVER` using the combined `http://user:pass@host:port` form. The combined form is not accepted by the `--proxy-server` CLI option.
+- `PROXY_BYPASS=localhost,127.0.0.1,::1` reaches local targets directly. With a proxy set, Chromium routes `localhost` through it too.
+
+<details>
+<summary>Pitfalls</summary>
+
+- Chromium cannot authenticate to a SOCKS proxy, so credentials require an `http(s)` endpoint. If your provider only offers authenticated SOCKS5, run a local relay that holds the credentials and point the server at that.
+- A wrong proxy password shows up as a timeout or a failed sign-in, because Chromium retries the authentication challenge until the page times out. If sessions stop working right after you add a proxy, check the proxy credentials first.
+- Auto-import is skipped while a proxy is configured: the imported session would move from your real address to the proxy. Use `--login`.
+- Inside a container `127.0.0.1` is the container itself, so a relay on the host is `host.docker.internal`; native Linux Docker also needs `--add-host=host.docker.internal:host-gateway`.
+
+</details>
+
 <br/>
 <br/>
 
 ## 🐍 Local Setup (Develop & Contribute)
 
-Contributions are welcome! See [CONTRIBUTING.md](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/CONTRIBUTING.md) for architecture guidelines and checklists. Please [open an issue](https://github.com/stickerdaniel/linkedin-mcp-server/issues) first to discuss the feature or bug fix before submitting a PR.
+Contributions are welcome! See [CONTRIBUTING.md](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/CONTRIBUTING.md) for architecture guidelines and checklists. Packet: search first, then add evidence to an existing issue or prepare a new report. Agents follow the [packet skill](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/.agents/skills/issue-packet/SKILL.md). Humans use the [issue forms](https://github.com/stickerdaniel/linkedin-mcp-server/issues/new/choose).
 
 **Prerequisites:** [Git](https://git-scm.com/downloads) and [uv](https://docs.astral.sh/uv/) installed
 
@@ -684,8 +735,6 @@ uv run pre-commit install
 # 5. Start the server
 uv run -m linkedin_mcp_server
 ```
-
-The local server uses the same managed-runtime flow as MCPB and `uvx`: it prepares the Patchright Chromium browser cache in the background and opens LinkedIn login on the first auth-requiring tool call. You can still run `uv run -m linkedin_mcp_server --login` when you want to create the session explicitly.
 
 ### Local Setup Help
 
@@ -840,35 +889,6 @@ uv run -m linkedin_mcp_server --transport streamable-http --host 127.0.0.1 --por
 <br/>
 <br/>
 
-<a id="using-a-proxy"></a>
-
-## 🛡️ Using a proxy
-
-LinkedIn scores the address a session signs in from. The account's usual address is the safe one, and you need a proxy only when the server cannot use it: a cloud host, another country, or a second account that must not share the first one's address. A container on your own machine leaves through your address and needs none.
-
-Take a dedicated static ISP address and keep it. From a residential pool, use a sticky session that holds one address, never per-request rotation. A WireGuard or Tailscale exit node on your home network works too.
-
-**Setup:**
-
-- Set the proxy up **before** `--login`. Moving an existing session to a new address triggers a LinkedIn checkpoint. That includes a session from `--import-from-browser`, which was created on your real address.
-- `--proxy-server scheme://host:port` or `PROXY_SERVER`, with `http`, `https`, `socks4` or `socks5`. Only browser traffic is routed, not the MCP transport.
-- Credentials go in `PROXY_USERNAME` and `PROXY_PASSWORD`, or in the combined `http://user:pass@host:port` form. There is no `--proxy-password` flag: command-line arguments are readable by every other user on the machine.
-- `PROXY_BYPASS=localhost,127.0.0.1,::1` reaches local targets directly. With a proxy set, Chromium routes `localhost` through it too.
-- These flags and variables work with every install method. The MCP Bundle exposes the same four settings in Claude Desktop.
-
-<details>
-<summary>Pitfalls</summary>
-
-- Chromium cannot authenticate to a SOCKS proxy, so credentials require an `http(s)` endpoint. If your provider only offers authenticated SOCKS5, run a local relay that holds the credentials and point the server at that.
-- A wrong proxy password shows up as a timeout or a failed sign-in, because Chromium retries the authentication challenge until the page times out. If sessions stop working right after you add a proxy, check the credentials first.
-- Auto-import is skipped while a proxy is configured: the imported session would move from your real address to the proxy. Use `--login`.
-- Inside a container `127.0.0.1` is the container itself, so a relay on the host is `host.docker.internal`; native Linux Docker also needs `--add-host=host.docker.internal:host-gateway`.
-
-</details>
-
-<br/>
-<br/>
-
 > [!IMPORTANT]
 > **FAQ**
 >
@@ -888,6 +908,6 @@ Use in accordance with [LinkedIn's User Agreement](https://www.linkedin.com/lega
 
 This project is licensed under the Apache 2.0 license.
 
-Building on it is welcome, including under a different license. Apache-2.0 attaches conditions to that, set out in section 4 of the [license](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/LICENSE). The one most often missed is that the attribution in [`NOTICE`](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/NOTICE) has to travel with what you ship.
+Building on this project is welcome! See the [license](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/LICENSE) for terms and the [`NOTICE`](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/NOTICE) for attribution.
 
 <br>
