@@ -13,7 +13,11 @@ from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.scraping import jobs as jobs_module
-from linkedin_mcp_server.scraping.capture import CapturePlan, SectionCapture
+from linkedin_mcp_server.scraping.capture import (
+    CaptureMode,
+    CapturePlan,
+    SectionCapture,
+)
 from linkedin_mcp_server.scraping.content import PageContentReader
 from linkedin_mcp_server.scraping.contracts import (
     RATE_LIMITED_SECTION_TEXT,
@@ -81,7 +85,7 @@ class TestScrapeJob:
         capture.assert_awaited_once_with(
             "https://www.linkedin.com/jobs/view/12345/",
             section_name="job_posting",
-            plan=CapturePlan(),
+            plan=CapturePlan(CaptureMode.JOB_POSTING),
         )
         assert result["url"] == "https://www.linkedin.com/jobs/view/12345/"
         assert "job_posting" in result["sections"]
@@ -152,6 +156,37 @@ class TestScrapeJob:
             "job posting",
             "similar job",
         ]
+
+    async def test_scrape_job_reports_a_posting_without_its_description(
+        self, mock_page
+    ):
+        scraper = _scraper(mock_page)
+        with patch.object(
+            scraper._capture,
+            "capture",
+            new_callable=AsyncMock,
+            return_value=extracted("Software Engineer\nAcme\nEasy Apply"),
+        ):
+            result = await scraper.scrape_job("12345")
+
+        assert result["sections"] == {
+            "job_posting": "Software Engineer\nAcme\nEasy Apply"
+        }
+        error = result["section_errors"]["job_posting"]
+        assert error["error_type"] == "description_missing"
+
+    async def test_scrape_job_with_its_description_reports_nothing(self, mock_page):
+        scraper = _scraper(mock_page)
+        with patch.object(
+            scraper._capture,
+            "capture",
+            new_callable=AsyncMock,
+            return_value=extracted("Software Engineer\nAbout the job\nBuild agents"),
+        ):
+            result = await scraper.scrape_job("12345")
+
+        assert "job_posting" in result["sections"]
+        assert "section_errors" not in result
 
 
 class TestSearchJobs:
@@ -739,6 +774,68 @@ class TestSearchJobs:
         assert error["error_type"] == "filters_dropped"
         assert "location" in error["error_message"]
 
+    @pytest.mark.parametrize(
+        "lands_on,expected_dropped",
+        [
+            (None, False),
+            (
+                "https://www.linkedin.com/jobs/search/?keywords=python&f_EA=true",
+                True,
+            ),
+        ],
+    )
+    async def test_encoded_facet_is_one_filter_and_drop_detection_keeps_it(
+        self, mock_page, lands_on: str | None, expected_dropped: bool
+    ):
+        scraper = _scraper(mock_page)
+
+        with (
+            patch.object(
+                scraper._pages,
+                "_extract_search_page",
+                side_effect=self._navigating(
+                    mock_page,
+                    [extracted("python jobs")],
+                    lands_on=lands_on,
+                ),
+            ),
+            patch.object(
+                scraper._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["901"],
+            ),
+            patch.object(
+                scraper._pages,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.jobs.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.search_jobs(
+                "python",
+                job_type="x&f_EA=true",
+                easy_apply=True,
+                max_pages=1,
+            )
+
+        assert result["url"] == (
+            "https://www.linkedin.com/jobs/search/"
+            "?keywords=python&f_JT=x%26f_EA%3Dtrue&f_EA=true"
+        )
+        assert result["job_ids"] == ["901"]
+        if expected_dropped:
+            error = result["section_errors"]["search_results"]
+            assert error["error_type"] == "filters_dropped"
+            assert "f_JT" in error["error_message"]
+            assert "did not keep f_EA" not in error["error_message"]
+        else:
+            assert "section_errors" not in result
+
     async def test_a_dropped_filter_survives_whatever_stops_the_loop(self, mock_page):
         """The warning describes the results, and the results are returned.
 
@@ -1221,7 +1318,7 @@ class TestSearchJobs:
         assert len(seen) == 10
         assert seen[0] == 12.0  # the per-page cap, whatever max_pages says
         assert seen == [12.0] * 5 + [0.0] * 5  # 60s, spent five pages in
-        assert sum(seen) <= 60.0
+        assert sum(s for s in seen if s is not None) <= 60.0
 
     async def test_a_slow_navigation_does_not_spend_the_scroll_budget(self, mock_page):
         """The budget bounds scrolling, so only scrolling may spend it.

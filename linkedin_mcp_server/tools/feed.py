@@ -33,12 +33,10 @@ def register_feed_tools(
         title="Get Feed",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"feed", "scraping"},
-        exclude_args=["extractor"],
     )
     async def get_feed(
         ctx: Context,
         num_posts: Annotated[int, Field(ge=1, le=50)] = 10,
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         Get posts from the authenticated user's LinkedIn feed.
@@ -68,9 +66,7 @@ def register_feed_tools(
             ``url`` when present; otherwise use ``references["feed"]``.
         """
         try:
-            extractor = extractor or await get_ready_extractor(
-                ctx, tool_name="get_feed"
-            )
+            extractor = await get_ready_extractor(ctx, tool_name="get_feed")
             logger.info("Scraping feed (num_posts=%d)", num_posts)
 
             await ctx.report_progress(

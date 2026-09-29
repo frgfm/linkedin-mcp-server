@@ -66,14 +66,12 @@ def register_person_tools(
         title="Get Person Profile",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"person", "scraping"},
-        exclude_args=["extractor"],
     )
     async def get_person_profile(
         linkedin_username: str,
         ctx: Context,
         sections: str | None = None,
         max_scrolls: Annotated[int, Field(ge=1, le=50)] | None = None,
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         Get a specific person's LinkedIn profile.
@@ -112,9 +110,7 @@ def register_person_tools(
             return raw innerText for the LLM to parse.
         """
         try:
-            extractor = extractor or await get_ready_extractor(
-                ctx, tool_name="get_person_profile"
-            )
+            extractor = await get_ready_extractor(ctx, tool_name="get_person_profile")
             requested, unknown = parse_person_sections(sections)
 
             logger.info(
@@ -149,7 +145,6 @@ def register_person_tools(
         title="Search People",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"person", "search"},
-        exclude_args=["extractor"],
     )
     async def search_people(
         keywords: str,
@@ -157,7 +152,6 @@ def register_person_tools(
         location: str | None = None,
         network: StrList | None = None,
         current_company: str | None = None,
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         Search for people on LinkedIn.
@@ -185,9 +179,7 @@ def register_person_tools(
             The LLM should parse the raw text to extract individual people and their profiles.
         """
         try:
-            extractor = extractor or await get_ready_extractor(
-                ctx, tool_name="search_people"
-            )
+            extractor = await get_ready_extractor(ctx, tool_name="search_people")
             logger.info(
                 "Searching people: keywords='%s', location='%s', network=%s, current_company='%s'",
                 keywords,
@@ -234,13 +226,11 @@ def register_person_tools(
         title="Connect With Person",
         annotations={"destructiveHint": True, "openWorldHint": True},
         tags={"person", "actions"},
-        exclude_args=["extractor"],
     )
     async def connect_with_person(
         linkedin_username: str,
         ctx: Context,
         note: str | None = None,
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         Send a LinkedIn connection request or accept an incoming one.
@@ -272,9 +262,7 @@ def register_person_tools(
             before calling again, because a repeat may invite twice.
         """
         try:
-            extractor = extractor or await get_ready_extractor(
-                ctx, tool_name="connect_with_person"
-            )
+            extractor = await get_ready_extractor(ctx, tool_name="connect_with_person")
             logger.info(
                 "Connecting with person: %s (note=%s)",
                 linkedin_username,
@@ -309,12 +297,10 @@ def register_person_tools(
         title="Get Sidebar Profiles",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"person", "scraping"},
-        exclude_args=["extractor"],
     )
     async def get_sidebar_profiles(
         linkedin_username: str,
         ctx: Context,
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         Get profile links from sidebar recommendation sections on a LinkedIn profile page.
@@ -334,9 +320,7 @@ def register_person_tools(
             /in/username/ paths. Only sections present on the page are included.
         """
         try:
-            extractor = extractor or await get_ready_extractor(
-                ctx, tool_name="get_sidebar_profiles"
-            )
+            extractor = await get_ready_extractor(ctx, tool_name="get_sidebar_profiles")
             logger.info("Getting sidebar profiles for: %s", linkedin_username)
 
             await ctx.report_progress(
@@ -362,13 +346,11 @@ def register_person_tools(
         title="Get My Profile",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"person", "scraping"},
-        exclude_args=["extractor"],
     )
     async def get_my_profile(
         ctx: Context,
         sections: str | None = None,
         max_scrolls: Annotated[int, Field(ge=1, le=50)] | None = None,
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         Get the authenticated user's own LinkedIn profile.
@@ -396,9 +378,7 @@ def register_person_tools(
             innerText.
         """
         try:
-            extractor = extractor or await get_ready_extractor(
-                ctx, tool_name="get_my_profile"
-            )
+            extractor = await get_ready_extractor(ctx, tool_name="get_my_profile")
             requested, unknown = parse_person_sections(sections)
 
             logger.info("Scraping own profile (sections=%s)", sections)

@@ -24,13 +24,11 @@ def register_network_tools(
         title="Get Pending Invitations",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"network", "scraping"},
-        exclude_args=["extractor"],
     )
     async def get_pending_invitations(
         ctx: Context,
         limit: Annotated[int, Field(ge=1, le=100)] = 20,
         kind: Literal["received", "sent"] = "received",
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         List pending LinkedIn network invitations (received or sent).
@@ -40,7 +38,7 @@ def register_network_tools(
         identity and headline fields.
         """
         try:
-            extractor = extractor or await get_ready_extractor(
+            extractor = await get_ready_extractor(
                 ctx, tool_name="get_pending_invitations"
             )
             logger.info("Fetching pending invitations (kind=%s, limit=%d)", kind, limit)
@@ -63,12 +61,10 @@ def register_network_tools(
         title="Get Connections",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"network", "scraping"},
-        exclude_args=["extractor"],
     )
     async def get_connections(
         ctx: Context,
         limit: Annotated[int, Field(ge=1, le=100)] = 20,
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         List the authenticated user's most recently added 1st-degree connections.
@@ -80,9 +76,7 @@ def register_network_tools(
         line, or ``None`` for other locales / unparseable text.
         """
         try:
-            extractor = extractor or await get_ready_extractor(
-                ctx, tool_name="get_connections"
-            )
+            extractor = await get_ready_extractor(ctx, tool_name="get_connections")
             logger.info("Fetching connections (limit=%d)", limit)
             await ctx.report_progress(
                 progress=0, total=100, message="Loading connections"
@@ -103,12 +97,10 @@ def register_network_tools(
         title="Ignore Connection Request",
         annotations={"destructiveHint": True, "openWorldHint": True},
         tags={"network", "actions"},
-        exclude_args=["extractor"],
     )
     async def ignore_connection_request(
         linkedin_username: str,
         ctx: Context,
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         Ignore a received LinkedIn connection request.
@@ -124,7 +116,7 @@ def register_network_tools(
         | ``action_unavailable`` | ``verification_failed``.
         """
         try:
-            extractor = extractor or await get_ready_extractor(
+            extractor = await get_ready_extractor(
                 ctx, tool_name="ignore_connection_request"
             )
             logger.info("Ignoring connection request: %s", linkedin_username)
@@ -143,12 +135,10 @@ def register_network_tools(
         title="Withdraw Invitation",
         annotations={"destructiveHint": True, "openWorldHint": True},
         tags={"network", "actions"},
-        exclude_args=["extractor"],
     )
     async def withdraw_invitation(
         linkedin_username: str,
         ctx: Context,
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         Withdraw an outgoing LinkedIn connection request.
@@ -162,9 +152,7 @@ def register_network_tools(
         | ``action_unavailable`` | ``verification_failed``.
         """
         try:
-            extractor = extractor or await get_ready_extractor(
-                ctx, tool_name="withdraw_invitation"
-            )
+            extractor = await get_ready_extractor(ctx, tool_name="withdraw_invitation")
             logger.info("Withdrawing invitation: %s", linkedin_username)
             result = await extractor.act_on_invitation(linkedin_username, "withdraw")
             return result

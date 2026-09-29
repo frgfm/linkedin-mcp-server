@@ -27,9 +27,7 @@ from linkedin_mcp_server.scraping.feed_payload import (
 )
 from linkedin_mcp_server.scraping.navigation import PageNavigator
 from linkedin_mcp_server.scraping.session import ScrapingSession
-from linkedin_mcp_server.scraping.text import (
-    truncate_linkedin_noise,
-)
+from linkedin_mcp_server.scraping.text import truncate_linkedin_noise
 
 logger = logging.getLogger(__name__)
 
@@ -481,7 +479,10 @@ class FeedScraper:
                 # reads still need stopping.
                 page.remove_listener("response", _handle_response)
             except Exception:
-                pass
+                logger.debug(
+                    "Failed to remove feed response listener",
+                    exc_info=True,
+                )
             await self._drain_listener_tasks(pending_reads)
 
     async def _extract_feed_body(

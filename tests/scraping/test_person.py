@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -517,6 +518,136 @@ class TestScrapePersonUrls:
         assert list(result["sections"]) == list(table)
 
 
+class TestScrapePersonPacing:
+    """The person-section walk paces gaps rather than individual captures."""
+
+    async def test_selected_sections_are_paced_in_config_order(self, mock_page):
+        scraper = _scraper(mock_page)
+        events = []
+
+        async def capture(_url, section_name, plan):
+            events.append(("capture", section_name))
+            return extracted(f"{section_name} text")
+
+        async def overlay(_url, section_name, plan):
+            events.append(("capture", section_name))
+            return extracted(f"{section_name} text")
+
+        async def delay(seconds):
+            events.append(("delay", seconds))
+
+        with (
+            patch.object(scraper._capture, "capture", side_effect=capture),
+            patch.object(scraper._capture, "_extract_overlay", side_effect=overlay),
+            patch.object(ScrapingSession, "delay", side_effect=delay),
+        ):
+            await scraper.scrape_person(
+                "testuser", {"main_profile", "experience", "contact_info"}
+            )
+
+        assert events == [
+            ("capture", "main_profile"),
+            ("delay", 2.0),
+            ("capture", "experience"),
+            ("delay", 2.0),
+            ("capture", "contact_info"),
+        ]
+
+    @pytest.mark.parametrize(
+        "requested",
+        [{"main_profile"}, {"not_a_person_section"}],
+        ids=["one-section", "no-recognized-section"],
+    )
+    async def test_a_single_selected_section_has_no_gap(self, mock_page, requested):
+        scraper = _scraper(mock_page)
+        events = []
+
+        async def capture(_url, section_name, plan):
+            events.append(("capture", section_name))
+            return extracted("profile text")
+
+        async def delay(seconds):
+            events.append(("delay", seconds))
+
+        with (
+            patch.object(scraper._capture, "capture", side_effect=capture),
+            patch.object(ScrapingSession, "delay", side_effect=delay),
+        ):
+            await scraper.scrape_person("testuser", requested)
+
+        assert events == [("capture", "main_profile")]
+
+    async def test_rate_limit_stops_before_later_capture_and_gap(self, mock_page):
+        scraper = _scraper(mock_page)
+        events = []
+
+        async def capture(_url, section_name, plan):
+            events.append(("capture", section_name))
+            if section_name == "experience":
+                return extracted(RATE_LIMITED_SECTION_TEXT)
+            return extracted(f"{section_name} text")
+
+        async def delay(seconds):
+            events.append(("delay", seconds))
+
+        with (
+            patch.object(scraper._capture, "capture", side_effect=capture),
+            patch.object(ScrapingSession, "delay", side_effect=delay),
+        ):
+            result = await scraper.scrape_person(
+                "testuser", {"main_profile", "experience", "posts"}
+            )
+
+        assert events == [
+            ("capture", "main_profile"),
+            ("delay", 2.0),
+            ("capture", "experience"),
+        ]
+        assert result["sections"] == {"main_profile": "main_profile text"}
+        assert result["section_errors"]["experience"]["error_type"] == "rate_limit"
+
+    async def test_reused_main_profile_leaves_one_gap_before_next_section(
+        self, mock_page
+    ):
+        scraper = _scraper(mock_page)
+        mock_page.url = "https://www.linkedin.com/in/testuser/"
+        events = []
+
+        async def reuse(_url, section_name, plan):
+            events.append(("reuse", section_name))
+            return extracted("profile text")
+
+        async def capture(_url, section_name, plan):
+            events.append(("capture", section_name))
+            return extracted("experience text")
+
+        async def delay(seconds):
+            events.append(("delay", seconds))
+
+        with (
+            patch.object(
+                scraper._capture, "_extract_loaded_section", side_effect=reuse
+            ),
+            patch.object(scraper._capture, "capture", side_effect=capture),
+            patch.object(ScrapingSession, "delay", side_effect=delay),
+            patch.object(
+                scraper._navigator, "_navigate_to_page", new_callable=AsyncMock
+            ) as navigate,
+        ):
+            await scraper.scrape_person(
+                "testuser",
+                {"main_profile", "experience"},
+                main_profile_already_loaded=True,
+            )
+
+        assert events == [
+            ("reuse", "main_profile"),
+            ("delay", 2.0),
+            ("capture", "experience"),
+        ]
+        navigate.assert_not_awaited()
+
+
 class TestScrapePersonSectionOutcomes:
     """What one section's result does to the walk and to the response."""
 
@@ -715,6 +846,217 @@ class TestScrapePersonSectionOutcomes:
 
         assert result["sections"]["main_profile"] == "Profile text"
         assert result["section_errors"]["posts"]["error_type"] == "rate_limit"
+
+
+OVERLAY_ROOTS: tuple[str, ...] = ("dialog[open]", ".artdeco-modal__content")
+MAIN_ROOT: tuple[str, ...] = ("main",)
+NOISE_ONLY = (
+    "More profiles for you\n\n"
+    "You've approached your profile search limit\n\n"
+    "About\nAccessibility\nTalent Solutions"
+)
+PROFILE_TEXT = "Ada Lovelace\nAnalyst at Engines Ltd"
+
+
+def _root(text: str, href: str | None = None, *, source: str = "root") -> dict:
+    """One answer of the shared root read, optionally with a single anchor."""
+    references = []
+    if href is not None:
+        references.append(
+            {
+                "href": href,
+                "text": "Linked profile",
+                "aria_label": "",
+                "title": "",
+                "heading": "",
+                "in_article": False,
+                "in_nav": False,
+                "in_footer": False,
+            }
+        )
+    return {"source": source, "text": text, "references": references}
+
+
+def _missing_root(overlay_url: str) -> dict[str, str]:
+    return {
+        "error_type": "OverlayRootNotFoundError",
+        "error_message": (
+            "No overlay root (dialog[open] or .artdeco-modal__content) matched "
+            f"on {overlay_url}; no underlying-page text or links were returned "
+            "for contact_info"
+        ),
+    }
+
+
+class TestMissingContactOverlay:
+    """A missing contact overlay through the real capture, with the browser mocked.
+
+    Only navigation, the rate-limit read, scrolling and the root read are
+    stood in for. Everything between them, the retry, the error conversion and
+    the section walk, is the production path.
+    """
+
+    @staticmethod
+    @contextmanager
+    def browser(
+        scraper: PersonScraper,
+        mock_page,
+        pages: dict[str, dict[tuple[str, ...], list[dict]]],
+        events: list[tuple[str, Any]],
+        redirects: dict[str, str] | None = None,
+    ):
+        """Answer each root read from the page last navigated to."""
+        pages = {
+            url: {k: list(v) for k, v in reads.items()} for url, reads in pages.items()
+        }
+        current = {"url": mock_page.url}
+
+        async def navigate(url: str) -> None:
+            events.append(("goto", url))
+            current["url"] = (redirects or {}).get(url, url)
+
+        async def evaluate(script, *args, **kwargs):
+            if "MAX_REFERENCE_ANCHORS" not in script:
+                return None
+            selectors = tuple(args[0]["selectors"])
+            return pages[current["url"]][selectors].pop(0)
+
+        async def delay(seconds: float) -> None:
+            events.append(("delay", seconds))
+
+        mock_page.evaluate = AsyncMock(side_effect=evaluate)
+        diagnostic_failure = PermissionError("diagnostic directory is unwritable")
+        boundaries = (
+            patch.object(scraper._navigator, "_navigate_to_page", side_effect=navigate),
+            patch.object(ScrapingSession, "delay", side_effect=delay),
+            patch(
+                "linkedin_mcp_server.scraping.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.scroll_to_bottom",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.capture.build_issue_diagnostics",
+                side_effect=diagnostic_failure,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.person.build_issue_diagnostics",
+                side_effect=diagnostic_failure,
+            ),
+        )
+        with ExitStack() as stack:
+            for boundary in boundaries:
+                stack.enter_context(boundary)
+            yield
+
+    async def test_a_missing_overlay_is_reported_and_the_walk_continues(
+        self, mock_page
+    ):
+        base = "https://www.linkedin.com/in/testuser"
+        overlay = f"{base}/overlay/contact-info/"
+        posts = f"{base}/recent-activity/all/"
+        scraper = _scraper(mock_page)
+        events: list[tuple[str, Any]] = []
+        pages = {
+            f"{base}/": {
+                MAIN_ROOT: [
+                    _root(PROFILE_TEXT, "https://www.linkedin.com/company/engines/")
+                ]
+            },
+            overlay: {
+                OVERLAY_ROOTS: [
+                    _root(
+                        PROFILE_TEXT,
+                        "https://www.linkedin.com/in/someone-else/",
+                        source="body",
+                    )
+                ],
+                MAIN_ROOT: [
+                    _root(PROFILE_TEXT, "https://www.linkedin.com/in/someone-else/")
+                ],
+            },
+            posts: {MAIN_ROOT: [_root("Ada posted\nEngines are neat")]},
+        }
+
+        with self.browser(scraper, mock_page, pages, events):
+            result = await scraper.scrape_person(
+                "testuser", {"main_profile", "contact_info", "posts"}
+            )
+
+        assert events == [
+            ("goto", f"{base}/"),
+            ("delay", 2.0),
+            ("goto", overlay),
+            ("delay", 2.0),
+            ("goto", posts),
+        ]
+        assert result["sections"] == {
+            "main_profile": PROFILE_TEXT,
+            "posts": "Ada posted\nEngines are neat",
+        }
+        assert "contact_info" not in result.get("references", {})
+        assert result["section_errors"] == {"contact_info": _missing_root(overlay)}
+
+    async def test_a_throttled_missing_overlay_still_stops_the_walk(self, mock_page):
+        base = "https://www.linkedin.com/in/testuser"
+        overlay = f"{base}/overlay/contact-info/"
+        scraper = _scraper(mock_page)
+        events: list[tuple[str, Any]] = []
+        pages = {
+            f"{base}/": {MAIN_ROOT: [_root(PROFILE_TEXT)]},
+            overlay: {
+                OVERLAY_ROOTS: [_root("Home\n" + NOISE_ONLY, source="body")] * 2,
+                MAIN_ROOT: [_root(NOISE_ONLY)] * 2,
+            },
+            # Answered, so a walk that goes on fails on its events, not a stub.
+            f"{base}/recent-activity/all/": {MAIN_ROOT: [_root("Ada posted")]},
+        }
+
+        with self.browser(scraper, mock_page, pages, events):
+            result = await scraper.scrape_person(
+                "testuser", {"main_profile", "contact_info", "posts"}
+            )
+
+        assert events == [
+            ("goto", f"{base}/"),
+            ("delay", 2.0),
+            ("goto", overlay),
+            ("delay", 5.0),
+            ("goto", overlay),
+        ]
+        assert result["sections"] == {"main_profile": PROFILE_TEXT}
+        assert "contact_info" not in result.get("references", {})
+        assert result["section_errors"]["contact_info"]["error_type"] == "rate_limit"
+
+    async def test_get_my_profile_reports_the_same_contact_error(self, mock_page):
+        me = "https://www.linkedin.com/in/me/"
+        profile = "https://www.linkedin.com/in/realuser/"
+        overlay = "https://www.linkedin.com/in/realuser/overlay/contact-info/"
+        mock_page.url = profile
+        scraper = _scraper(mock_page)
+        events: list[tuple[str, Any]] = []
+        pages = {
+            profile: {MAIN_ROOT: [_root(PROFILE_TEXT)]},
+            overlay: {
+                OVERLAY_ROOTS: [_root(PROFILE_TEXT, source="body")],
+                MAIN_ROOT: [_root(PROFILE_TEXT)],
+            },
+        }
+
+        with self.browser(scraper, mock_page, pages, events, redirects={me: profile}):
+            result = await scraper.get_my_profile(sections={"contact_info"})
+
+        assert events == [("goto", me), ("delay", 2.0), ("goto", overlay)]
+        assert result["url"] == profile
+        assert result["sections"] == {"main_profile": PROFILE_TEXT}
+        assert result["section_errors"] == {"contact_info": _missing_root(overlay)}
 
 
 class TestScrapePersonCallbacks:
@@ -1070,6 +1412,140 @@ class TestGetSidebarProfiles:
         assert mpfy == ["/in/alice/", "/in/bob/", "/in/eve/", "/in/frank/"]
         assert result["sidebar_profiles"]["explore_premium_profiles"] == ["/in/carol/"]
         assert result["sidebar_profiles"]["people_you_may_know"] == ["/in/dave/"]
+
+    async def test_two_show_all_navigations_have_one_gap_before_the_second(
+        self, mock_page
+    ):
+        first_url = "https://www.linkedin.com/search/results/people/?keywords=first"
+        second_url = "https://www.linkedin.com/search/results/people/?keywords=second"
+        sidebar_data = {
+            "sections": {"first": [], "second": []},
+            "showAllUrls": {"first": first_url, "second": second_url},
+        }
+        mock_page.evaluate = AsyncMock(
+            side_effect=[sidebar_data, ["/in/alice/"], ["/in/bob/"]]
+        )
+        events = []
+
+        async def navigate(url):
+            events.append(("navigate", url))
+            mock_page.url = url
+
+        async def delay(seconds):
+            events.append(("delay", seconds))
+
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(scraper._navigator, "_navigate_to_page", side_effect=navigate),
+            patch.object(ScrapingSession, "delay", side_effect=delay),
+            patch(
+                "linkedin_mcp_server.scraping.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            await scraper.get_sidebar_profiles("testuser")
+
+        assert events == [
+            ("navigate", "https://www.linkedin.com/in/testuser/"),
+            ("navigate", first_url),
+            ("delay", 2.0),
+            ("navigate", second_url),
+        ]
+
+    async def test_literal_premium_url_does_not_consume_first_attempt_slot(
+        self, mock_page
+    ):
+        useful_url = "https://www.linkedin.com/search/results/people/?keywords=useful"
+        sidebar_data = {
+            "sections": {"premium": ["/in/alice/"], "useful": []},
+            "showAllUrls": {
+                "premium": "https://www.linkedin.com/premium/products/",
+                "useful": useful_url,
+            },
+        }
+        mock_page.evaluate = AsyncMock(side_effect=[sidebar_data, ["/in/bob/"]])
+        events = []
+
+        async def navigate(url):
+            events.append(("navigate", url))
+            mock_page.url = url
+
+        async def delay(seconds):
+            events.append(("delay", seconds))
+
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(scraper._navigator, "_navigate_to_page", side_effect=navigate),
+            patch.object(ScrapingSession, "delay", side_effect=delay),
+            patch(
+                "linkedin_mcp_server.scraping.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            await scraper.get_sidebar_profiles("testuser")
+
+        assert events == [
+            ("navigate", "https://www.linkedin.com/in/testuser/"),
+            ("navigate", useful_url),
+        ]
+
+    @pytest.mark.parametrize("first_outcome", ["failure", "premium-redirect"])
+    async def test_unsuccessful_show_all_attempt_paces_the_next_one(
+        self, mock_page, first_outcome
+    ):
+        first_url = "https://www.linkedin.com/search/results/people/?keywords=first"
+        second_url = "https://www.linkedin.com/search/results/people/?keywords=second"
+        sidebar_data = {
+            "sections": {"first": ["/in/alice/"], "second": []},
+            "showAllUrls": {"first": first_url, "second": second_url},
+        }
+        mock_page.evaluate = AsyncMock(side_effect=[sidebar_data, ["/in/bob/"]])
+        events = []
+
+        async def navigate(url):
+            events.append(("navigate", url))
+            if url == first_url:
+                if first_outcome == "failure":
+                    raise RuntimeError("navigation failed")
+                mock_page.url = "https://www.linkedin.com/premium/products/"
+                return
+            mock_page.url = url
+
+        async def delay(seconds):
+            events.append(("delay", seconds))
+
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(scraper._navigator, "_navigate_to_page", side_effect=navigate),
+            patch.object(ScrapingSession, "delay", side_effect=delay),
+            patch(
+                "linkedin_mcp_server.scraping.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            await scraper.get_sidebar_profiles("testuser")
+
+        assert events == [
+            ("navigate", "https://www.linkedin.com/in/testuser/"),
+            ("navigate", first_url),
+            ("delay", 2.0),
+            ("navigate", second_url),
+        ]
 
     @pytest.mark.parametrize(
         ("error_type", "message"),

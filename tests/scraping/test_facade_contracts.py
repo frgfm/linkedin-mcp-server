@@ -21,7 +21,11 @@ from linkedin_mcp_server.scraping.capture import SectionCapture
 from linkedin_mcp_server.scraping.connection import ActionSignals
 from linkedin_mcp_server.scraping.connection_actions import ConnectionActions
 from linkedin_mcp_server.scraping.content import PageContentReader
-from linkedin_mcp_server.scraping.conversations import ConversationReader
+from linkedin_mcp_server.scraping.conversations import (
+    ConversationReader,
+    _ThreadRefScan,
+    _ThreadResolution,
+)
 from linkedin_mcp_server.scraping.extractor import (
     ExtractedSection,
     FilterValidationError,
@@ -142,12 +146,18 @@ async def test_company_posts_delegate_matches_registered_tool_consumer():
     )
     context = SimpleNamespace(report_progress=AsyncMock())
 
-    await tool.fn("example", context, extractor=extractor)
+    with patch(
+        "linkedin_mcp_server.tools.company.get_ready_extractor",
+        AsyncMock(return_value=extractor),
+    ):
+        await tool.fn("example", context)
 
     delegate = getattr(extractor, TOOL_DELEGATES["get_company_posts"])
     delegate.assert_awaited_once()
     extractor.extract_page.assert_awaited_once_with(
-        "https://www.linkedin.com/company/example/posts/", section_name="posts"
+        "https://www.linkedin.com/company/example/posts/",
+        section_name="posts",
+        max_scrolls=None,
     )
     extractor.scrape_company.assert_not_awaited()
 
@@ -220,7 +230,7 @@ async def test_connection_profile_read_resolves_the_facade_delegate_late(mock_pa
             "sections": {"main_profile": "Target profile"},
         }
     )
-    extractor.scrape_person = replacement  # ty: ignore[invalid-assignment]
+    extractor.scrape_person = replacement
     self_profile = ActionSignals(False, False, True, False, False, False)
 
     with patch.object(
@@ -367,7 +377,7 @@ async def test_facade_get_conversation_forwards_its_username_and_index(mock_page
             ConversationReader,
             "_resolve_conversation_thread_urls",
             new_callable=AsyncMock,
-            return_value=threads,
+            return_value=_ThreadResolution(threads),
         ),
         patch.object(
             PageContentReader,
@@ -408,7 +418,7 @@ async def test_facade_search_conversations_forwards_its_row_cap(mock_page):
             ConversationReader,
             "_extract_conversation_thread_refs",
             new_callable=AsyncMock,
-            return_value=[],
+            return_value=_ThreadRefScan(refs=[]),
         ) as refs,
     ):
         await extractor.search_conversations("engine", limit=7)
@@ -550,7 +560,7 @@ async def test_incoming_verification_resolves_classifier_at_call_time(
     # Rebind after facade/action construction. Both the initial decision and the
     # post-accept verification must resolve the canonical owner dynamically.
     extractor = LinkedInExtractor(cast(Page, mock_page))
-    extractor.scrape_person = AsyncMock(  # ty: ignore[invalid-assignment]
+    extractor.scrape_person = AsyncMock(
         return_value={
             "url": "https://www.linkedin.com/in/target/",
             "sections": {"main_profile": "Target profile"},
@@ -591,7 +601,7 @@ async def test_submitted_invite_verification_resolves_classifier_at_call_time(
     # The fake navigator and submitter keep this entirely off LinkedIn while the
     # verification branch still performs both classifier calls.
     extractor = LinkedInExtractor(cast(Page, mock_page))
-    extractor.scrape_person = AsyncMock(  # ty: ignore[invalid-assignment]
+    extractor.scrape_person = AsyncMock(
         return_value={
             "url": "https://www.linkedin.com/in/target/",
             "sections": {"main_profile": "Target profile"},
