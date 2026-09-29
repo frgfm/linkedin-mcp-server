@@ -1,10 +1,10 @@
 # Contributing
 
-Contributions are welcome! Packet: search first, then add evidence to an existing issue or prepare a new report. Agents follow the [packet skill](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/.agents/skills/issue-packet/SKILL.md). Humans use the [issue forms](https://github.com/stickerdaniel/linkedin-mcp-server/issues/new/choose).
+Contributions are welcome. Search existing issues first, then use the [issue forms](https://github.com/stickerdaniel/linkedin-mcp-server/issues/new/choose) for anything new. AI agents follow the [issue-packet skill](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/.agents/skills/issue-packet/SKILL.md).
 
 ## Development Setup
 
-See the [README](README.md#-local-setup-develop--contribute) for full setup instructions.
+See the [README](README.md#setup-from-source-develop--contribute) for full setup instructions.
 
 ```bash
 git clone https://github.com/stickerdaniel/linkedin-mcp-server
@@ -159,7 +159,7 @@ when the reviewed policy change is intentional.
 
 ## Workflow
 
-1. Link the canonical issue for the change. Follow the packet procedure above when adding a report.
+1. Link the canonical issue for the change, or open one as described above.
 2. Create a branch: `feature/<issue-number>-<short-description>` or `fix/<issue-number>-<short-description>`
 3. Implement, test, and update docs (see checklists above)
 4. Open a PR — AI agents review first, then manual review
@@ -168,6 +168,29 @@ when the reviewed policy change is intentional.
    provenance, with an outer host or wrapper optionally added as `via <host>`
 6. PRs are squash-merged into `main`, so the PR title becomes the commit
    subject; commits inside a PR are for review only
+
+## Changelog Fragments
+
+A PR titled `feat` or `fix`, or marked breaking, needs a changelog fragment.
+The breaking marker is a `!` right before the colon, as in
+`fix(scope)!: Change the error shape`; a `!` anywhere else in the title does
+not count. The PR Title check fails until the fragment is there.
+
+1. Open the PR as a draft to get its number.
+2. Add `changelog.d/<number>.feat.md`, `.fix.md` or `.breaking.md` to match the
+   title. A breaking title takes `.breaking.md` whatever its type.
+3. Write one sentence of at most 90 characters that says what changes for a
+   user, without a PR link; the release adds that. Details belong in the PR
+   description.
+4. Push it to the same branch. The PR Title check turns green.
+
+Adding or removing the breaking marker means renaming the fragment. Edit an
+existing fragment instead of running `towncrier create` again, which writes a
+second, numbered file that the check rejects.
+
+Renovate's PRs need no fragment, because Renovate cannot write one and stops
+updating a PR once someone else pushes to its branch. When a dependency update
+changes what users see, whoever merges it adds the sentence in a follow-up PR.
 
 ## Scraping Philosophy: Minimize DOM Dependence
 

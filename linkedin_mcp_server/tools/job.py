@@ -15,6 +15,7 @@ from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
 from linkedin_mcp_server.error_handler import raise_tool_error
+from linkedin_mcp_server.scraping.identifiers import normalize_job_id
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +30,10 @@ def register_job_tools(
         title="Get Job Details",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"job", "scraping"},
-        exclude_args=["extractor"],
     )
     async def get_job_details(
         job_id: str,
         ctx: Context,
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         Get job details for a specific job posting on LinkedIn.
@@ -48,11 +47,13 @@ def register_job_tools(
             The LLM should parse the raw text to extract job details. Jobs in
             the posting's "More jobs" list are references with context
             "similar job"; their ids work with get_job_details.
+            section_errors.job_posting.error_type "description_missing" means
+            the captured text lacks the expected "About the job" heading.
+            The text is kept but may be incomplete; calling again may return more.
         """
         try:
-            extractor = extractor or await get_ready_extractor(
-                ctx, tool_name="get_job_details"
-            )
+            job_id = normalize_job_id(job_id)
+            extractor = await get_ready_extractor(ctx, tool_name="get_job_details")
             logger.info("Scraping job: %s", job_id)
 
             await ctx.report_progress(
@@ -78,7 +79,6 @@ def register_job_tools(
         title="Search Jobs",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"job", "search"},
-        exclude_args=["extractor"],
     )
     async def search_jobs(
         keywords: str,
@@ -91,7 +91,6 @@ def register_job_tools(
         work_type: str | None = None,
         easy_apply: bool = False,
         sort_by: str | None = None,
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         Search for jobs on LinkedIn.
@@ -128,9 +127,7 @@ def register_job_tools(
             # against eight it no longer had, and the call was cancelled with
             # every page it had gathered.
             started = time.monotonic()
-            extractor = extractor or await get_ready_extractor(
-                ctx, tool_name="search_jobs"
-            )
+            extractor = await get_ready_extractor(ctx, tool_name="search_jobs")
             logger.info(
                 "Searching jobs: keywords='%s', location='%s', max_pages=%d",
                 keywords,
@@ -173,12 +170,10 @@ def register_job_tools(
         title="Get Saved Jobs",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"job", "scraping"},
-        exclude_args=["extractor"],
     )
     async def get_saved_jobs(
         ctx: Context,
         max_pages: Annotated[int, Field(ge=1, le=10)] = 3,
-        extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         List job postings saved by the authenticated LinkedIn user.
@@ -194,9 +189,7 @@ def register_job_tools(
             numeric job ID strings usable with get_job_details), and optional references.
         """
         try:
-            extractor = extractor or await get_ready_extractor(
-                ctx, tool_name="get_saved_jobs"
-            )
+            extractor = await get_ready_extractor(ctx, tool_name="get_saved_jobs")
             logger.info("Fetching saved jobs (max_pages=%d)", max_pages)
 
             await ctx.report_progress(

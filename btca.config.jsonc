@@ -158,10 +158,23 @@
     },
     {
       "type": "git",
+      "name": "agentGuardrails",
+      "url": "https://github.com/stickerdaniel/agent-guardrails",
+      "branch": "main"
+    },
+    {
+      "type": "git",
       "name": "mcpPythonSdk",
       "url": "https://github.com/modelcontextprotocol/python-sdk",
       "branch": "main",
       "specialNotes": "Model Context Protocol Python SDK used directly for protocol types and transitively by FastMCP."
+    },
+    {
+      "type": "git",
+      "name": "httpx2",
+      "url": "https://github.com/pydantic/httpx2",
+      "branch": "main",
+      "specialNotes": "HTTP client (fork of httpx) used by MCP SDK v2 and FastMCP 4, and directly by the daemon's loopback clients."
     },
     {
       "type": "git",
@@ -176,6 +189,20 @@
       "url": "https://github.com/Kludex/starlette",
       "branch": "main",
       "specialNotes": "ASGI framework constrained directly to keep MCP transports above known security advisories."
+    },
+    {
+      "type": "git",
+      "name": "towncrier",
+      "url": "https://github.com/twisted/towncrier",
+      "branch": "trunk",
+      "specialNotes": "Builds CHANGELOG.md from changelog.d fragments at release time. Configured in pyproject.toml [tool.towncrier]."
+    },
+    {
+      "type": "git",
+      "name": "psutil",
+      "url": "https://github.com/giampaolo/psutil",
+      "branch": "master",
+      "specialNotes": "Dev only. The differential harness's process watcher samples the process table with it (tests/differential/watcher.py)."
     }
   ]
 }

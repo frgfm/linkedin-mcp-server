@@ -82,7 +82,7 @@
       "call": "send_message",
       "kind": "wait_for_function",
       "operation": "profile_message_target_ready",
-      "program_digest": "96d99936369a",
+      "program_digest": "d156e406f6bb",
       "section": "message",
       "timeout_ms": 1000
     },
@@ -90,7 +90,7 @@
       "call": "send_message",
       "kind": "evaluate",
       "operation": "profile_message_target",
-      "program_digest": "33b2fb160e45",
+      "program_digest": "c7804bf22e53",
       "section": "message"
     },
     {
@@ -171,7 +171,7 @@
       "call": "send_message",
       "kind": "wait_for_function",
       "operation": "message_composer_ready",
-      "program_digest": "55fbb455644d",
+      "program_digest": "c92fc7560352",
       "section": "message",
       "timeout_ms": null
     },
@@ -183,7 +183,7 @@
       "call": "send_message",
       "kind": "evaluate",
       "operation": "message_composer_state",
-      "program_digest": "5b716974716a",
+      "program_digest": "28f2c6ded1bf",
       "section": "message"
     },
     {
@@ -194,7 +194,7 @@
       "call": "send_message",
       "kind": "evaluate",
       "operation": "message_composer_state",
-      "program_digest": "5b716974716a",
+      "program_digest": "28f2c6ded1bf",
       "section": "message"
     },
     {
@@ -208,7 +208,7 @@
       "call": "send_message",
       "kind": "evaluate_handle",
       "operation": "message_composer_owner",
-      "program_digest": "d311cb797c03",
+      "program_digest": "57fa5bf0b247",
       "section": "message"
     },
     {
@@ -256,7 +256,7 @@
       "call": "send_message",
       "kind": "evaluate",
       "operation": "message_confirmation_prepare",
-      "program_digest": "93a3ae384427",
+      "program_digest": "3d961c4e5130",
       "section": "message"
     },
     {
@@ -282,7 +282,7 @@
       "call": "send_message",
       "kind": "evaluate",
       "operation": "message_confirmation_dispose",
-      "program_digest": "6b3c7d577da9",
+      "program_digest": "bd92ef816e24",
       "section": "message"
     },
     {
@@ -301,7 +301,7 @@
       "handle": "handle-1",
       "kind": "handle.evaluate",
       "operation": "message_composer_dispose",
-      "program_digest": "ec7c454e506b",
+      "program_digest": "195abada1200",
       "section": "message"
     },
     {

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 from typing import Any, Callable, Coroutine, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -26,7 +27,22 @@ async def get_tool_fn(
     tool = await mcp.get_tool(name)
     if tool is None:
         raise ValueError(f"Tool '{name}' not found")
-    return cast(FunctionTool, tool).fn
+    fn = cast(FunctionTool, tool).fn
+
+    async def call(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Keep the old test-only extractor injection seam out of tool schemas."""
+        extractor = kwargs.pop("extractor", None)
+        if extractor is None:
+            return await fn(*args, **kwargs)
+        module = cast(Any, sys.modules[fn.__module__])
+        ready = module.get_ready_extractor
+        module.get_ready_extractor = AsyncMock(return_value=extractor)
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            module.get_ready_extractor = ready
+
+    return call
 
 
 def _make_mock_extractor(scrape_result: dict) -> MagicMock:
