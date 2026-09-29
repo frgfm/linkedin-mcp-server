@@ -3,6 +3,71 @@
     "_meta": {
       "fastmcp": {
         "tags": [
+          "actions",
+          "messaging"
+        ]
+      }
+    },
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true
+    },
+    "description": "Archive a messaging conversation.\n\nIdentify it by ``thread_id`` or ``linkedin_username``. For a pending\ninvitation conversation, provide ``linkedin_username`` plus the\n``message_url`` returned by ``get_pending_invitations``.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "default": 0,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "linkedin_username": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "message_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    },
+    "name": "archive_conversation",
+    "outputSchema": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "title": "Archive Conversation"
+  },
+  {
+    "_meta": {
+      "fastmcp": {
+        "tags": [
           "session"
         ]
       }
@@ -213,6 +278,39 @@
     "_meta": {
       "fastmcp": {
         "tags": [
+          "network",
+          "scraping"
+        ]
+      }
+    },
+    "annotations": {
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "List the authenticated user's most recently added 1st-degree connections.\n\nReturns ``url`` and a ``connections`` array. Each connection is\n``{name, url, headline, connected_on}``. ``url`` is the relative\n``/in/<slug>/`` profile path. ``connected_on`` is an ISO date\n(``YYYY-MM-DD``) parsed from the en-US \"Connected on Month DD, YYYY\"\nline, or ``None`` for other locales / unparseable text.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "default": 20,
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "get_connections",
+    "outputSchema": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "title": "Get Connections"
+  },
+  {
+    "_meta": {
+      "fastmcp": {
+        "tags": [
           "messaging",
           "scraping"
         ]
@@ -221,7 +319,7 @@
     "annotations": {
       "openWorldHint": true
     },
-    "description": "Read a specific messaging conversation.\n\nProvide either linkedin_username or thread_id to identify the conversation.\n\nWhen looked up by linkedin_username, resolution searches the messaging\ninbox for the participant's display name and click-visits every\nmatching row to capture its thread ID — LinkedIn's sidebar has no\nanchor hrefs or thread-id attributes, so this is the only available\npath. Each visit selects the row in the LinkedIn UI and may mark it\nas read. Pass thread_id directly to skip this enumeration.\n\nUsername resolution scans matching rows from a requested compose page\nfirst. Its indexable sequence ends before the first unresolved click,\nmissing matching click target, or admitted row that fails the existing\nexact display-name check. An index outside that verified prefix is\nrefused with its reason. Search is a fallback only when the inbox scan\nhas no observed matching result and no such barrier; it never\nsubstitutes a result after a stopped or gapped inbox scan. Pass a known\nthread_id to bypass username/index resolution.",
+    "description": "Read a specific messaging conversation as a structured list of messages.\n\nProvide a thread_id, or linkedin_username for inbox lookup. For a\npending invitation sender who is not a direct connection, provide\nlinkedin_username plus the message_url from get_pending_invitations.\n\nWhen looked up by linkedin_username, resolution searches the messaging\ninbox for the participant's display name and click-visits every\nmatching row to capture its thread ID \u2014 LinkedIn's sidebar has no\nanchor hrefs or thread-id attributes, so this is the only available\npath. Each visit selects the row in the LinkedIn UI and may mark it\nas read. Pass thread_id directly to skip this enumeration.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -242,6 +340,25 @@
           ],
           "default": null,
           "description": "LinkedIn username of the conversation participant; a full profile URL is accepted too"
+        },
+        "max_scrolls": {
+          "default": 3,
+          "description": "How many times to scroll the message list back to\nload older history (0-20, default 3). LinkedIn virtualizes\nthe list, so message count grows with scroll count; raise\nthis value to retrieve older history at the cost of latency.",
+          "maximum": 20,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "message_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Relative invitation compose URL from\nget_pending_invitations. Requires linkedin_username and cannot\nbe combined with thread_id."
         },
         "thread_id": {
           "anyOf": [
@@ -284,7 +401,7 @@
       "properties": {
         "num_posts": {
           "default": 10,
-          "description": "Number of posts to fetch (1-50, default 10).\n       Posts are loaded in batches of ~5 as the page scrolls,\n       so the actual count may slightly exceed the target.",
+          "description": "Number of posts to fetch (1-50, default 10).\n       Posts are loaded in batches of ~5 as the page scrolls.",
           "maximum": 50,
           "minimum": 1,
           "type": "integer"
@@ -312,13 +429,13 @@
       "openWorldHint": true,
       "readOnlyHint": true
     },
-    "description": "List recent conversations from the LinkedIn messaging inbox.\n\nThe returned inbox text and result URL come from the ordinary messaging\ninbox. Click-derived conversation references are collected separately\nafter requesting the compose page, which avoided inbox auto-opening on\nthe measured variant. A row contributes a click-derived reference only\nafter its click is followed by an observed different thread path. The\nscan stops at its first unverifiable click. section_errors.inbox\nreports that stop or unavailable scan rows; captured inbox text and\nindependently extracted anchors retain their normal handling. A known\nthread_id can bypass row attribution when calling get_conversation.",
+    "description": "List recent conversations from the LinkedIn messaging inbox.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "limit": {
           "default": 20,
-          "description": "Maximum number of conversations to load (1-50, default 20)",
+          "description": "Maximum conversations to load per inbox tab (1-50, default 20)",
           "maximum": 50,
           "minimum": 1,
           "type": "integer"
@@ -419,6 +536,47 @@
       "type": "object"
     },
     "title": "Get My Profile"
+  },
+  {
+    "_meta": {
+      "fastmcp": {
+        "tags": [
+          "network",
+          "scraping"
+        ]
+      }
+    },
+    "annotations": {
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "List pending LinkedIn network invitations (received or sent).\n\nReturns ``url`` and an ``invitations`` array. Received invitations\ninclude sender/target triage fields. Sent invitations include recipient\nidentity and headline fields.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "default": "received",
+          "enum": [
+            "received",
+            "sent"
+          ],
+          "type": "string"
+        },
+        "limit": {
+          "default": 20,
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "get_pending_invitations",
+    "outputSchema": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "title": "Get Pending Invitations"
   },
   {
     "_meta": {
@@ -552,6 +710,84 @@
     "_meta": {
       "fastmcp": {
         "tags": [
+          "actions",
+          "network"
+        ]
+      }
+    },
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true
+    },
+    "description": "Ignore a received LinkedIn connection request.\n\nNavigates to ``/in/{linkedin_username}/``, verifies the page is\nshowing an incoming connection request, and clicks the Ignore\nbutton in the top-card action row. The Ignore button is\nidentified via a locale-table label scan (per\n``INCOMING_REQUEST_LABELS``) with structural fallbacks\n(engineering attrs \u2192 design-system class \u2192 documented position).\n\nStatus: ``ignored`` | ``not_found`` | ``already_connected``\n| ``action_unavailable`` | ``verification_failed``.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "linkedin_username": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "linkedin_username"
+      ],
+      "type": "object"
+    },
+    "name": "ignore_connection_request",
+    "outputSchema": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "title": "Ignore Connection Request"
+  },
+  {
+    "_meta": {
+      "fastmcp": {
+        "tags": [
+          "actions",
+          "messaging"
+        ]
+      }
+    },
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true
+    },
+    "description": "Message the sender of a received connection invitation.\n\n``message_url`` must be the relative compose URL returned by\n``get_pending_invitations`` for the sender. Set ``confirm_send`` to\n``True`` to send; ``False`` performs a recipient-verified dry run.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "confirm_send": {
+          "type": "boolean"
+        },
+        "linkedin_username": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "message_url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "linkedin_username",
+        "message_url",
+        "message",
+        "confirm_send"
+      ],
+      "type": "object"
+    },
+    "name": "message_invitation_sender",
+    "outputSchema": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "title": "Message Invitation Sender"
+  },
+  {
+    "_meta": {
+      "fastmcp": {
+        "tags": [
           "company",
           "search"
         ]
@@ -594,7 +830,7 @@
     "annotations": {
       "openWorldHint": true
     },
-    "description": "Search messages by keyword.\n\nClick-derived references require an observed different thread path\nafter each row click. The first unverifiable click stops further row\nclicks and is reported in section_errors.search_results. Already-read\ntext and independently extracted anchors retain their normal handling.\nA result without that diagnostic does not guarantee that every\nconversation was enumerated.",
+    "description": "Search messages by keyword.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -879,20 +1115,18 @@
       "destructiveHint": true,
       "openWorldHint": true
     },
-    "description": "Compose and send a new message to a LinkedIn user.\n\nProfile-based targeting opens LinkedIn's compose flow. It is not a safe\nreply path for an existing recruiter/InMail or messaging thread: it may\ncreate a separate DM even after you inspect that thread with\nget_conversation or search_conversations. Those tools only read an\nexisting thread; they do not send a reply. Until a thread-targeted send\npath is available, do not treat profile-based send_message as a reply.\n\nThe recipient must be directly messageable from the profile page. If\nLinkedIn does not expose a normal Message action, use connect_with_person\nfirst, then retry send_message only after the connection request is\naccepted. A ``status`` of ``enter_to_send_enabled`` means the account\nhas LinkedIn's \"Press Enter to Send\" preference on, which hides the Send\nbutton; relay the returned instructions to the user, who switches it to\n\"Click Send to send\" before retrying. The dry run (confirm_send False)\nreports it too. Recipient authorization comes from validating one\nrecipient-specific Message action carrying the target URN, then following\nits browser navigation and pinning the exact final route. Visible profile\nlinks or recipient URNs in the composer are optional corroboration; any\ncontradiction fails closed. No Voyager or other private API is used. This\nis a write operation when confirm_send is True.",
+    "description": "        Compose and send a new message to a LinkedIn user.\n\n        Profile-based targeting opens LinkedIn's compose flow. It is not a safe\n        reply path for an existing recruiter/InMail or messaging thread: it may\n        create a separate DM even after you inspect that thread with\n        get_conversation or search_conversations. Those tools only read an\n        existing thread; they do not send a reply. Until a thread-targeted send\n        path is available, do not treat profile-based send_message as a reply.\n\n        The recipient must be directly messageable from the profile page. If\n        LinkedIn does not expose a normal Message action, use connect_with_person\n        first, then retry send_message only after the connection request is\n        accepted. Recipient authorization comes from validating one\n        recipient-specific Message action carrying the target URN, then following\n        its browser navigation and pinning the exact final route. Visible profile\n        links or recipient URNs in the composer are optional corroboration; any\n        contradiction fails closed. No Voyager or other private API is used. This\n        is a write operation when confirm_send is True.\n\n        Args:\n            linkedin_username: LinkedIn username of the recipient; a full\n                profile URL is accepted too\n            message: The message text to send. `\n` is preserved as a line\n                break and `\n\n` as a paragraph break, matching how LinkedIn\n                renders multi-paragraph messages in the web composer.\n            confirm_send: Must be True to send the message\n            ctx: FastMCP context for progress reporting\n            profile_urn: Optional profile URN (e.g. ACoAAB...) to verify against\n                the URN exposed by the loaded profile before opening its Message\n                action. It never bypasses recipient verification. Obtain via\n                get_person_profile. Note: inbox may not always show all messages;\n                use search_conversations as a fallback.\n\n        Returns:\n            Dict with url, status, message, recipient_selected, sent, and\n            retry_safe. ``sent`` is true only after the submitted message's DOM\n            node gains a different opaque event ID; this does not claim delivery\n            or read status. It is false both where nothing was submitted and\n            where the outcome is unknown. ``retry_safe`` separates the two: it\n            is false from the moment a submission is attempted, and calling\n            again while it is\n            false can deliver the message twice. A ``status`` of\n            ``outcome_unknown`` is that same warning from the transport rather\n            than the page: the browser process went away with the call in\n            flight, so ``sent`` is absent instead of false and only LinkedIn\n            itself can say whether the message left.\n        ",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "confirm_send": {
-          "description": "Must be True to send the message",
           "type": "boolean"
         },
         "linkedin_username": {
-          "description": "LinkedIn username of the recipient; a full profile URL is accepted too",
           "type": "string"
         },
         "message": {
-          "description": "Single-line message text to send. C0 control characters and\nDEL are rejected, including CR, LF, and tab.",
+          "description": "Message text to send; line breaks are preserved. Other control characters are rejected.",
           "type": "string"
         },
         "profile_urn": {
@@ -904,8 +1138,7 @@
               "type": "null"
             }
           ],
-          "default": null,
-          "description": "Optional profile URN (e.g. ACoAAB...) to verify against\nthe URN exposed by the loaded profile before opening its Message\naction. It never bypasses recipient verification. Obtain via\nget_person_profile. Note: inbox may not always show all messages;\nuse search_conversations as a fallback."
+          "default": null
         }
       },
       "required": [
@@ -921,5 +1154,38 @@
       "type": "object"
     },
     "title": "Send Message"
+  },
+  {
+    "_meta": {
+      "fastmcp": {
+        "tags": [
+          "actions",
+          "network"
+        ]
+      }
+    },
+    "annotations": {
+      "destructiveHint": true,
+      "openWorldHint": true
+    },
+    "description": "Withdraw an outgoing LinkedIn connection request.\n\nNavigates to ``/in/{linkedin_username}/``, verifies the page is\nshowing an outgoing-pending state, clicks the Pending control,\nand confirms in the withdraw modal. Sidesteps the sent-page\npagination cost for accounts with many outstanding requests.\n\nStatus: ``withdrawn`` | ``not_found`` | ``already_connected``\n| ``action_unavailable`` | ``verification_failed``.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "linkedin_username": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "linkedin_username"
+      ],
+      "type": "object"
+    },
+    "name": "withdraw_invitation",
+    "outputSchema": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "title": "Withdraw Invitation"
   }
 ]
