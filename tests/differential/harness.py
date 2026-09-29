@@ -899,11 +899,23 @@ def tool_summary(result: mcp_types.CallToolResult) -> dict[str, Any]:
         structured = structured["result"]
     sections = structured.get("sections")
     feed = sections.get("feed") if isinstance(sections, dict) else None
+    references = structured.get("references")
+    feed_references = references.get("feed") if isinstance(references, dict) else None
+    read_the_post = isinstance(feed, str) and POST_MARKER in feed
+    if not read_the_post and isinstance(feed, list):
+        read_the_post = any(isinstance(post, dict) and post.get("url") for post in feed)
+    if not read_the_post and isinstance(feed_references, list):
+        read_the_post = any(
+            isinstance(reference, dict)
+            and isinstance(reference.get("url"), str)
+            and "/posts/" in reference["url"]
+            for reference in feed_references
+        )
     return {
         "is_error": bool(result.is_error),
         "sections": sorted(sections) if isinstance(sections, dict) else [],
         "section_errors": sorted(structured.get("section_errors") or {}),
-        "read_the_post": isinstance(feed, str) and POST_MARKER in feed,
+        "read_the_post": read_the_post,
         "text": "\n".join(texts)[:2000],
     }
 
