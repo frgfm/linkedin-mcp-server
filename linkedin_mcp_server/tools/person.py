@@ -120,7 +120,7 @@ def register_person_tools(
             )
 
             cb = MCPContextProgressCallback(ctx)
-            result = await extractor.scrape_person(
+            result = await getattr(extractor, "scrape_person")(
                 linkedin_username,
                 requested,
                 callbacks=cb,

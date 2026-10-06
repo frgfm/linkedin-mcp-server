@@ -1,11 +1,12 @@
 """
-LinkedIn company profile scraping tools.
+LinkedIn company profile reading tools.
 
 Uses innerText extraction for resilient company data capture
 with configurable section selection.
 """
 
 import logging
+import inspect
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
@@ -16,14 +17,14 @@ from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
 from linkedin_mcp_server.error_handler import raise_tool_error
-from linkedin_mcp_server.scraping import parse_company_sections
-from linkedin_mcp_server.scraping.contracts import RATE_LIMITED_SECTION_TEXT
-from linkedin_mcp_server.scraping.contracts import rate_limited_section_error
-from linkedin_mcp_server.scraping.identifiers import (
+from linkedin_mcp_server.linkedin import parse_company_sections
+from linkedin_mcp_server.linkedin.contracts import RATE_LIMITED_SECTION_TEXT
+from linkedin_mcp_server.linkedin.contracts import rate_limited_section_error
+from linkedin_mcp_server.linkedin.identifiers import (
     company_page_url,
     normalize_company_identifier,
 )
-from linkedin_mcp_server.scraping.link_metadata import Reference
+from linkedin_mcp_server.linkedin.link_metadata import Reference
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ def register_company_tools(
         timeout=tool_timeout,
         title="Get Company Profile",
         annotations={"readOnlyHint": True, "openWorldHint": True},
-        tags={"company", "scraping"},
+        tags={"company"},
     )
     async def get_company_profile(
         company_name: str,
@@ -50,11 +51,11 @@ def register_company_tools(
         Args:
             company_name: LinkedIn company name (e.g., "docker", "anthropic", "microsoft"). A full company URL is accepted too and is reduced to the slug.
             ctx: FastMCP context for progress reporting
-            sections: Comma-separated list of extra sections to scrape.
+            sections: Comma-separated list of extra sections to read.
                 The about page is always included.
                 Available sections: posts, jobs
                 Examples: "posts", "posts,jobs"
-                Default (None) scrapes only the about page.
+                Default (None) reads only the about page.
 
         Returns:
             Dict with url, sections (name -> raw text), and optional references.
@@ -70,21 +71,25 @@ def register_company_tools(
             that facet.
         """
         try:
-            # Validate before starting the browser; the scraper normalizes the original reference.
+            # Validate before starting the browser; the reader normalizes the original reference.
             normalize_company_identifier(company_name)
             extractor = await get_ready_extractor(ctx, tool_name="get_company_profile")
             requested, unknown = parse_company_sections(sections)
 
             logger.info(
-                "Scraping company: %s (sections=%s)",
+                "Reading company: %s (sections=%s)",
                 company_name,
                 sections,
             )
 
             cb = MCPContextProgressCallback(ctx)
-            result = await extractor.scrape_company(
-                company_name, requested, callbacks=cb
-            )
+            reader = getattr(extractor, "read_company", None)
+            if reader is not None and inspect.iscoroutinefunction(reader):
+                result = await reader(company_name, requested, callbacks=cb)
+            else:
+                result = await getattr(extractor, "scrape_company")(
+                    company_name, requested, callbacks=cb
+                )
 
             if unknown:
                 result["unknown_sections"] = unknown
@@ -103,7 +108,7 @@ def register_company_tools(
         timeout=tool_timeout,
         title="Get Company Posts",
         annotations={"readOnlyHint": True, "openWorldHint": True},
-        tags={"company", "scraping"},
+        tags={"company"},
     )
     async def get_company_posts(
         company_name: str,
@@ -126,10 +131,10 @@ def register_company_tools(
         try:
             company_name = normalize_company_identifier(company_name)
             extractor = await get_ready_extractor(ctx, tool_name="get_company_posts")
-            logger.info("Scraping company posts: %s", company_name)
+            logger.info("Reading company posts: %s", company_name)
 
             await ctx.report_progress(
-                progress=0, total=100, message="Starting company posts scrape"
+                progress=0, total=100, message="Reading company posts"
             )
 
             url = company_page_url(company_name, "/posts/")
@@ -216,7 +221,7 @@ def register_company_tools(
         timeout=tool_timeout,
         title="Get Company Employees",
         annotations={"readOnlyHint": True, "openWorldHint": True},
-        tags={"company", "scraping"},
+        tags={"company"},
     )
     async def get_company_employees(
         company_name: str,
@@ -252,13 +257,13 @@ def register_company_tools(
             References include /in/ profile paths for listed employees.
         """
         try:
-            # Preserve the reference for the scraper's single normalization pass.
+            # Preserve the reference for the reader's single normalization pass.
             normalize_company_identifier(company_name)
             extractor = await get_ready_extractor(
                 ctx, tool_name="get_company_employees"
             )
             logger.info(
-                "Scraping company employees: %s (keywords=%s)", company_name, keywords
+                "Reading company employees: %s (keywords=%s)", company_name, keywords
             )
 
             await ctx.report_progress(

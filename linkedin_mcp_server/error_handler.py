@@ -20,12 +20,13 @@ from linkedin_mcp_server.core.exceptions import (
     InvalidReferenceError,
     AuthenticationError,
     ElementNotFoundError,
-    LinkedInScraperException,
+    LinkedInOperationError,
     NetworkError,
+    OffLinkedInLandingError,
+    PageReadError,
     ProfileNotFoundError,
     ProxyConnectionError,
     RateLimitError,
-    ScrapingError,
 )
 
 from linkedin_mcp_server.exceptions import (
@@ -256,6 +257,13 @@ def raise_tool_error(exception: Exception, context: str = "") -> NoReturn:
         logger.warning("Proxy error%s: %s", ctx, exception)
         raise ToolError(str(exception)) from exception
 
+    # Also ahead of NetworkError, whose generic text drops the one useful fact:
+    # where the browser landed. No issue diagnostics, following
+    # ProxyConnectionError: a portal on the user's network is not a bug.
+    elif isinstance(exception, OffLinkedInLandingError):
+        logger.warning("Navigation ended off LinkedIn%s: %s", ctx, exception)
+        raise ToolError(str(exception)) from exception
+
     elif isinstance(exception, NetworkError):
         logger.warning("Network error%s: %s", ctx, exception)
         _raise_tool_error_with_diagnostics(
@@ -264,11 +272,11 @@ def raise_tool_error(exception: Exception, context: str = "") -> NoReturn:
             context=context,
         )
 
-    elif isinstance(exception, ScrapingError):
-        logger.warning("Scraping error%s: %s", ctx, exception)
+    elif isinstance(exception, PageReadError):
+        logger.warning("Page read error%s: %s", ctx, exception)
         _raise_tool_error_with_diagnostics(
             exception,
-            "Scraping failed. LinkedIn page structure may have changed.",
+            "Could not read the page. LinkedIn page structure may have changed.",
             context=context,
         )
 
@@ -279,7 +287,7 @@ def raise_tool_error(exception: Exception, context: str = "") -> NoReturn:
         logger.info("Invalid reference%s: %s", ctx, exception)
         raise ToolError(str(exception)) from exception
 
-    elif isinstance(exception, (LinkedInScraperException, LinkedInMCPError)):
+    elif isinstance(exception, (LinkedInOperationError, LinkedInMCPError)):
         # Catch-all for base exception types and any future subclasses
         # without a dedicated handler above. Passes through str(exception).
         logger.warning("LinkedIn error%s: %s", ctx, exception)

@@ -308,7 +308,7 @@
                 }
               ],
               "default": null,
-              "description": "Comma-separated list of extra sections to scrape.\nThe about page is always included.\nAvailable sections: posts, jobs\nExamples: \"posts\", \"posts,jobs\"\nDefault (None) scrapes only the about page."
+              "description": "Comma-separated list of extra sections to read.\nThe about page is always included.\nAvailable sections: posts, jobs\nExamples: \"posts\", \"posts,jobs\"\nDefault (None) reads only the about page."
             }
           },
           "required": [
@@ -431,6 +431,25 @@
               "type": "integer"
             }
           },
+          "type": "object"
+        },
+        "output": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
+      "get_job_apply_url": {
+        "input": {
+          "additionalProperties": false,
+          "properties": {
+            "job_id": {
+              "description": "LinkedIn job ID (e.g., \"4252026496\", \"3856789012\")",
+              "type": "string"
+            }
+          },
+          "required": [
+            "job_id"
+          ],
           "type": "object"
         },
         "output": {

@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-from linkedin_mcp_server.scraping.main_profile import (
+from linkedin_mcp_server.linkedin.main_profile import (
     extract_main_profile,
     normalize_main_profile,
     parse_connection_count,
