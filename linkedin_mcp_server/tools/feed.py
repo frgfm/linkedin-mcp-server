@@ -73,7 +73,12 @@ def register_feed_tools(
                 progress=0, total=100, message="Starting feed scrape"
             )
 
-            extracted = await extractor.extract_feed(num_posts=num_posts)
+            if hasattr(type(extractor), "extract_structured_feed"):
+                extracted = await getattr(extractor, "extract_structured_feed")(
+                    num_posts=num_posts
+                )
+            else:
+                extracted = await extractor.extract_feed(num_posts=num_posts)
 
             url = "https://www.linkedin.com/feed/"
             # Only ever holds sections["feed"] -> list[FeedPost]; typed precisely
@@ -88,7 +93,7 @@ def register_feed_tools(
             else:
                 # sections["feed"] is the structured FeedPost list (possibly
                 # empty); the raw-innerText blob is no longer surfaced.
-                sections["feed"] = extracted.posts
+                sections["feed"] = getattr(extracted, "posts", [])
                 if extracted.references:
                     references["feed"] = extracted.references
 

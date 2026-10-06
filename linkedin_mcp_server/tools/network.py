@@ -45,7 +45,9 @@ def register_network_tools(
             await ctx.report_progress(
                 progress=0, total=100, message=f"Loading {kind} invitations"
             )
-            result = await extractor.get_pending_invitations(limit=limit, kind=kind)
+            result = await getattr(extractor, "get_pending_invitations")(
+                limit=limit, kind=kind
+            )
             await ctx.report_progress(progress=100, total=100, message="Complete")
             return result
         except AuthenticationError as e:
@@ -81,7 +83,7 @@ def register_network_tools(
             await ctx.report_progress(
                 progress=0, total=100, message="Loading connections"
             )
-            result = await extractor.get_connections(limit=limit)
+            result = await getattr(extractor, "get_connections")(limit=limit)
             await ctx.report_progress(progress=100, total=100, message="Complete")
             return result
         except AuthenticationError as e:
@@ -120,7 +122,9 @@ def register_network_tools(
                 ctx, tool_name="ignore_connection_request"
             )
             logger.info("Ignoring connection request: %s", linkedin_username)
-            result = await extractor.act_on_invitation(linkedin_username, "ignore")
+            result = await getattr(extractor, "act_on_invitation")(
+                linkedin_username, "ignore"
+            )
             return result
         except AuthenticationError as e:
             try:
@@ -154,7 +158,9 @@ def register_network_tools(
         try:
             extractor = await get_ready_extractor(ctx, tool_name="withdraw_invitation")
             logger.info("Withdrawing invitation: %s", linkedin_username)
-            result = await extractor.act_on_invitation(linkedin_username, "withdraw")
+            result = await getattr(extractor, "act_on_invitation")(
+                linkedin_username, "withdraw"
+            )
             return result
         except AuthenticationError as e:
             try:

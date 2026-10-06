@@ -64,22 +64,22 @@ class SequentialToolExecutionMiddleware(Middleware):
     ) -> ToolResult:
         tool_name = context.message.name
         wait_started = time.perf_counter()
-        logger.debug("Waiting for scraper lock for tool '%s'", tool_name)
+        logger.debug("Waiting for browser lock for tool '%s'", tool_name)
         await self._report_progress(
             context,
-            message="Queued waiting for scraper lock",
+            message="Queued waiting for the browser lock",
         )
 
         async with self._lock:
             wait_seconds = time.perf_counter() - wait_started
             logger.debug(
-                "Acquired scraper lock for tool '%s' after %.3fs",
+                "Acquired browser lock for tool '%s' after %.3fs",
                 tool_name,
                 wait_seconds,
             )
             await self._report_progress(
                 context,
-                message="Scraper lock acquired, starting tool",
+                message="Browser lock acquired, starting tool",
             )
             return await self._run_owning_the_profile(context, call_next, tool_name)
 
@@ -140,7 +140,7 @@ class SequentialToolExecutionMiddleware(Middleware):
         finally:
             hold_seconds = time.perf_counter() - hold_started
             logger.debug(
-                "Released scraper lock for tool '%s' after %.3fs",
+                "Released browser lock for tool '%s' after %.3fs",
                 tool_name,
                 hold_seconds,
             )

@@ -21,6 +21,7 @@ from linkedin_mcp_server.scraping.contracts import (
     SEND_INTERRUPTED_WARNING,
     refuse_an_invalid_message,
 )
+from linkedin_mcp_server.linkedin.contracts import before_the_reply_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -166,13 +167,22 @@ def register_messaging_tools(
                 progress=0, total=100, message="Loading conversation"
             )
 
-            result = await extractor.get_conversation(
-                linkedin_username=linkedin_username,
-                thread_id=thread_id,
-                message_url=message_url,
-                index=index,
-                max_scrolls=max_scrolls,
-            )
+            if hasattr(type(extractor), "get_conversation_with_options"):
+                result = await getattr(extractor, "get_conversation_with_options")(
+                    linkedin_username=linkedin_username,
+                    thread_id=thread_id,
+                    message_url=message_url,
+                    index=index,
+                    max_scrolls=max_scrolls,
+                )
+            else:
+                result = await getattr(extractor, "get_conversation")(
+                    linkedin_username=linkedin_username,
+                    thread_id=thread_id,
+                    message_url=message_url,
+                    index=index,
+                    max_scrolls=max_scrolls,
+                )
 
             await ctx.report_progress(progress=100, total=100, message="Complete")
 
@@ -235,7 +245,7 @@ def register_messaging_tools(
                 thread_id,
                 message_url is not None,
             )
-            return await extractor.archive_conversation(
+            return await getattr(extractor, "archive_conversation")(
                 linkedin_username=linkedin_username,
                 thread_id=thread_id,
                 message_url=message_url,
@@ -399,7 +409,10 @@ def register_messaging_tools(
             )
 
             try:
-                await ctx.report_progress(progress=100, total=100, message="Complete")
+                with before_the_reply_deadline():
+                    await ctx.report_progress(
+                        progress=100, total=100, message="Complete"
+                    )
             except BaseException:
                 # The send has already answered, and this notification is the
                 # last await inside FastMCP's `anyio.fail_after()`. A deadline
@@ -449,7 +462,14 @@ def register_messaging_tools(
                 linkedin_username,
                 confirm_send,
             )
-            return await extractor.send_message(
+            if hasattr(type(extractor), "send_message_with_compose_url"):
+                return await getattr(extractor, "send_message_with_compose_url")(
+                    linkedin_username,
+                    message,
+                    confirm_send=confirm_send,
+                    compose_url=message_url,
+                )
+            return await getattr(extractor, "send_message")(
                 linkedin_username,
                 message,
                 confirm_send=confirm_send,

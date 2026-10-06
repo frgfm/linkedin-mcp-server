@@ -13,10 +13,10 @@ import asyncio
 import inspect
 import json
 
+from linkedin_mcp_server.callbacks import ProgressCallback
 from patchright.async_api import Page
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from linkedin_mcp_server.callbacks import ProgressCallback
 from linkedin_mcp_server.scraping import capture as capture_module
 from linkedin_mcp_server.scraping import company as company_module
 from linkedin_mcp_server.scraping import feed as feed_module
@@ -84,19 +84,19 @@ _COMMON_ALLOWED = {
 }
 
 
-class TraceCallbacks(ProgressCallback):
+class TraceCallbacks:
     """Record progress callbacks without a mock object."""
 
     def __init__(self, recorder: TraceRecorder):
         self.recorder = recorder
 
-    async def on_start(self, scraper_type: str, url: str) -> None:
+    async def on_start(self, scraper_type: str, url: str) -> None:  # type: ignore[invalid-method-override]
         self.recorder.record("callback.start", operation=scraper_type, url=url)
 
     async def on_progress(self, message: str, percent: int) -> None:
         self.recorder.record("callback.progress", message=message, percent=percent)
 
-    async def on_complete(self, scraper_type: str, result: Any) -> None:
+    async def on_complete(self, scraper_type: str, result: Any) -> None:  # type: ignore[invalid-method-override]
         self.recorder.record(
             "callback.complete", operation=scraper_type, result_url=result["url"]
         )
@@ -310,7 +310,7 @@ async def _person_sections_scenario() -> dict[str, Any]:
     )
     page.script("show_more.filtered.count", *([0] * 8))
     extractor = _extractor(page)
-    callbacks = TraceCallbacks(recorder)
+    callbacks = cast(ProgressCallback, TraceCallbacks(recorder))
     async with boundaries(recorder, clock):
         with recorder.context("scrape_person"):
             result = await extractor.scrape_person(
@@ -338,7 +338,7 @@ async def _company_sections_scenario() -> dict[str, Any]:
         *[_root(f"{section} content") for section in COMPANY_SECTIONS],
     )
     extractor = _extractor(page)
-    callbacks = TraceCallbacks(recorder)
+    callbacks = cast(ProgressCallback, TraceCallbacks(recorder))
     async with boundaries(recorder, clock):
         with recorder.context("scrape_company"):
             result = await extractor.scrape_company(
