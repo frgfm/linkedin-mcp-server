@@ -12,6 +12,7 @@ import logging
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware import Middleware
 
 # fastmcp's own AccessToken, not the SDK's: it subclasses it to carry the JWT
 # claims (`fastmcp/server/auth/auth.py:54`), and returning the base class from
@@ -57,6 +58,19 @@ if TYPE_CHECKING:
     from linkedin_mcp_server.daemon.proxy import DaemonProxyBackend
 
 logger = logging.getLogger(__name__)
+
+
+class _ProxyOnlyToolsMiddleware(Middleware):
+    """Keep non-tool listings local on a server that forwards tools only."""
+
+    async def on_list_resources(self, context: Any, call_next: Any) -> Any:
+        return []
+
+    async def on_list_resource_templates(self, context: Any, call_next: Any) -> Any:
+        return []
+
+    async def on_list_prompts(self, context: Any, call_next: Any) -> Any:
+        return []
 
 
 # For clients that never load the plugin skill. Every client reads this on
@@ -251,6 +265,10 @@ def create_mcp_server(
     # First, so it is the outermost layer on every role: everything inside it
     # still sees a failure as the exception it raised.
     mcp.add_middleware(ErrorCodeMiddleware())
+    if role is ServerRole.PROXY:
+        # FastMCP may synthesize resources from the listed tools; that would
+        # forward a tools/list request while answering resources/list.
+        mcp.add_middleware(_ProxyOnlyToolsMiddleware())
     # Added before the serializing middleware below, which makes it the outer one.
     # An inner position would work: `close_browser` does not consult the in-flight
     # count, so quiescence succeeds from there, and the lease reference the inner
