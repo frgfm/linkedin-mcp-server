@@ -9,14 +9,40 @@
   <a href="https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/LICENSE" target="_blank"><img src="https://img.shields.io/badge/License-Apache%202.0-%233fb950?labelColor=32383f" alt="License"></a>
 </p>
 
-An MCP server that connects AI assistants like Claude to LinkedIn through your own logged-in browser session. Look up profiles and companies, send messages, manage your inbox, or search for jobs. All browser actions run locally on your machine.
+Give your AI agents access to LinkedIn through your own browser session. Read profiles, research companies, find jobs, and manage conversations and connection requests.
 
-> This is an independent open-source project, not affiliated with, authorized by, endorsed by, or sponsored by LinkedIn or Microsoft. LinkedIn is a trademark of LinkedIn Corporation and is used here only to identify the service this software interacts with.
+> Independent open-source project. Not affiliated with LinkedIn or Microsoft. LinkedIn is a trademark of LinkedIn Corporation.
 
 <br/>
 <details open>
 <summary><strong>LinkedIn MCP Sponsor</strong></summary>
 <br/>
+<a href="https://golink.onl/linkupapi-banner" target="_blank">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/df9f3784-4db3-4a30-a908-ca9aae32f54c">
+    <img src="https://github.com/user-attachments/assets/e3a019f0-0dbe-4b91-8e41-684d5ea69893" alt="LinkupAPI, the outreach API for your AI agents" width="100%">
+  </picture>
+</a>
+
+> Running LinkedIn agents in production? [**LinkupAPI**](https://golink.onl/linkupapi-link) is the hosted outreach API built for scale, across LinkedIn Classic, Sales Navigator, and Recruiter, plus email, WhatsApp, and iMessage.
+
+[Try LinkupAPI free →](https://golink.onl/linkupapi-free)
+
+<br/>
+
+<a href="https://golink.onl/cadenza-banner" target="_blank">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/e7dc04a7-4b2c-4f8f-bffa-77895f02a9b4">
+    <img src="https://github.com/user-attachments/assets/8b8ffaf4-ac80-4943-bb14-88562d636a35" alt="Cadenza, hosted LinkedIn MCP for your AI assistant" width="100%">
+  </picture>
+</a>
+
+> [**Cadenza**](https://golink.onl/cadenza-link) is the single hosted MCP server for all your LinkedIn needs. It covers Classic, Sales Navigator, and Recruiter with 100+ actions, each within limits you set. Works on web, desktop, and mobile.
+
+Use code <strong>FOUNDING20</strong> for 20% off your first year. <a href="https://golink.onl/cadenza-cta">Try Cadenza →</a>
+
+<br/>
+
 <a href="https://golink.onl/unipile-banner" target="_blank">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/c2e7f3b4-6812-4f28-8728-10f882a44e0e">
@@ -27,6 +53,19 @@ An MCP server that connects AI assistants like Claude to LinkedIn through your o
 > This MCP server is supported by [**Unipile**](https://golink.onl/unipile-link). Unipile is the fully managed cloud option for developers: a hosted LinkedIn API for Classic, Sales Navigator, and Recruiter that handles auth, sessions, and infrastructure for you.
 
 [Try Unipile free for 7 days →](https://golink.onl/unipile-free-trial)
+
+<br/>
+
+<a href="https://golink.onl/zernio-banner" target="_blank">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/f8b34875-c2b7-4466-b430-51fda4875720">
+    <img src="https://github.com/user-attachments/assets/ef30cb05-80a7-4b03-a9d4-186c6db2fe43" alt="Zernio, official APIs for every social channel" width="100%">
+  </picture>
+</a>
+
+> [**Zernio**](https://golink.onl/zernio-link) gives your agents official APIs for every social channel. Post, reply, and run ads on Instagram, TikTok, X, YouTube, Threads, and more, through one API or MCP server.
+
+[Try Zernio free →](https://golink.onl/zernio-free)
 </details>
 
 ---
@@ -35,68 +74,68 @@ An MCP server that connects AI assistants like Claude to LinkedIn through your o
 
 ## Installation Methods - LinkedIn MCP Server
 
-[![uvx](https://img.shields.io/badge/uvx-Quick_Install-de5fe9?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDEiIGhlaWdodD0iNDEiIHZpZXdCb3g9IjAgMCA0MSA0MSIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTS01LjI4NjE5ZS0wNiAwLjE2ODYyOUwwLjA4NDMwOTggMjAuMTY4NUwwLjE1MTc2MiAzNi4xNjgzQzAuMTYxMDc1IDM4LjM3NzQgMS45NTk0NyA0MC4xNjA3IDQuMTY4NTkgNDAuMTUxNEwyMC4xNjg0IDQwLjA4NEwzMC4xNjg0IDQwLjA0MThMMzEuMTg1MiA0MC4wMzc1QzMzLjM4NzcgNDAuMDI4MiAzNS4xNjgzIDM4LjIwMjYgMzUuMTY4MyAzNlYzNkwzNy4wMDAzIDM2TDM3LjAwMDMgMzkuOTk5Mkw0MC4xNjgzIDM5Ljk5OTZMMzkuOTk5NiAtOS45NDY1M2UtMDdMMjEuNTk5OCAwLjA3NzU2ODlMMjEuNjc3NCAxNi4wMTg1TDIxLjY3NzQgMjUuOTk5OEwyMC4wNzc0IDI1Ljk5OThMMTguMzk5OCAyNS45OTk4TDE4LjQ3NzQgMTYuMDMyTDE4LjM5OTggMC4wOTEwNTkzTC01LjI4NjE5ZS0wNiAwLjE2ODYyOVoiIGZpbGw9IiNERTVGRTkiLz4KPC9zdmc+Cg==)](#-uvx-setup-recommended)
-[![Install MCP Bundle](https://img.shields.io/badge/Claude_Desktop_MCPB-d97757?style=for-the-badge&logo=anthropic)](#-claude-desktop-mcp-bundle-formerly-dxt)
-[![Codex Plugin](https://img.shields.io/badge/Codex-Plugin-24292f?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0iI2ZmZmZmZiIgZmlsbC1ydWxlPSJldmVub2RkIiBjbGlwLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik04LjA4Ni40NTdhNi4xMDUgNi4xMDUgMCAwMTMuMDQ2LS40MTVjMS4zMzMuMTUzIDIuNTIxLjcyIDMuNTY0IDEuN2EuMTE3LjExNyAwIDAwLjEwNy4wMjljMS40MDgtLjM0NiAyLjc2Mi0uMjI0IDQuMDYxLjM2NmwuMDYzLjAzLjE1NC4wNzZjMS4zNTcuNzAzIDIuMzMgMS43NyAyLjkxOCAzLjE5OC4yNzguNjc5LjQxOCAxLjM4OC40MjEgMi4xMjZhNS42NTUgNS42NTUgMCAwMS0uMTggMS42MzEuMTY3LjE2NyAwIDAwLjA0LjE1NSA1Ljk4MiA1Ljk4MiAwIDAxMS41NzggMi44OTFjLjM4NSAxLjkwMS0uMDEgMy42MTUtMS4xODMgNS4xNGwtLjE4Mi4yMmE2LjA2MyA2LjA2MyAwIDAxLTIuOTM0IDEuODUxLjE2Mi4xNjIgMCAwMC0uMTA4LjEwMmMtLjI1NS43MzYtLjUxMSAxLjM2NC0uOTg3IDEuOTkyLTEuMTk5IDEuNTgyLTIuOTYyIDIuNDYyLTQuOTQ4IDIuNDUxLTEuNTgzLS4wMDgtMi45ODYtLjU4Ny00LjIxLTEuNzM2YS4xNDUuMTQ1IDAgMDAtLjE0LS4wMzJjLS41MTguMTY3LTEuMDQuMTkxLTEuNjA0LjE4NWE1LjkyNCA1LjkyNCAwIDAxLTIuNTk1LS42MjIgNi4wNTggNi4wNTggMCAwMS0yLjE0Ni0xLjc4MWMtLjIwMy0uMjY5LS40MDQtLjUyMi0uNTUxLS44MjFhNy43NCA3Ljc0IDAgMDEtLjQ5NS0xLjI4MyA2LjExIDYuMTEgMCAwMS0uMDE3LTMuMDY0LjE2Ni4xNjYgMCAwMC4wMDgtLjA3NC4xMTUuMTE1IDAgMDAtLjAzNy0uMDY0IDUuOTU4IDUuOTU4IDAgMDEtMS4zOC0yLjIwMiA1LjE5NiA1LjE5NiAwIDAxLS4zMzMtMS41ODkgNi45MTUgNi45MTUgMCAwMS4xODgtMi4xMzJjLjQ1LTEuNDg0IDEuMzA5LTIuNjQ4IDIuNTc3LTMuNDkzLjI4Mi0uMTg4LjU1LS4zMzQuODAyLS40MzguMjg2LS4xMi41NzMtLjIyLjg2MS0uMzA0YS4xMjkuMTI5IDAgMDAuMDg3LS4wODdBNi4wMTYgNi4wMTYgMCAwMTUuNjM1IDIuMzFDNi4zMTUgMS40NjQgNy4xMzIuODQ2IDguMDg2LjQ1N3ptLS44MDQgNy44NWEuODQ4Ljg0OCAwIDAwLTEuNDczLjg0MmwxLjY5NCAyLjk2NS0xLjY4OCAyLjg0OGEuODQ5Ljg0OSAwIDAwMS40Ni44NjRsMS45NC0zLjI3MmEuODQ5Ljg0OSAwIDAwLjAwNy0uODU0bC0xLjk0LTMuMzkzem01LjQ0NiA2LjI0YS44NDkuODQ5IDAgMDAwIDEuNjk1aDQuODQ4YS44NDkuODQ5IDAgMDAwLTEuNjk2aC00Ljg0OHoiLz48L3N2Zz4%3D)](#-codex-plugin)
-[![Docker](https://img.shields.io/badge/Docker-Universal_MCP-008fe2?style=for-the-badge&logo=docker&logoColor=008fe2)](#-docker-setup)
+[![uvx](https://img.shields.io/badge/uvx-Quick_Install-de5fe9?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDEiIGhlaWdodD0iNDEiIHZpZXdCb3g9IjAgMCA0MSA0MSIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTS01LjI4NjE5ZS0wNiAwLjE2ODYyOUwwLjA4NDMwOTggMjAuMTY4NUwwLjE1MTc2MiAzNi4xNjgzQzAuMTYxMDc1IDM4LjM3NzQgMS45NTk0NyA0MC4xNjA3IDQuMTY4NTkgNDAuMTUxNEwyMC4xNjg0IDQwLjA4NEwzMC4xNjg0IDQwLjA0MThMMzEuMTg1MiA0MC4wMzc1QzMzLjM4NzcgNDAuMDI4MiAzNS4xNjgzIDM4LjIwMjYgMzUuMTY4MyAzNlYzNkwzNy4wMDAzIDM2TDM3LjAwMDMgMzkuOTk5Mkw0MC4xNjgzIDM5Ljk5OTZMMzkuOTk5NiAtOS45NDY1M2UtMDdMMjEuNTk5OCAwLjA3NzU2ODlMMjEuNjc3NCAxNi4wMTg1TDIxLjY3NzQgMjUuOTk5OEwyMC4wNzc0IDI1Ljk5OThMMTguMzk5OCAyNS45OTk4TDE4LjQ3NzQgMTYuMDMyTDE4LjM5OTggMC4wOTEwNTkzTC01LjI4NjE5ZS0wNiAwLjE2ODYyOVoiIGZpbGw9IiNERTVGRTkiLz4KPC9zdmc+Cg==)](#setup-with-uvx-recommended)
+[![Install MCP Bundle](https://img.shields.io/badge/Claude_Desktop_MCPB-d97757?style=for-the-badge&logo=anthropic)](#claude-desktop-mcp-bundle-formerly-dxt)
+[![Codex Plugin](https://img.shields.io/badge/Codex-Plugin-24292f?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0iI2ZmZmZmZiIgZmlsbC1ydWxlPSJldmVub2RkIiBjbGlwLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik04LjA4Ni40NTdhNi4xMDUgNi4xMDUgMCAwMTMuMDQ2LS40MTVjMS4zMzMuMTUzIDIuNTIxLjcyIDMuNTY0IDEuN2EuMTE3LjExNyAwIDAwLjEwNy4wMjljMS40MDgtLjM0NiAyLjc2Mi0uMjI0IDQuMDYxLjM2NmwuMDYzLjAzLjE1NC4wNzZjMS4zNTcuNzAzIDIuMzMgMS43NyAyLjkxOCAzLjE5OC4yNzguNjc5LjQxOCAxLjM4OC40MjEgMi4xMjZhNS42NTUgNS42NTUgMCAwMS0uMTggMS42MzEuMTY3LjE2NyAwIDAwLjA0LjE1NSA1Ljk4MiA1Ljk4MiAwIDAxMS41NzggMi44OTFjLjM4NSAxLjkwMS0uMDEgMy42MTUtMS4xODMgNS4xNGwtLjE4Mi4yMmE2LjA2MyA2LjA2MyAwIDAxLTIuOTM0IDEuODUxLjE2Mi4xNjIgMCAwMC0uMTA4LjEwMmMtLjI1NS43MzYtLjUxMSAxLjM2NC0uOTg3IDEuOTkyLTEuMTk5IDEuNTgyLTIuOTYyIDIuNDYyLTQuOTQ4IDIuNDUxLTEuNTgzLS4wMDgtMi45ODYtLjU4Ny00LjIxLTEuNzM2YS4xNDUuMTQ1IDAgMDAtLjE0LS4wMzJjLS41MTguMTY3LTEuMDQuMTkxLTEuNjA0LjE4NWE1LjkyNCA1LjkyNCAwIDAxLTIuNTk1LS42MjIgNi4wNTggNi4wNTggMCAwMS0yLjE0Ni0xLjc4MWMtLjIwMy0uMjY5LS40MDQtLjUyMi0uNTUxLS44MjFhNy43NCA3Ljc0IDAgMDEtLjQ5NS0xLjI4MyA2LjExIDYuMTEgMCAwMS0uMDE3LTMuMDY0LjE2Ni4xNjYgMCAwMC4wMDgtLjA3NC4xMTUuMTE1IDAgMDAtLjAzNy0uMDY0IDUuOTU4IDUuOTU4IDAgMDEtMS4zOC0yLjIwMiA1LjE5NiA1LjE5NiAwIDAxLS4zMzMtMS41ODkgNi45MTUgNi45MTUgMCAwMS4xODgtMi4xMzJjLjQ1LTEuNDg0IDEuMzA5LTIuNjQ4IDIuNTc3LTMuNDkzLjI4Mi0uMTg4LjU1LS4zMzQuODAyLS40MzguMjg2LS4xMi41NzMtLjIyLjg2MS0uMzA0YS4xMjkuMTI5IDAgMDAuMDg3LS4wODdBNi4wMTYgNi4wMTYgMCAwMTUuNjM1IDIuMzFDNi4zMTUgMS40NjQgNy4xMzIuODQ2IDguMDg2LjQ1N3ptLS44MDQgNy44NWEuODQ4Ljg0OCAwIDAwLTEuNDczLjg0MmwxLjY5NCAyLjk2NS0xLjY4OCAyLjg0OGEuODQ5Ljg0OSAwIDAwMS40Ni44NjRsMS45NC0zLjI3MmEuODQ5Ljg0OSAwIDAwLjAwNy0uODU0bC0xLjk0LTMuMzkzem01LjQ0NiA2LjI0YS44NDkuODQ5IDAgMDAwIDEuNjk1aDQuODQ4YS44NDkuODQ5IDAgMDAwLTEuNjk2aC00Ljg0OHoiLz48L3N2Zz4%3D)](#codex-plugin)
+[![Claude Code Plugin](https://img.shields.io/badge/Claude_Code-Plugin-d97757?style=for-the-badge&logo=claude&logoColor=d97757)](#claude-code-plugin)
+[![Cursor Plugin](https://img.shields.io/badge/Cursor-Plugin-000000?style=for-the-badge&logo=cursor)](#cursor-plugin)
+[![Docker](https://img.shields.io/badge/Docker-Universal_MCP-008fe2?style=for-the-badge&logo=docker&logoColor=008fe2)](#setup-with-docker)
 
-| Tool | Description | Status |
-|------|-------------|--------|
-| `get_person_profile` | Get profile info with explicit section selection (experience, education, interests, honors, languages, certifications, skills, projects, contact_info, posts) | [#590](https://github.com/stickerdaniel/linkedin-mcp-server/issues/590) |
-| `get_my_profile` | Get the authenticated user's own LinkedIn profile (same sections as get_person_profile) | [#590](https://github.com/stickerdaniel/linkedin-mcp-server/issues/590) |
-| `connect_with_person` | Send a connection request or accept an incoming one, with optional note | [#407](https://github.com/stickerdaniel/linkedin-mcp-server/issues/407) [#432](https://github.com/stickerdaniel/linkedin-mcp-server/issues/432) [#454](https://github.com/stickerdaniel/linkedin-mcp-server/issues/454) [#629](https://github.com/stickerdaniel/linkedin-mcp-server/issues/629) |
-| `get_sidebar_profiles` | Extract profile URLs from sidebar recommendation sections ("More profiles for you", "Explore premium profiles", "People you may know") on a profile page | working |
-| `get_inbox` | List recent conversations from the LinkedIn messaging inbox | working |
-| `get_conversation` | Read a messaging conversation as a structured list of messages plus participants, by username, thread ID, or invitation compose URL | [#434](https://github.com/stickerdaniel/linkedin-mcp-server/issues/434) |
-| `archive_conversation` | Archive a conversation by username, thread ID, or invitation compose URL | working |
-| `search_conversations` | Search messages by keyword | working |
-| `send_message` | Compose/send a message to a LinkedIn user (requires confirmation; profile-based targeting may open a separate DM instead of replying in an existing thread) | [#433](https://github.com/stickerdaniel/linkedin-mcp-server/issues/433) [#441](https://github.com/stickerdaniel/linkedin-mcp-server/issues/441) |
-| `message_invitation_sender` | Message a received connection-invitation sender using its invitation compose URL (requires confirmation) | [#613](https://github.com/stickerdaniel/linkedin-mcp-server/issues/613) |
-| `get_pending_invitations` | List pending network invitations from `/mynetwork/invitation-manager/` (`received` or `sent`) | working |
-| `get_connections` | List most recently added 1st-degree connections from `/mynetwork/invite-connect/connections/` | working |
-| `ignore_connection_request` | Ignore a received connection request, identified by `linkedin_username` | working |
-| `withdraw_invitation` | Withdraw an outgoing connection request, identified by recipient `linkedin_username` | working |
-| `get_company_profile` | Extract company information with explicit section selection (posts, jobs); about-section references may include a `company_urn` entry carrying the numeric id used by LinkedIn's people-search `currentCompany` URL facet | working |
-| `get_company_posts` | Get recent posts from a company's LinkedIn feed | working |
-| `search_companies` | Search for companies on LinkedIn by keywords | working |
-| `get_company_employees` | List employees at a company from the /people/ page, with optional keyword filter | working |
-| `search_jobs` | Search for jobs with keywords and location filters | working |
-| `get_saved_jobs` | List job postings saved by the authenticated user | working |
-| `search_people` | Search for people by keywords, location, connection degree (1st/2nd/3rd), and current company | [#526](https://github.com/stickerdaniel/linkedin-mcp-server/issues/526) |
-| `get_job_details` | Get detailed information about a specific job posting | working |
-| `get_feed` | Get recent posts from the authenticated user's home feed | working |
-| `search_posts` | Search posts/content globally by keyword (the "Posts" tab) with an optional recency filter (past-24h/past-week/past-month); returns unordered candidate permalinks in references | working |
-| `close_session` | Close browser session and clean up resources | working |
+| Tool | Description |
+|------|-------------|
+| `get_person_profile` | Read profile sections, including volunteering. Main profile data is structured. |
+| `get_my_profile` | Read your profile sections. Main profile data is structured. |
+| `connect_with_person` | Send a connection request with an optional note, or accept an incoming one. |
+| `get_pending_invitations` | List received or sent invitations, with sender and recipient details. |
+| `get_connections` | List recently added first-degree connections. |
+| `ignore_connection_request` | Ignore a received connection request. |
+| `withdraw_invitation` | Withdraw a sent connection request. |
+| `get_sidebar_profiles` | Find recommended profile links, including people you may know. |
+| `get_inbox` | List recent inbox conversations, with links to open individual threads. |
+| `get_conversation` | Read structured messages using a username, thread ID, or invitation link. |
+| `search_conversations` | Search messages by keyword and link to matching threads. |
+| `archive_conversation` | Archive a conversation by thread ID, username, or invitation link. |
+| `send_message` | Message a profile after confirmation. Threads use `reply_to_conversation`. |
+| `message_invitation_sender` | Message the sender of a received invitation using its invitation link. |
+| `reply_to_conversation` | Reply inside a thread or InMail by thread ID, with confirmation. |
+| `get_company_profile` | Read company information, with optional sections for posts and open jobs. |
+| `get_company_posts` | Read recent posts from a company's feed, with links to the original posts. |
+| `search_companies` | Find companies by keyword and return links to their LinkedIn profiles. |
+| `get_company_employees` | Find company employees, optionally filtered by name, title, or skill. |
+| `search_jobs` | Find job postings by keyword and location, with job IDs for reading details. |
+| `get_saved_jobs` | List your saved job postings, with job IDs for looking up their details. |
+| `dismiss_job` | Dismiss a job from job search so later searches no longer show it. Irreversible. |
+| `search_people` | Find people by keyword, location, degree, company, and mutual connections. |
+| `get_job_details` | Read a job posting's description, requirements, and company details. |
+| `get_job_apply_url` | Check whether a job uses Easy Apply or links to an employer's application. |
+| `get_easy_apply_form` | Read an Easy Apply form's fields, options and prefilled values. Never submits. |
+| `get_feed` | Read structured posts from your home feed. |
+| `search_posts` | Search posts by keyword, optionally filtered by recency or content type. |
+| `get_session_status` | Check your saved login and browser state without opening a browser. |
+| `close_session` | Close the shared browser session without deleting your saved login. |
 
-`get_pending_invitations` returns `{url, invitations}`. Received invitations
-expose `type` (`connection_request`, `page_follow`, or
-`newsletter_subscription`), `invitation_age` (`min`, `h`, `d`, `w`, or `mo`),
-`sender`, optional `note`, `target`, and `message_url` (compose path with full
-query string for connection requests). Sent invitations are connection requests
-with `invitation_age` and `recipient` (`name`, `url`, `headline`).
+`get_pending_invitations` returns received invitations with their type, age,
+sender, optional note and target. Connection requests include a `message_url`
+that can be passed to `get_conversation`, `archive_conversation` or
+`message_invitation_sender`. Sent invitations include the recipient and age.
 
-`get_connections` returns `{url, connections}` ordered most-recently-added
-first. Each connection has `name`, `url` (relative `/in/<slug>/`), `headline`,
-and `connected_on` (ISO date `YYYY-MM-DD`, parsed from the en-US "Connected on
-Month DD, YYYY" line — `null` for other locales or unparseable text).
+`get_connections` returns recently added connections with their name, profile
+path, headline and connection date. Dates are parsed from LinkedIn's en-US text.
 
-`message_invitation_sender` accepts the relative `/messaging/compose/` URL
-exposed by a received invitation plus the sender's `linkedin_username`; set
-`confirm_send=true` to send.
-
-`get_conversation` accepts that same `message_url` with `linkedin_username` to
-read conversations that remain scoped to a pending invitation.
+`get_feed` returns structured posts in `sections.feed`; each post includes its
+author, visible text, media, engagement counts and permalink when LinkedIn
+exposes them.
 
 <br/>
 <br/>
 
-## 🚀 uvx Setup (Recommended)
+## Setup with uvx (Recommended)
 
 **Prerequisites:** [Install uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ### Installation
 
-**Client Configuration**
+**Add to your MCP client's `mcpServers` configuration**
 
 ```json
 {
@@ -110,14 +149,14 @@ read conversations that remain scoped to a pending invitation.
 }
 ```
 
-The `@latest` tag turns on automatic updates, which keep the server working with LinkedIn's current page structure. The server starts quickly, prepares the shared Patchright Chromium browser cache in the background under `~/.linkedin-mcp/patchright-browsers`, and opens a LinkedIn login browser window on the first tool call that needs authentication.
+The `@latest` tag turns on automatic updates, which keep the server working with LinkedIn's current page structure. The server starts quickly and prepares the shared Patchright Chromium browser cache in the background under `~/.linkedin-mcp/patchright-browsers`. On the first tool call that needs authentication, it reuses a LinkedIn session from a signed-in local browser if it finds one, and otherwise opens a LinkedIn login browser window.
 
 AI agent? Get a quick confirmation from the user before enabling automatic updates.
 
 > [!NOTE]
 > Early tool calls may return a setup/authentication-in-progress error until browser setup or login finishes. If you prefer to create a session explicitly, run `uvx mcp-server-linkedin@latest --login`.
 
-### uvx Setup Help
+### Setup Help
 
 <details>
 <summary><b>🔧 Configuration</b></summary>
@@ -138,7 +177,7 @@ AI agent? Get a quick confirmation from the user before enabling automatic updat
 **Session:**
 
 - `--login` - Open a browser to sign in and save the session
-- `--import-from-browser [BROWSER]` - Reuse a session from a locally signed-in Chromium browser (`chrome`, `chromium`, `brave`, `edge`, `arc`, `vivaldi`, `helium`, `yandex`, `whale`, `auto`). Bare flag picks `auto`, the most recently used browser with a live LinkedIn session.
+- `--import-from-browser [BROWSER]` - Reuse a session from a locally signed-in Chromium browser (`chrome`, `chromium`, `brave`, `edge`, `arc`, `vivaldi`, `helium`, `yandex`, `whale`, `coccoc`, `opera`, `opera_gx`, `auto`). Bare flag picks `auto`, the most recently used browser with a live LinkedIn session.
 - `--auto-import` / `--no-auto-import` - Import a session from a signed-in local browser on the first tool call that needs one, before falling back to manual login (default: on). Skipped in Docker, behind a proxy, and on a non-loopback HTTP bind. On macOS the keychain may prompt once.
 - `--logout` - Clear the stored session
 - `--login-viewer` - Docker only: show the `--login` browser at a token-protected URL on port 6080 (see [Authentication](#authentication))
@@ -153,7 +192,7 @@ AI agent? Get a quick confirmation from the user before enabling automatic updat
 **Timeouts:**
 
 - `--timeout MS` - Timeout for a single page operation (default: 5000)
-- `--tool-timeout SECONDS` - Timeout for a whole tool call (default: 180). Raise it for heavy scrapes, slow networks, or a cold-start browser.
+- `--tool-timeout SECONDS` - Timeout for a whole tool call (default: 180). Raise it for calls that read many pages, slow networks, or a cold-start browser.
 - `--login-timeout SECONDS` - How long the login browser waits for you to finish signing in (default: 1800; 0 = no limit). `--login-viewer` ends the session after 30 minutes either way.
 - `--login-inline-wait SECONDS` - How long a tool call waits for a login to finish before telling the model to retry (default: 25, max 45; 0 = return at once)
 
@@ -178,7 +217,7 @@ AI agent? Get a quick confirmation from the user before enabling automatic updat
 <details>
 <summary>Import a session from your everyday browser</summary>
 
-If you are already signed into LinkedIn in Chrome, Chromium, Brave, Edge, Arc, Vivaldi, Helium, Yandex, or Naver Whale, you can skip the manual `--login` step and reuse that session:
+If you are already signed into LinkedIn in Chrome, Chromium, Brave, Edge, Arc, Vivaldi, Helium, Yandex, Naver Whale, Cốc Cốc, Opera, or Opera GX, you can skip the manual `--login` step and reuse that session:
 
 ```bash
 # Auto-pick the most recently used browser with a live LinkedIn session
@@ -303,19 +342,22 @@ while a container is running.
 <br/>
 <br/>
 
-## 📦 Claude Desktop MCP Bundle (formerly DXT)
+## Claude Desktop MCP Bundle (formerly DXT)
 
 **Prerequisites:** [Claude Desktop](https://claude.ai/download).
 
-**One-click installation** for Claude Desktop users:
+### Installation
 
 1. Download the latest `.mcpb` artifact from [releases](https://github.com/stickerdaniel/linkedin-mcp-server/releases/latest)
 2. Click the downloaded `.mcpb` file to install it into Claude Desktop
 3. Call any LinkedIn tool
 
-On startup, the MCP Bundle starts preparing the shared Patchright Chromium browser cache in the background. If you call a tool too early, Claude will surface a setup-in-progress error. On the first tool call that needs authentication, the server opens a LinkedIn login browser window and asks you to retry after sign-in.
+On startup, the MCP Bundle prepares the shared Patchright Chromium browser cache in the background. On the first tool call that needs authentication, the server reuses a LinkedIn session from a signed-in local browser if it finds one, and otherwise opens a LinkedIn login browser window.
 
-### MCP Bundle Setup Help
+> [!NOTE]
+> Early tool calls may return a setup/authentication-in-progress error until browser setup or login finishes. Retry the tool call once the browser download or sign-in completes.
+
+### Setup Help
 
 <details>
 <summary><b>❗ Troubleshooting</b></summary>
@@ -336,7 +378,7 @@ On startup, the MCP Bundle starts preparing the shared Patchright Chromium brows
 
 - Make sure you have only one active LinkedIn session at a time
 - LinkedIn may require a login confirmation in the LinkedIn mobile app for `--login`
-- LinkedIn may show a captcha challenge during login. Run `uvx mcp-server-linkedin@latest --login` which opens a browser where you can solve captchas manually. See the [uvx setup](#-uvx-setup-recommended---universal) for prerequisites.
+- LinkedIn may show a captcha challenge during login. Run `uvx mcp-server-linkedin@latest --login` which opens a browser where you can solve captchas manually. See the [uvx setup](#setup-with-uvx-recommended) for prerequisites.
 
 </details>
 
@@ -347,6 +389,14 @@ On startup, the MCP Bundle starts preparing the shared Patchright Chromium brows
 - *Entire tool calls timing out* (e.g. multi-section profiles, cold-start Chromium, slow containers): increase the per-tool execution timeout: `--tool-timeout 300` or `TOOL_TIMEOUT=300` (seconds, default 180).
 - *First tool call with no session*: if a locally logged-in browser has a live LinkedIn session, the server auto-imports it (see `AUTO_IMPORT_FROM_BROWSER` / `--auto-import`) instead of forcing a manual login. On macOS the keychain may prompt once for Safe Storage access. If no importable browser session exists, it falls back to opening a login window and waits up to `LOGIN_INLINE_WAIT` seconds (default 25, max 45; `--login-inline-wait`) so a quick sign-in resolves in one call. If the wait elapses, the tool returns a pending signal and the model retries in about 30 seconds. Neither the auto-import nor the inline wait applies under Docker or when the server is bound to a non-loopback HTTP host. Create the session on the host with `--login`, or use the explicit Docker `--login --login-viewer` command.
 - Users on slow connections may need higher values for either.
+
+</details>
+
+<details>
+<summary>Use your own Chrome</summary>
+
+- Set **Chrome executable** in the extension's settings to a Chrome, Chromium or Chrome for Testing binary, such as `/usr/bin/google-chrome`. Leave it blank to keep the bundled Chromium. It sets `CHROME_PATH`, described under *Custom Chrome path* in the uvx setup help.
+- This is the fix when tool calls refuse to open the profile because a newer browser last opened it: point the setting at that newer browser instead of signing in again.
 
 </details>
 
@@ -362,23 +412,73 @@ On startup, the MCP Bundle starts preparing the shared Patchright Chromium brows
 <br/>
 <br/>
 
-## 🧩 Codex plugin
+## Codex Plugin
 
-This repository includes an opt-in Codex plugin that bundles the MCP server. Add the repository marketplace and install the
-plugin:
+**Prerequisites:** [Codex](https://github.com/openai/codex) and [uv](https://docs.astral.sh/uv/getting-started/installation/).
+
+### Installation
+
+**Run in a terminal**
 
 ```bash
 codex plugin marketplace add stickerdaniel/linkedin-mcp-server
 codex plugin add linkedin-mcp-server@linkedin-mcp-server
 ```
 
+The plugin runs the latest server release. On the first tool call that needs authentication, the server reuses a LinkedIn session from a signed-in local browser or opens a login window.
+
+> [!NOTE]
+> Early tool calls may return a setup/authentication-in-progress error until browser setup or login finishes. Retry the tool call once the browser download or sign-in completes.
+
 <br/>
 <br/>
 
-## 🐳 Docker Setup
+## Claude Code Plugin
+
+**Prerequisites:** [Claude Code](https://code.claude.com/docs) and [uv](https://docs.astral.sh/uv/getting-started/installation/).
+
+### Installation
+
+**Run in a terminal**
+
+```bash
+claude plugin marketplace add stickerdaniel/linkedin-mcp-server
+claude plugin install linkedin-mcp-server@linkedin-mcp-server
+```
+
+The plugin runs the latest server release. On the first tool call that needs authentication, the server reuses a LinkedIn session from a signed-in local browser or opens a login window.
+
+> [!NOTE]
+> Early tool calls may return a setup/authentication-in-progress error until browser setup or login finishes. Retry the tool call once the browser download or sign-in completes.
+
+<br/>
+<br/>
+
+## Cursor Plugin
+
+**Prerequisites:** [Cursor](https://cursor.com/) and [uv](https://docs.astral.sh/uv/getting-started/installation/) on your `PATH`.
+
+### Installation
+
+**From the Cursor Marketplace:** open **Customize** in the sidebar, search for **LinkedIn MCP**, and choose **Install**. The plugin bundles the LinkedIn skill.
+
+**One-click MCP install** (server only, without the skill):
+
+[![Add to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=linkedin&config=eyJjb21tYW5kIjoidXZ4IiwiYXJncyI6WyJtY3Atc2VydmVyLWxpbmtlZGluQGxhdGVzdCIsIi0tdHJhbnNwb3J0Iiwic3RkaW8iXSwiZW52Ijp7IlVWX0hUVFBfVElNRU9VVCI6IjMwMCJ9fQ%3D%3D)
+
+Both run the latest server release. On the first tool call that needs authentication, the server reuses a LinkedIn session from a signed-in local browser or opens a login window.
+
+> [!NOTE]
+> Early tool calls may return a setup/authentication-in-progress error until browser setup or login finishes. Retry the tool call once the browser download or sign-in completes.
+
+<br/>
+<br/>
+
+## Setup with Docker
 
 <details>
 <summary><strong>I know what I'm doing</strong></summary>
+
 **Prerequisites:** Make sure [Docker](https://www.docker.com/get-started/) is installed and running.
 
 ### Authentication
@@ -409,11 +509,11 @@ docker run -it --rm `
   --login --login-viewer
 ```
 
-Open the full URL the command prints (it carries the access token) and sign in. The viewer closes itself afterwards; let the command exit on its own so the session is stored completely. It gives up after 30 minutes.
+Open the full URL the command prints (it carries the access token) and sign in. Ctrl+V (Cmd+V on a Mac) pastes plain ASCII text, such as a password from your password manager, into the login browser. The viewer closes itself afterwards; let the command exit on its own so the session is stored completely. It gives up after 30 minutes.
 
 Keep the same host directory mounted at `/home/pwuser/.linkedin-mcp` on every later `docker run`, otherwise the server cannot find the session.
 
-**Configure Claude Desktop with Docker**
+**Add to your MCP client's `mcpServers` configuration**
 
 **macOS / Linux (absolute path in JSON):**
 
@@ -462,7 +562,7 @@ username.
 > [!NOTE]
 > Sessions expire over time. When tool calls start asking for authentication, repeat the login command above, or run `uvx mcp-server-linkedin@latest --login` on the host.
 
-### Docker Setup Help
+### Setup Help
 
 <details>
 <summary><b>🔧 Configuration</b></summary>
@@ -496,7 +596,7 @@ username.
 **Timeouts:**
 
 - `--timeout MS` - Timeout for a single page operation (default: 5000)
-- `--tool-timeout SECONDS` - Timeout for a whole tool call (default: 180). Raise it for heavy scrapes, slow networks, or a cold-start browser.
+- `--tool-timeout SECONDS` - Timeout for a whole tool call (default: 180). Raise it for calls that read many pages, slow networks, or a cold-start browser.
 - `--login-timeout SECONDS` - How long the login browser waits for you to finish signing in (default: 1800; 0 = no limit). `--login-viewer` ends the session after 30 minutes either way.
 - `--login-inline-wait SECONDS` - How long a tool call waits for a login to finish before telling the model to retry (default: 25, max 45; 0 = return at once)
 
@@ -609,7 +709,7 @@ belongs behind something that provides it.
 
 - Make sure you have only one active LinkedIn session at a time
 - LinkedIn may require a login confirmation in the LinkedIn mobile app for `--login`
-- LinkedIn may show a captcha challenge during login. Run `uvx mcp-server-linkedin@latest --login` which opens a browser where you can solve captchas manually. See the [uvx setup](#-uvx-setup-recommended---universal) for prerequisites.
+- LinkedIn may show a captcha challenge during login. Run `uvx mcp-server-linkedin@latest --login` which opens a browser where you can solve captchas manually. See the [uvx setup](#setup-with-uvx-recommended) for prerequisites.
 - If Docker auth becomes stale after you re-login on the host, restart Docker once so it can fresh-bridge from the new source session generation.
 
 </details>
@@ -650,54 +750,26 @@ belongs behind something that provides it.
 <br/>
 
 
-<a id="using-a-proxy"></a>
-
-## 🛡️ Using a proxy
-
-<details open>
-<summary><strong>Sponsored proxy providers</strong></summary>
-
-<br/>
-<a href="https://www.swiftproxy.net/?ref=stickerdaniel">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/872f4efb-f329-4f3c-b864-cd1fac7a331b" />
-    <img src="https://github.com/user-attachments/assets/c413a236-a49f-4480-8dcc-b67de3093920" alt="Swiftproxy logo" width="240">
-  </picture>
-</a>
-
-> Swiftproxy offers residential proxies with sticky sessions and worldwide geo-targeting. Its dedicated static ISP options include networks such as AT&T, Sky UK, and Rogers, with unlimited traffic and renewable addresses.
-
-Use code <strong>PROXY90</strong> for 10% off <a href="https://www.swiftproxy.net/?ref=stickerdaniel">Try Swiftproxy →</a>
-<br/>
-
-<a href="https://www.rapidproxy.io/?ref=linkedin">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/47680db7-360f-4128-9e66-73f784c0fa85" />
-    <img src="https://github.com/user-attachments/assets/3daa30e1-ead1-4884-8388-b3024c026ba9" alt="RapidProxy logo" width="240">
-  </picture>
-</a>
-
-> RapidProxy offers 90M+ residential IPs worldwide for LinkedIn automation and browser workflows, with sticky sessions, geo-targeting, and high-concurrency support. Plans start at $0.55/GB with non-expiring traffic.
-
-Use code <strong>RAPID10</strong> for 10% off <a href="https://www.rapidproxy.io/?ref=linkedin">Try RapidProxy for free →</a>
-<br/>
-
-<br/>
-</details>
+## Using a proxy
 
 LinkedIn scores the address a session signs in from. Your account's usual IP address is the safe one. You should use a proxy in your country when the server cannot use it: a VPS, another country, or a second account that must not share the first one's address.
 
 With a paid provider, use a sticky residential session that holds one address (never per-request rotation). A WireGuard full tunnel or Tailscale exit node on your home network works when the server should use your usual home address.
 
-**Setup:**
+### Setup Help
+
+<details>
+<summary><b>🔧 Configuration</b></summary>
 
 - Set the proxy up **before** `--login`. Moving an existing session to a new address triggers a LinkedIn checkpoint. That includes a session from `--import-from-browser`, which was created on your real address.
 - `--proxy-server scheme://host:port` or `PROXY_SERVER`, with `http`, `https`, `socks4` or `socks5`. Only browser traffic is routed, not the MCP transport.
 - Pass credentials through `PROXY_USERNAME` and `PROXY_PASSWORD`, or include them in `PROXY_SERVER` using the combined `http://user:pass@host:port` form. The combined form is not accepted by the `--proxy-server` CLI option.
 - `PROXY_BYPASS=localhost,127.0.0.1,::1` reaches local targets directly. With a proxy set, Chromium routes `localhost` through it too.
 
+</details>
+
 <details>
-<summary>Pitfalls</summary>
+<summary><b>❗ Troubleshooting</b></summary>
 
 - Chromium cannot authenticate to a SOCKS proxy, so credentials require an `http(s)` endpoint. If your provider only offers authenticated SOCKS5, run a local relay that holds the credentials and point the server at that.
 - A wrong proxy password shows up as a timeout or a failed sign-in, because Chromium retries the authentication challenge until the page times out. If sessions stop working right after you add a proxy, check the proxy credentials first.
@@ -709,13 +781,15 @@ With a paid provider, use a sticky residential session that holds one address (n
 <br/>
 <br/>
 
-## 🐍 Local Setup (Develop & Contribute)
+## Setup from Source (Develop & Contribute)
 
-Contributions are welcome! See [CONTRIBUTING.md](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/CONTRIBUTING.md) for architecture guidelines and checklists. Packet: search first, then add evidence to an existing issue or prepare a new report. Agents follow the [packet skill](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/.agents/skills/issue-packet/SKILL.md). Humans use the [issue forms](https://github.com/stickerdaniel/linkedin-mcp-server/issues/new/choose).
+Contributions are welcome. See [CONTRIBUTING.md](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/.github/CONTRIBUTING.md) for architecture guidelines and checklists. Search existing issues first, then use the [issue forms](https://github.com/stickerdaniel/linkedin-mcp-server/issues/new/choose) for anything new. AI agents follow the [issue-packet skill](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/.agents/skills/issue-packet/SKILL.md).
 
 **Prerequisites:** [Git](https://git-scm.com/downloads) and [uv](https://docs.astral.sh/uv/) installed
 
 ### Installation
+
+**Run in a terminal**
 
 ```bash
 # 1. Clone repository
@@ -736,7 +810,7 @@ uv run pre-commit install
 uv run -m linkedin_mcp_server
 ```
 
-### Local Setup Help
+### Setup Help
 
 <details>
 <summary><b>🔧 Configuration</b></summary>
@@ -747,7 +821,7 @@ uv run -m linkedin_mcp_server
 **Session:**
 
 - `--login` - Open a browser to sign in and save the session
-- `--import-from-browser [BROWSER]` - Reuse a session from a locally signed-in Chromium browser (`chrome`, `chromium`, `brave`, `edge`, `arc`, `vivaldi`, `helium`, `yandex`, `whale`, `auto`). Bare flag picks `auto`, the most recently used browser with a live LinkedIn session.
+- `--import-from-browser [BROWSER]` - Reuse a session from a locally signed-in Chromium browser (`chrome`, `chromium`, `brave`, `edge`, `arc`, `vivaldi`, `helium`, `yandex`, `whale`, `coccoc`, `opera`, `opera_gx`, `auto`). Bare flag picks `auto`, the most recently used browser with a live LinkedIn session.
 - `--auto-import` / `--no-auto-import` - Import a session from a signed-in local browser on the first tool call that needs one, before falling back to manual login (default: on). Skipped in Docker, behind a proxy, and on a non-loopback HTTP bind. On macOS the keychain may prompt once.
 - `--status` - Check whether the stored session is valid, then exit
 - `--logout` - Clear the stored session
@@ -762,7 +836,7 @@ uv run -m linkedin_mcp_server
 **Timeouts:**
 
 - `--timeout MS` - Timeout for a single page operation (default: 5000)
-- `--tool-timeout SECONDS` - Timeout for a whole tool call (default: 180). Raise it for heavy scrapes, slow networks, or a cold-start browser.
+- `--tool-timeout SECONDS` - Timeout for a whole tool call (default: 180). Raise it for calls that read many pages, slow networks, or a cold-start browser.
 - `--login-timeout SECONDS` - How long the login browser waits for you to finish signing in (default: 1800; 0 = no limit). `--login-viewer` ends the session after 30 minutes either way.
 - `--login-inline-wait SECONDS` - How long a tool call waits for a login to finish before telling the model to retry (default: 25, max 45; 0 = return at once)
 
@@ -778,7 +852,7 @@ uv run -m linkedin_mcp_server
 - `--slow-mo MS` - Delay between browser actions (default: 0, useful for debugging)
 - `--viewport WxH` - Viewport size (default: 1280x720). Applies to windowless mode only; a headed launch uses the real window size.
 - `--chrome-path PATH` - Path to a Chrome/Chromium executable
-- `--installer-temp-dir PATH` - Parent directory for temporary files created during browser installation bootstrap (default: system temporary directory). Useful when system %TEMP% ancestry has non-standard ACLs or permissions.
+- `--installer-temp-dir PATH` - Existing directory for browser installation temporary files (environment: `INSTALLER_TEMP_DIR`).
 - `--proxy-server URL` - Route browser traffic through a proxy, as `scheme://host:port`. Set it up **before** `--login`; see [Using a proxy](#using-a-proxy).
 
 **Other:**
@@ -831,9 +905,9 @@ uv run -m linkedin_mcp_server --transport streamable-http --host 127.0.0.1 --por
 </details>
 
 <details>
-<summary>Scraping issues</summary>
+<summary>Tool issues</summary>
 
-- Use `--no-headless` to see browser actions and debug scraping problems
+- Use `--no-headless` to watch the browser when a tool returns wrong or missing data
 - Add `--log-level DEBUG` to see more detailed logging
 
 </details>
@@ -897,6 +971,14 @@ uv run -m linkedin_mcp_server --transport streamable-http --host 127.0.0.1 --por
 >
 > **What if my agents execute too many actions?**
 > Tool calls run sequentially through a queue. You are responsible for the volume of automation you run; use it sparingly and prompt your agents responsibly.
+
+## Contributors
+
+Thanks to everyone who has contributed code, bug reports and fixes.
+
+<a href="https://github.com/stickerdaniel/linkedin-mcp-server/graphs/contributors">
+  <img alt="Contributors to linkedin-mcp-server" src="https://contrib.rocks/image?repo=stickerdaniel/linkedin-mcp-server" />
+</a>
 
 ## Acknowledgements
 

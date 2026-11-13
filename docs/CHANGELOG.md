@@ -5,6 +5,140 @@ described on [GitHub Releases](https://github.com/stickerdaniel/linkedin-mcp-ser
 
 <!-- towncrier release notes start -->
 
+## 4.30.0 (2026-11-13)
+
+### Highlights
+
+- **Mutual connections.** search_people lists a member's connections with `connection_of`. ([#1358](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1358))
+- **Replies by thread id.** reply_to_conversation answers a thread by id, InMail included. ([#1342](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1342))
+- **Copied links work.** Job and company tools take the links LinkedIn shows, with slugs. ([#1437](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1437))
+
+### Features
+
+- reply_to_conversation answers an existing thread by its id, InMail included. ([#1342](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1342))
+- search_people takes connection_of to list a member's connections, e.g. mutual connections. ([#1358](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1358))
+- The server can load optional tools at start. ([#1475](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1475))
+
+### Bug Fixes
+
+- Connection requests now report pending when LinkedIn hides Pending in the More menu. ([#1425](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1425))
+- Job, messaging and post tools refuse invalid input before starting the browser. ([#1429](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1429))
+- --slow-mo 0 now turns off a SLOW_MO set in the environment. ([#1431](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1431))
+- Job tools accept a job search link with currentJobId in place of the job id. ([#1437](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1437))
+- `--port 0` is refused as an invalid port instead of being dropped in favour of 8000. ([#1447](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1447))
+- Invalid LOG_LEVEL now refuses startup instead of silently keeping the default level. ([#1461](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1461))
+- An unreadable HEADLESS, AUTO_IMPORT_FROM_BROWSER or DAEMON_ENABLED now stops startup. ([#1479](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1479))
+- References keep an external link behind /redir/redirect without a trailing slash. ([#1491](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1491))
+- Job tools accept a slugged job link with a period or escaped character in the title. ([#1493](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1493))
+- References keep an escaped ?, # or / in the target of a LinkedIn redirect. ([#1498](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1498))
+- Company tools accept a slug with an ampersand, such as johnson-&-johnson. ([#1500](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1500))
+- An unknown `LINKEDIN_TRACE_MODE` or `LINKEDIN_MCP_CHECK_FOR_UPDATES` value stops startup. ([#1501](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1501))
+- References keep an external link behind /safety/go. ([#1504](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1504))
+- Company tools accept a slug with an apostrophe, such as lowe's-home-improvement. ([#1506](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1506))
+- A job reference is emitted only for a job link that the job tools accept as input. ([#1508](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1508))
+
+
+## 4.29.0 (2026-10-31)
+
+### Highlights
+
+- **Stable error codes.** Failed calls name a code in `_meta` that clients can branch on. ([#1390](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1390))
+- **Usage rules at connect.** Clients get the usage rules as MCP server instructions. ([#1402](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1402))
+- **Crashed pages recover.** A crashed page is replaced instead of failing every later call. ([#1382](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1382))
+
+### Features
+
+- A failed tool call now says when LinkedIn answered HTTP 429 or 999 during it. ([#1264](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1264))
+- MCPB bundle settings can point the server at your own Chrome or Chromium executable. ([#1303](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1303))
+- search_jobs reports why paging stopped, so a caller knows whether more results may exist. ([#1323](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1323))
+- dismiss_job dismisses a job from job search so later searches no longer show it. ([#1326](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1326))
+- New `get_easy_apply_form` tool reads an Easy Apply form's questions without answering. ([#1343](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1343))
+- New `archive_conversation` tool archives a messaging thread by its id, InMail included. ([#1354](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1354))
+- `get_person_profile` and `get_my_profile` can now read a profile's volunteering section. ([#1357](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1357))
+- search_posts can filter by content type, such as uploaded documents. ([#1377](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1377))
+- Failed tool calls name a stable error code in `_meta`, beside the unchanged message. ([#1390](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1390))
+- Add `get_session_status`, which reports the saved session without opening a browser. ([#1392](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1392))
+- The server now sends its usage rules to MCP clients as server instructions. ([#1402](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1402))
+- get_feed pairs a post's permalink with its text excerpt and URN when its markup has one. ([#1409](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1409))
+- Ctrl+V (Cmd+V on a Mac) in the Docker login viewer pastes plain text. ([#1414](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1414))
+
+### Bug Fixes
+
+- search_people refuses a plain-text location and filters by a numeric geo URN id instead. ([#722](https://github.com/stickerdaniel/linkedin-mcp-server/pull/722))
+- search_jobs reports no_matching_jobs when LinkedIn's redesigned search matches nothing. ([#1363](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1363))
+- A crashed browser page is now shut down and replaced instead of failing every later call. ([#1382](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1382))
+- Raise fastmcp to 4.1.3, fixing the M2M OAuth advisory GHSA-vqqp-x5qm-5qp4. ([#1408](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1408))
+- Sidebar "Show all" links off LinkedIn are skipped, and diagnostics hide proxy credentials. ([#1417](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1417))
+
+
+## 4.28.0 (2026-10-23)
+
+### Highlights
+
+- **Claude Code and Cursor plugins.** Install the server and its agent skill in one step. ([#1296](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1296))
+- **Proxy credentials stay private.** Search errors no longer quote them. ([#1375](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1375))
+- **Checkpoints ask for a login.** A checkpoint reached mid-call no longer waits 30 s. ([#1379](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1379))
+
+### Features
+
+- Cursor Marketplace plugin adds one-click install and the linkedin-mcp agent skill. ([#1268](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1268))
+- A shared browser process that stops responding is now named, with its pid, in the error. ([#1295](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1295))
+- Claude Code plugin with the same server and skill as the Codex plugin. ([#1296](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1296))
+- The Codex, Claude Code and Cursor plugins now start the latest server release. ([#1322](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1322))
+
+### Bug Fixes
+
+- Trace directories left behind by killed servers are now removed after 14 days. ([#1297](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1297))
+- Tool calls answered in full are no longer reported as possibly lost. ([#1298](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1298))
+- A newer server now retires an older shared browser that uses other settings. ([#1301](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1301))
+- Browser setup on a busy Mac no longer fails after Chromium installed successfully. ([#1302](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1302))
+- Clients differing only in login settings share one browser; EAGER_FULL_CHROMIUM is gone. ([#1304](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1304))
+- A message confirmed just before the deadline is no longer reported as unconfirmed. ([#1305](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1305))
+- Listing resources or prompts no longer fails while the shared browser is unavailable. ([#1311](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1311))
+- Shared browser startup refuses a file swapped for a named pipe instead of hanging. ([#1317](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1317))
+- Tool calls no longer keep failing on a shared browser built with an incompatible MCP. ([#1327](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1327))
+- A call whose answer was lost no longer reports that the shared browser stopped running. ([#1337](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1337))
+- On a busy Mac, a cleanly closed browser no longer reports that it may still be running. ([#1368](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1368))
+- On a busy Mac, a crashed server's browser is now closed and its profile released. ([#1370](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1370))
+- search_people and search_posts no longer show proxy credentials quoted in an error. ([#1375](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1375))
+- A security checkpoint reached mid-call now asks for a new login instead of a 30 s wait. ([#1379](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1379))
+
+
+## 4.27.0 (2026-10-10)
+
+### Highlights
+
+- **Multi-line messages.** `send_message` sends line breaks and empty lines as one message. ([#1224](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1224))
+- **Apply links.** `get_job_apply_url` returns the apply type and the employer's link. ([#1035](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1035))
+- **Sessions recover.** A profile that lost its cookies gets them back before any page. ([#1251](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1251))
+
+### Features
+
+- get_job_apply_url says how a posting takes applications and gives the employer's URL. ([#1035](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1035))
+- get_saved_jobs takes a stage to read in-progress, applied and archived tracker jobs. ([#1058](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1058))
+- send_message now sends multi-line messages as one message, keeping empty lines. ([#1224](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1224))
+- send_message reports the thread a confirmed message landed in, or null on compose. ([#1243](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1243))
+- get_job_details adds apply: {type} for postings applied to or closed. ([#1249](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1249))
+
+### Bug Fixes
+
+- A browser install no longer fails when its helper processes end late under load. ([#1220](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1220))
+- A profile locked under another host name now says which lock files to remove, and when. ([#1228](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1228))
+- A browser install whose size limit was exceeded is now refused even if it exits cleanly. ([#1229](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1229))
+- The CLI now says that Ctrl+Z does not pause a browser download. ([#1230](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1230))
+- Logout no longer deletes a session another client signed in with while it waited. ([#1231](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1231))
+- A lost shared browser now tells clients to reconnect instead of an internal error. ([#1232](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1232))
+- send_message now reports an unconfirmed send instead of a bare timeout error. ([#1233](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1233))
+- A cancelled job search no longer keeps scrolling its results in the shared page. ([#1234](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1234))
+- Tools now refuse a page that ended up off LinkedIn instead of reading it as LinkedIn's. ([#1235](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1235))
+- A browser that stopped is shut down, and the next tool call starts a new one. ([#1240](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1240))
+- A feed navigation is timed from the request, and one that is never sent still ends. ([#1245](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1245))
+- get_job_apply_url reads an Easy Apply that LinkedIn now renders as a button. ([#1250](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1250))
+- A profile that opens without its saved cookies loads them before the first page. ([#1251](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1251))
+- Exclude new-message compose destinations from conversation references and thread IDs. ([#1255](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1255))
+- search_jobs keeps the pages it has when a slow page reaches the end of its time budget. ([#1261](https://github.com/stickerdaniel/linkedin-mcp-server/pull/1261))
+
+
 ## 4.26.2 (2026-10-03)
 
 ### Breaking Changes

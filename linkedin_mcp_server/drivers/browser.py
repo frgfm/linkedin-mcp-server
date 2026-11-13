@@ -11,7 +11,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping, Sequence
 from typing import Any, TypeVar
 
 from linkedin_mcp_server.common_utils import harden_linkedin_tree, secure_mkdir
@@ -358,6 +358,47 @@ async def _close_holding_back_cancels(browser: BrowserManager) -> tuple[bool, bo
     return await await_deferring_cancels(browser.close())
 
 
+def _jar_has_linkedin_session(cookies: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether *cookies* holds an ``li_at`` on LinkedIn's own domain."""
+    for cookie in cookies:
+        domain = cookie.get("domain") or ""
+        if cookie.get("name") == "li_at" and (
+            domain == "linkedin.com" or domain.endswith(".linkedin.com")
+        ):
+            return True
+    return False
+
+
+async def _restore_portable_session_if_the_store_lost_it(
+    browser: BrowserManager, profile_dir: Path
+) -> None:
+    """Load ``cookies.json`` when the profile store opened without a session.
+
+    The store is SQLite. A browser that exits while its journal is still hot
+    rolls that journal back on the next open, and the jar comes up empty. The
+    portable file sits beside the profile and is not part of that rollback, but
+    this path otherwise trusts the store alone. The close then exports the
+    empty jar over the file, and the session is gone for good. Measured on
+    Windows CI: the file and the store both held the staged ``li_at`` after
+    staging, every request of the next browser carried none, and the close
+    wrote zero cookies.
+
+    A jar that already has ``li_at`` is left alone, so a session newer than
+    the file is not replaced by it. An empty file is the logged-out state and
+    imports as a no-op.
+    """
+    cookie_path = portable_cookie_path(profile_dir)
+    if not cookie_path.is_file():
+        return
+    if _jar_has_linkedin_session(await browser.context.cookies()):
+        return
+    if await browser.import_cookies(cookie_path):
+        logger.info(
+            "Restored the portable session into %s; its store had no li_at",
+            profile_dir,
+        )
+
+
 async def _authenticate_existing_profile(
     profile_dir: Path,
     *,
@@ -371,6 +412,10 @@ async def _authenticate_existing_profile(
     )
     try:
         await browser.start()
+        # Before the feed check, which is itself a navigation. A store that
+        # rolled back is empty from the first request, and that request is
+        # what the close would then export over the portable file.
+        await _restore_portable_session_if_the_store_lost_it(browser, profile_dir)
         if not await _feed_auth_succeeds(browser):
             raise AuthenticationError(
                 f"Stored runtime profile is invalid: {profile_dir}. "
@@ -1062,10 +1107,28 @@ async def check_rate_limit() -> None:
     Should be called after navigation to detect if LinkedIn is blocking requests.
 
     Raises:
+        AuthenticationError: If the page is a login or challenge route
+        AccountRestrictedError: If the page is the account-restriction route
         RateLimitError: If rate limiting is detected
     """
     browser = await get_or_create_browser()
     await detect_rate_limit(browser.page)
+
+
+def browser_activity() -> dict[str, Any]:
+    """This process's browser as module state records it, without touching one.
+
+    ``idle_seconds`` is ``None`` until a call has ended, as for the idle timer.
+    """
+    idle = None if _last_activity is None else time.monotonic() - _last_activity
+    return {
+        "manager_present": _browser is not None,
+        "page_crashed": _browser.page_crashed if _browser is not None else None,
+        "lifecycle_busy": _browser_lifecycle_lock.locked(),
+        "lease_retained": _browser_lease is not None,
+        "idle_seconds": None if idle is None else round(idle, 1),
+        "calls_in_flight": _calls_in_flight,
+    }
 
 
 def note_call_started() -> None:

@@ -15,7 +15,9 @@ is the failure it exists to expose, so a skipped case is counted, not dropped.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import platform as _platform
 import shutil
 import sys
@@ -210,6 +212,9 @@ EXPERIMENTS = frozenset({"K0", "K1", "K2", "K3"})
 #: them apart so a unit pass never stands in for a missing native one.
 COLUMNS = frozenset({"unit", "integrated", "manual"})
 
+#: What kind of evidence each column is, as a packet's node records label it.
+EVIDENCE = {"unit": "source-model", "integrated": "native", "manual": "manual"}
+
 STATUSES = ("executed", "skipped", "failed")
 
 
@@ -314,9 +319,15 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 @dataclass
 class Counts:
-    """Executed, skipped and failed cases per experiment, row, platform, column."""
+    """Executed, skipped and failed cases per experiment, row, platform, column.
+
+    A case recorded with its *node* id is also kept whole under ``nodes``, with
+    its evidence label and, for a skip, its reason: a count says how many cells
+    ran, the nodes say which tests they were and why one did not.
+    """
 
     _cells: Counter[tuple[str, str, str, str, str]] = field(default_factory=Counter)
+    _nodes: list[dict[str, Any]] = field(default_factory=list)
 
     def record(
         self,
@@ -326,6 +337,8 @@ class Counts:
         column: str,
         status: str,
         platform: str | None = None,
+        node: str | None = None,
+        reason: str | None = None,
     ) -> None:
         if experiment not in EXPERIMENTS:
             raise ValueError(f"unknown experiment {experiment!r}")
@@ -333,8 +346,21 @@ class Counts:
             raise ValueError(f"unknown column {column!r}")
         if status not in STATUSES:
             raise ValueError(f"unknown status {status!r}")
-        key = (experiment, row, platform or current_platform(), column, status)
-        self._cells[key] += 1
+        platform = platform or current_platform()
+        self._cells[(experiment, row, platform, column, status)] += 1
+        if node is not None:
+            self._nodes.append(
+                {
+                    "node": node,
+                    "experiment": experiment,
+                    "row": row,
+                    "platform": platform,
+                    "column": column,
+                    "evidence": EVIDENCE[column],
+                    "status": status,
+                    "reason": reason,
+                }
+            )
 
     def __bool__(self) -> bool:
         return bool(self._cells)
@@ -360,11 +386,111 @@ class Counts:
 
     def write(self, directory: Path) -> Path:
         path = directory / COUNTS_FILE
+        nodes = sorted(self._nodes, key=lambda n: (n["node"], n["experiment"]))
         path.write_text(
-            json.dumps({"cases": self.as_rows()}, indent=2, sort_keys=True) + "\n",
+            json.dumps(
+                {"cases": self.as_rows(), "nodes": nodes}, indent=2, sort_keys=True
+            )
+            + "\n",
             encoding="utf-8",
         )
         return path
+
+
+#: Every line an actor wrote, whole, one file per actor beside the row's other
+#: evidence. The event log carries the same lines one record each, which is
+#: the form a gate reads and the wrong one for following a single process; for
+#: the owner it carries only the last lines of its log, and
+#: ``OWNER_LOG_FILE`` is the whole of it. On Windows CI they hold Patchright's
+#: driver log too, which is where a browser's exit code is written
+#: (``DEBUG=pw:browser``).
+OUTPUT_FILES = {"frontend": "frontend.stderr", "cli": "cli.output"}
+OWNER_LOG_FILE = "owner.log"
+
+#: Per file. A driver logging every line its browser prints is a stream
+#: nothing else here bounds, and the runner's disk is shared with the rows.
+#: The head is what is kept. The browser's own output is the bulk; the
+#: driver's launch, exit, close and kill lines are recorded in the event log
+#: too (``harness.driver_lifecycle``), which is where an exit that arrives
+#: after the cap still is.
+OUTPUT_CAP_BYTES = 4 * 1024 * 1024
+
+
+def _truncated(cap: int, total: int | None = None) -> str:
+    size = f" of {total}" if total is not None else ""
+    return (
+        f"[truncated by the differential harness: the first {cap} bytes{size} "
+        f"are kept, the rest is not]\n"
+    )
+
+
+class CappedOutput:
+    """Lines appended to one file until *cap* bytes, then one marker.
+
+    Written as they arrive, so a row that never reaches its teardown still
+    leaves what its actors said. Evidence and never a verdict: a write that
+    fails is dropped, and the row goes on as it would have without it.
+    """
+
+    def __init__(self, path: Path, cap: int | None = None):
+        self.path = path
+        self.cap = OUTPUT_CAP_BYTES if cap is None else cap
+        self._written = 0
+        self._full = False
+        self._lock = threading.Lock()
+
+    def line(self, text: str) -> None:
+        data = (text + "\n").encode("utf-8", errors="replace")
+        with self._lock:
+            if self._full:
+                return
+            if self._written + len(data) > self.cap:
+                self._full = True
+                data = _truncated(self.cap).encode()
+            else:
+                self._written += len(data)
+            with contextlib.suppress(OSError):
+                with self.path.open("ab") as handle:
+                    handle.write(data)
+
+
+def keep_capped(source: Path, destination: Path, cap: int | None = None) -> bool:
+    """Copy *source* to *destination*, at most *cap* bytes.
+
+    A log that fits is copied whole. A longer one keeps the first half of the
+    budget and the last half, with a marker between them, because the line
+    that matters can be at either end: a browser that dies on launch writes
+    its exit first, and one that dies late writes it last. False when there
+    was nothing to read; like ``CappedOutput``, a failure is evidence lost
+    and nothing else."""
+    cap = OUTPUT_CAP_BYTES if cap is None else cap
+    head_cap = cap // 2
+    try:
+        with source.open("rb") as handle:
+            # The whole log when it fits. Reading only the first half would
+            # drop the rest of a log between half and the whole budget, and
+            # drop it silently, with no marker.
+            head = handle.read(cap)
+            total = os.fstat(handle.fileno()).st_size
+            tail = b""
+            if total > cap:
+                head = head[:head_cap]
+                handle.seek(max(head_cap, total - (cap - head_cap)))
+                tail = handle.read()
+    except OSError:
+        return False
+    with contextlib.suppress(OSError):
+        with destination.open("wb") as handle:
+            handle.write(head)
+            if tail:
+                marker = (
+                    f"[truncated by the differential harness: the first {head_cap} bytes "
+                    f"of {total} are kept, and its last {len(tail)}, the middle "
+                    f"is not]\n"
+                )
+                handle.write(b"\n" + marker.encode())
+                handle.write(tail)
+    return True
 
 
 #: What an evidence packet may contain, by file name. Everything else in the
@@ -379,6 +505,9 @@ PUBLISHED_FILES = frozenset(
         "failures.json",
         "watcher.jsonl",
         "watcher.stderr",
+        # What the actors wrote, whole and capped (``OUTPUT_FILES``).
+        *OUTPUT_FILES.values(),
+        OWNER_LOG_FILE,
         # The signal oracle's own output: syscalls and targets, no environment.
         "strace.txt",
         "strace.stderr",
@@ -394,6 +523,9 @@ PUBLISHED_FILES = frozenset(
         "first-navigation.json",
         "browser-lifetimes.json",
         "cookie-lineage.json",
+        # K2's source-model witnesses at the pin, judged per node
+        # (``frozen_witnesses``).
+        "witnesses.json",
     }
 )
 

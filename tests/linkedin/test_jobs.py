@@ -11,7 +11,10 @@ import pytest
 from patchright.async_api import Error as PatchrightError
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from linkedin_mcp_server.core.exceptions import AuthenticationError
+from linkedin_mcp_server.core.exceptions import (
+    AuthenticationError,
+    LinkedInOperationError,
+)
 from linkedin_mcp_server.linkedin import jobs as jobs_module
 from linkedin_mcp_server.linkedin.capture import (
     CaptureMode,
@@ -24,10 +27,13 @@ from linkedin_mcp_server.linkedin.contracts import (
     ExtractedSection,
 )
 from linkedin_mcp_server.linkedin.job_pages import (
+    EasyApplyDraftLeftError,
+    EasyApplyFormRead,
     JobApplyRead,
     JobPageCapture,
     JobPageReader,
 )
+from linkedin_mcp_server.linkedin.job_policy import easy_apply_draft_section_error
 from linkedin_mcp_server.linkedin.jobs import JobReader
 from linkedin_mcp_server.linkedin.link_metadata import Reference
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
@@ -125,6 +131,56 @@ class TestReadJob:
 
         assert result["sections"] == {}
         assert "references" not in result
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            ("Application status\nApplication submitted\n2 days ago", "applied"),
+            ("Applied 3 days ago", "applied"),
+            ("No longer accepting applications", "closed"),
+            ("Not currently accepting applications", "closed"),
+        ],
+    )
+    async def test_a_posting_state_is_read_above_the_description(
+        self, mock_page, state, expected
+    ):
+        reader = _reader(mock_page)
+        text = f"Applied AI Engineer\nAcme\n{state}\nAbout the job\nBuild agents."
+        with patch.object(
+            reader._capture,
+            "capture",
+            new_callable=AsyncMock,
+            return_value=extracted(text),
+        ):
+            result = await reader.read_job("12345")
+
+        assert result["apply"] == {"type": expected}
+        assert result["sections"]["job_posting"] == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # Open: the title opens with "Applied", which is not a state line.
+            "Applied AI Engineer\nAcme\nApply\nAbout the job\nBuild agents.",
+            # The same words below the heading belong to the description or to
+            # a "More jobs" card.
+            "Engineer\nAbout the job\nApplied 3 days ago\n"
+            "No longer accepting applications",
+            # No heading, so no boundary to trust a line above.
+            "Engineer\nNo longer accepting applications\nBuild agents.",
+        ],
+    )
+    async def test_no_posting_state_is_claimed_without_one(self, mock_page, text):
+        reader = _reader(mock_page)
+        with patch.object(
+            reader._capture,
+            "capture",
+            new_callable=AsyncMock,
+            return_value=extracted(text),
+        ):
+            result = await reader.read_job("12345")
+
+        assert "apply" not in result
 
     async def test_jobs_a_posting_links_to_are_labelled_similar(self, mock_page):
         """The posting's own link and its "More jobs" cards are both jobs.
@@ -239,6 +295,74 @@ class TestGetJobApplyUrl:
         with self._reading(reader, side_effect=AuthenticationError("expired")):
             with pytest.raises(AuthenticationError):
                 await reader.get_job_apply_url("12345")
+
+
+class TestGetEasyApplyForm:
+    URL = "https://www.linkedin.com/jobs/view/12345/"
+    STEP = {
+        "heading": "Contact info",
+        "progress": 0,
+        "fields": [{"label": "First name", "type": "text", "required": True}],
+    }
+
+    @staticmethod
+    def _reading(reader, **kwargs):
+        return patch.object(
+            reader._pages, "read_easy_apply_form", new_callable=AsyncMock, **kwargs
+        )
+
+    async def test_an_easy_apply_posting_answers_with_its_steps(self, mock_page):
+        reader = _reader(mock_page)
+        read = EasyApplyFormRead("easy_apply", (self.STEP,), complete=False)
+        with self._reading(reader, return_value=read) as read_form:
+            result = await reader.get_easy_apply_form("12345")
+
+        read_form.assert_awaited_once_with(self.URL, "12345", JOB_APPLY_EN_US)
+        assert result == {
+            "url": self.URL,
+            "apply": {"type": "easy_apply"},
+            "form": {"steps": [self.STEP], "complete": False},
+        }
+
+    async def test_any_other_posting_carries_its_type_alone(self, mock_page):
+        reader = _reader(mock_page)
+        with self._reading(reader, return_value=EasyApplyFormRead("closed")):
+            result = await reader.get_easy_apply_form("12345")
+
+        assert result == {"url": self.URL, "apply": {"type": "closed"}}
+
+    async def test_a_draft_left_behind_is_reported_beside_the_form(self, mock_page):
+        reader = _reader(mock_page)
+        read = EasyApplyFormRead("easy_apply", (self.STEP,), True, discarded=False)
+        with self._reading(reader, return_value=read):
+            result = await reader.get_easy_apply_form("12345")
+
+        assert result["form"]["steps"] == [self.STEP]
+        assert result["section_errors"]["form"]["error_type"] == "easy_apply_draft_left"
+
+    async def test_a_failed_read_is_a_section_error_and_no_form(self, mock_page):
+        reader = _reader(mock_page)
+        with self._reading(reader, side_effect=RuntimeError("dialog did not open")):
+            result = await reader.get_easy_apply_form("12345")
+
+        assert "form" not in result and "apply" not in result
+        assert "form" in result["section_errors"]
+
+    async def test_a_failed_read_that_leaves_a_draft_says_so(self, mock_page):
+        reader = _reader(mock_page)
+        error = EasyApplyDraftLeftError("draft left")
+        error.__cause__ = RuntimeError("dialog closed while it was read")
+        with self._reading(reader, side_effect=error):
+            result = await reader.get_easy_apply_form("12345")
+
+        assert "form" not in result and "apply" not in result
+        assert result["section_errors"] == {"form": easy_apply_draft_section_error()}
+
+    async def test_an_expired_session_reaches_the_relogin_path(self, mock_page):
+        reader = _reader(mock_page)
+        with self._reading(reader, side_effect=AuthenticationError("expired")):
+            with pytest.raises(AuthenticationError):
+                await reader.get_easy_apply_form("12345")
 
 
 class TestSearchJobs:
@@ -660,6 +784,11 @@ class TestSearchJobs:
         # start=30, which is exactly what a stride regression would produce.
         page2 = parse_qs(urlparse(urls_visited[1]).query)
         assert page2["start"] == ["3"]  # page 1 rendered three cards
+        assert result["pagination"] == {
+            "pages_fetched": 2,
+            "next_offset": 5,
+            "reason": "max_pages",
+        }
 
     async def test_references_keep_all_jobs_beyond_the_per_section_cap(self, mock_page):
         reader = _reader(mock_page)
@@ -825,6 +954,9 @@ class TestSearchJobs:
         error = result["section_errors"]["search_results"]
         assert error["error_type"] == "filters_dropped"
         assert "location" in error["error_message"]
+        # A warning about the results kept, not a failure: the search still
+        # says why it stopped.
+        assert result["pagination"]["reason"] == "max_pages"
 
     @pytest.mark.parametrize(
         "lands_on,expected_dropped",
@@ -939,6 +1071,8 @@ class TestSearchJobs:
         message = result["section_errors"]["search_results"]["error_message"]
         assert "location" in message
         assert RATE_LIMITED_SECTION_TEXT in message
+        # Page one was kept, and the list still ends on a failure.
+        assert "pagination" not in result
 
     async def test_a_search_answered_for_something_else_stops_the_loop(self, mock_page):
         """The route can be right and the offset right while the query is gone.
@@ -1181,6 +1315,7 @@ class TestSearchJobs:
             result["section_errors"]["search_results"]["error_type"]
             == "pagination_stopped"
         )
+        assert "pagination" not in result
 
     async def test_no_new_id_page_can_upgrade_duplicate_metadata(self, mock_page):
         """The stopping page still contributes richer duplicate metadata."""
@@ -1264,6 +1399,11 @@ class TestSearchJobs:
                 },
             ]
         }
+        assert result["pagination"] == {
+            "pages_fetched": 2,
+            "next_offset": 4,
+            "reason": "no_new_ids",
+        }
 
     async def test_stops_once_past_the_advertised_results(self, mock_page):
         """Stop when the offset passes the last result LinkedIn advertises.
@@ -1307,6 +1447,11 @@ class TestSearchJobs:
         assert mock_extract.await_count == 1
         assert mock_total_pages.await_count == 1
         assert result["job_ids"] == [str(i) for i in range(25)]
+        assert result["pagination"] == {
+            "pages_fetched": 1,
+            "next_offset": 25,
+            "reason": "complete",
+        }
 
     async def test_the_scroll_budget_is_spent_and_not_divided(self, mock_page):
         """Asking for more pages must not shorten the first one.
@@ -1492,6 +1637,11 @@ class TestSearchJobs:
         # Seven pages end at 142.9s; an eighth would need 163.6s.
         assert len(seen) == 7
         assert result["job_ids"] == [jid for page in pages[:7] for jid in page]
+        assert result["pagination"] == {
+            "pages_fetched": 7,
+            "next_offset": 70,
+            "reason": "time_budget",
+        }
 
     async def test_the_next_navigation_delay_is_part_of_the_prediction(self, mock_page):
         """The guard budgets the delay before a page, not just the page.
@@ -1555,6 +1705,57 @@ class TestSearchJobs:
         assert len(seen) == 6
         assert result["job_ids"] == [jid for page in pages[:6] for jid in page]
 
+    async def test_every_page_is_handed_the_end_of_the_budget(self, mock_page):
+        """The prediction admits a page; the deadline is what bounds it.
+
+        An admitted page otherwise runs to its own timeouts, `goto` alone 30s,
+        and a page that overruns the reserve has the tool cancelled with every
+        page before it discarded. The same absolute end for every page, taken
+        from when the search started rather than when the page did.
+        """
+
+        class Clock:
+            def __init__(self) -> None:
+                self.now = 7.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        clock = Clock()
+        reader = _reader(mock_page)
+        seen: list[float | None] = []
+
+        async def read_page(url, section_name, page_deadline=None, **kwargs):
+            seen.append(page_deadline)
+            navigate(mock_page, url)
+            clock.now += 6.5
+            return captured(mock_page, extracted("Job results"))
+
+        with (
+            patch.object(jobs_module, "time", clock),
+            patch.object(reader._pages, "_extract_search_page", side_effect=read_page),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                side_effect=[["1", "2"], ["3", "4"]],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            # A 40s budget from t=7.
+            await reader.search_jobs("python", max_pages=2, tool_timeout=50)
+
+        assert seen == [47.0, 47.0]
+
     async def test_zero_max_pages_fetches_nothing(self, mock_page):
         """max_pages=0 should fetch zero pages (validation at tool boundary)."""
         reader = _reader(mock_page)
@@ -1586,6 +1787,11 @@ class TestSearchJobs:
 
         assert result["job_ids"] == []
         assert mock_extract.await_count == 0
+        assert result["pagination"] == {
+            "pages_fetched": 0,
+            "next_offset": 0,
+            "reason": "max_pages",
+        }
 
     async def test_single_page(self, mock_page):
         """max_pages=1 should only visit one page; filters appear in URL."""
@@ -1701,6 +1907,11 @@ class TestSearchJobs:
         assert result["sections"] == {}
         # Empty text should skip ID extraction to avoid stale DOM
         mock_ids.assert_not_awaited()
+        assert result["pagination"] == {
+            "pages_fetched": 1,
+            "next_offset": 0,
+            "reason": "complete",
+        }
 
     async def test_empty_redesign_page_reports_dropped_keywords(self, mock_page):
         """An empty destination must still prove it answered the question.
@@ -1922,6 +2133,98 @@ class TestSearchJobs:
         assert "founder's associate" in error["error_message"]
         mock_ids.assert_not_awaited()
         assert mock_extract.await_count == 1
+        assert result["pagination"] == {
+            "pages_fetched": 1,
+            "next_offset": 0,
+            "reason": "complete",
+        }
+
+    _NOTICE = (
+        "We found more results related to your search that may not be exact "
+        "matches, but could still be a great fit."
+    )
+
+    async def _search_redesigned(self, mock_page, organic):
+        """One redesigned page holding the notice, with `organic` above it.
+
+        `organic` is what the DOM read answers, or an exception it raises.
+        """
+        reader = _reader(mock_page)
+        page = extracted(
+            f"99+ results\nParis (80 km)\nTransformation Success Engineer\n"
+            f"Promoted\n{self._NOTICE}\nData Engineer - F/H"
+        )
+        count_kwargs = (
+            {"side_effect": organic}
+            if isinstance(organic, Exception)
+            else {"return_value": organic}
+        )
+        with (
+            patch.object(
+                reader._pages,
+                "_extract_search_page",
+                side_effect=self._navigating(mock_page, [page] * 2),
+            ) as mock_extract,
+            patch.object(
+                reader._pages,
+                "_count_organic_before_notice",
+                new_callable=AsyncMock,
+                **count_kwargs,
+            ) as mock_count,
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["4458422026", "4458003726"],
+            ) as mock_ids,
+            patch.object(
+                reader._pages,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await reader.search_jobs("qzxvwk plorbnaut", max_pages=1)
+        mock_count.assert_awaited_with(self._NOTICE, "Promoted")
+        return result, mock_extract, mock_ids
+
+    async def test_nothing_but_ads_above_the_notice_is_no_match(self, mock_page):
+        """The redesigned search's answer to a query matching nothing.
+
+        It has no no-match page: the promoted cards, the notice, then a page
+        of unrelated postings under "99+ results". Read as a result page, they
+        came back as `job_ids` with nothing to say they were not matches.
+        """
+        result, mock_extract, mock_ids = await self._search_redesigned(mock_page, 0)
+
+        assert result["job_ids"] == []
+        assert result["sections"] == {}
+        error = result["section_errors"]["search_results"]
+        assert error["error_type"] == "no_matching_jobs"
+        assert "qzxvwk plorbnaut" in error["error_message"]
+        mock_ids.assert_not_awaited()
+        assert mock_extract.await_count == 1
+
+    async def test_matches_above_the_notice_keep_the_page(self, mock_page):
+        """The notice also ends a short list of real matches."""
+        result, _, mock_ids = await self._search_redesigned(mock_page, 24)
+
+        assert result["job_ids"] == ["4458422026", "4458003726"]
+        assert "section_errors" not in result
+        mock_ids.assert_awaited()
+
+    async def test_a_failed_read_above_the_notice_keeps_the_page(self, mock_page):
+        """Zero would discard real matches, so a failed read is not zero."""
+        result, _, _ = await self._search_redesigned(
+            mock_page, TypeError("Organic results read returned str")
+        )
+
+        assert result["job_ids"] == ["4458422026", "4458003726"]
+        assert "section_errors" not in result
 
     async def test_recommendations_after_real_results_end_the_list(self, mock_page):
         """Past a page of matches, the substitute page is just the end.
@@ -1966,6 +2269,11 @@ class TestSearchJobs:
         assert "section_errors" not in result
         assert mock_ids.await_count == 1
         assert mock_extract.await_count == 2
+        assert result["pagination"] == {
+            "pages_fetched": 2,
+            "next_offset": 1,
+            "reason": "complete",
+        }
 
     async def test_discarded_recommendations_do_not_warn_about_filters(self, mock_page):
         """A dropped filter on the discarded substitute page changes no result."""
@@ -2250,6 +2558,128 @@ class TestSearchJobs:
         assert mock_promoted.await_count == 2
         assert "promoted_job_ids" not in result
 
+    async def test_reads_the_requested_stage(self, mock_page):
+        reader = _reader(mock_page)
+        urls_visited: list[str] = []
+        navigate = self._navigating(mock_page, [extracted("Applied Job 1")])
+
+        async def mock_extract(url, *args, **kwargs):
+            urls_visited.append(url)
+            return await navigate(url)
+
+        with (
+            patch.object(
+                reader._pages, "_extract_saved_jobs_page", side_effect=mock_extract
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["111"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_list_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await reader.get_saved_jobs(max_pages=1, stage="applied")
+
+        assert urls_visited == ["https://www.linkedin.com/jobs-tracker/?stage=applied"]
+        assert result["job_ids"] == ["111"]
+
+    async def test_a_dropped_stage_is_reported_not_returned(self, mock_page):
+        """A tracker that lost ``?stage=`` shows the saved tab.
+
+        Returning it would hand saved jobs back as applied ones.
+        """
+        reader = _reader(mock_page)
+        with (
+            patch.object(
+                reader._pages,
+                "_extract_saved_jobs_page",
+                side_effect=self._navigating(
+                    mock_page,
+                    [extracted("Saved Job 1")],
+                    lands_on="https://www.linkedin.com/jobs-tracker/",
+                ),
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["111"],
+            ) as mock_ids,
+            patch.object(
+                reader._pages,
+                "_get_total_list_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(
+                reader._navigator, "_raise_if_auth_barrier", new_callable=AsyncMock
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await reader.get_saved_jobs(max_pages=1, stage="applied")
+
+        assert result["job_ids"] == []
+        assert result["sections"] == {}
+        assert "saved_jobs" in result["section_errors"]
+        mock_ids.assert_not_awaited()
+
+    async def test_a_stage_lost_while_counting_pages_is_not_returned(self, mock_page):
+        """The page count is read after the landing check, and can move the page.
+
+        On page one there is no ``start`` for the offset check to fail on, so
+        only the stage says the saved tab is now the one being read.
+        """
+        reader = _reader(mock_page)
+
+        async def count_pages_and_move():
+            mock_page.url = "https://www.linkedin.com/jobs-tracker/"
+            return None
+
+        with (
+            patch.object(
+                reader._pages,
+                "_extract_saved_jobs_page",
+                side_effect=self._navigating(mock_page, [extracted("Applied Job 1")]),
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["111"],
+            ) as mock_ids,
+            patch.object(
+                reader._pages,
+                "_get_total_list_pages",
+                side_effect=count_pages_and_move,
+            ),
+            patch.object(
+                reader._navigator, "_raise_if_auth_barrier", new_callable=AsyncMock
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await reader.get_saved_jobs(max_pages=1, stage="applied")
+
+        assert result["job_ids"] == []
+        assert result["sections"] == {}
+        assert "saved_jobs" in result["section_errors"]
+        mock_ids.assert_not_awaited()
+
     async def test_a_login_redirect_raises_an_auth_error(self, mock_page):
         """A login wall reached mid-search is an expired session.
 
@@ -2354,6 +2784,7 @@ class TestSearchJobs:
         assert "search_results" not in result["sections"]
         assert "references" not in result
         assert "search_results" in result["section_errors"]
+        assert "pagination" not in result
 
     async def test_rate_limited_skips_ids_and_text(self, mock_page):
         """Rate-limited pages should yield no IDs or text."""
@@ -2388,6 +2819,7 @@ class TestSearchJobs:
         assert result["sections"] == {}
         assert result["section_errors"]["search_results"]["error_type"] == "rate_limit"
         mock_ids.assert_not_awaited()
+        assert "pagination" not in result
 
     async def test_rate_limit_wins_over_an_unexpected_landing(self, mock_page):
         """The specific diagnosis survives a simultaneous route failure."""
@@ -2519,7 +2951,7 @@ class TestGetSavedJobs:
 
     @pytest.fixture(autouse=True)
     def _set_saved_jobs_url(self, mock_page):
-        mock_page.url = "https://www.linkedin.com/my-items/saved-jobs/"
+        mock_page.url = "https://www.linkedin.com/jobs-tracker/?stage=saved"
 
     @staticmethod
     def _navigating(mock_page, texts, *, lands_on=None):
@@ -2567,7 +2999,7 @@ class TestGetSavedJobs:
 
         assert result["job_ids"] == ["111", "222"]
         assert "saved_jobs" in result["sections"]
-        assert result["url"] == "https://www.linkedin.com/my-items/saved-jobs/"
+        assert result["url"] == "https://www.linkedin.com/jobs-tracker/?stage=saved"
 
     async def test_a_foreign_host_is_not_the_saved_jobs_list(self, mock_page):
         """A substring test accepts any origin serving this path.
@@ -2720,9 +3152,9 @@ class TestGetSavedJobs:
 
         assert result["job_ids"] == ["100", "200", "300", "400"]
         assert urls_visited == [
-            "https://www.linkedin.com/my-items/saved-jobs/",
-            "https://www.linkedin.com/my-items/saved-jobs/?start=10",
-            "https://www.linkedin.com/my-items/saved-jobs/?start=20",
+            "https://www.linkedin.com/jobs-tracker/?stage=saved",
+            "https://www.linkedin.com/jobs-tracker/?stage=saved&start=10",
+            "https://www.linkedin.com/jobs-tracker/?stage=saved&start=20",
         ]
 
     async def test_early_stop_no_new_ids(self, mock_page):
@@ -3021,14 +3453,11 @@ class TestGetSavedJobs:
         assert result["sections"]["saved_jobs"] == "first page"
         assert result["section_errors"]["saved_jobs"]["error_type"] == "rate_limit"
 
-    async def test_the_jobs_tracker_redirect_is_the_list(self, mock_page):
-        """LinkedIn answers the saved-jobs URL with a redirect now.
+    async def test_the_tracker_without_a_stage_is_the_saved_list(self, mock_page):
+        """``/jobs-tracker/`` with no ``?stage=`` shows the saved tab.
 
-        Measured on 2026-08-21 against an authenticated profile:
-        ``/my-items/saved-jobs/`` lands on ``/jobs-tracker/``, and the query
-        is dropped on the way, for ``?start=10`` as well. Refusing that
-        destination makes every call return an empty list for every account,
-        which is indistinguishable from having nothing saved.
+        Refusing it would return an empty list whenever LinkedIn drops the
+        parameter, which reads as having nothing saved.
         """
         mock_page.url = "https://www.linkedin.com/jobs-tracker/"
         reader = _reader(mock_page)
@@ -3315,3 +3744,116 @@ class TestGetSavedJobs:
             },
             {"kind": "job", "url": "/jobs/view/200/", "text": "Two"},
         ]
+
+
+class TestDismissJob:
+    """dismiss_job, over a stubbed posting and search page reader."""
+
+    URL = (
+        "https://www.linkedin.com/jobs/search/"
+        "?keywords=Applied+AI+Engineer+Acme&geoId=92000000"
+    )
+
+    @staticmethod
+    def _stub(reader, outcome, *listed, posting=("Applied AI Engineer", "Acme")):
+        title = patch.object(
+            reader._pages,
+            "read_posting_title",
+            new_callable=AsyncMock,
+            return_value=posting,
+        )
+        act = patch.object(
+            reader._pages,
+            "dismiss_search_card",
+            new_callable=AsyncMock,
+            return_value=(outcome, 25),
+        )
+        read = patch.object(
+            reader._pages,
+            "search_lists_job",
+            new_callable=AsyncMock,
+            side_effect=list(listed),
+        )
+        sleep = patch(
+            "linkedin_mcp_server.linkedin.jobs.asyncio.sleep", new_callable=AsyncMock
+        )
+        return title, act, read, sleep
+
+    async def test_dismisses_from_a_worldwide_search_for_the_posting_and_rechecks(
+        self, mock_page
+    ):
+        reader = _reader(mock_page)
+        title, act, read, sleep = self._stub(reader, "dismissed", False)
+        with title as titling, act as acting, read as reading, sleep:
+            result = await reader.dismiss_job("/jobs/view/4400000201/")
+
+        titling.assert_awaited_once_with("4400000201")
+        acting.assert_awaited_once_with(self.URL, "4400000201")
+        reading.assert_awaited_once_with(self.URL, "4400000201", 24)
+        assert result == {
+            "url": self.URL,
+            "job_id": "4400000201",
+            "keywords": "Applied AI Engineer Acme",
+            "dismissed": True,
+            "already_dismissed": False,
+        }
+
+    async def test_a_card_already_in_its_undo_state_is_already_dismissed(
+        self, mock_page
+    ):
+        reader = _reader(mock_page)
+        title, act, read, sleep = self._stub(reader, "already_dismissed")
+        with title, act, read as reading, sleep:
+            result = await reader.dismiss_job("123")
+
+        reading.assert_not_awaited()
+        assert result["already_dismissed"] is True
+
+    async def test_a_job_back_after_a_reload_is_an_error(self, mock_page):
+        reader = _reader(mock_page)
+        title, act, read, sleep = self._stub(reader, "dismissed", True)
+        with title, act, read, sleep:
+            with pytest.raises(LinkedInOperationError, match="back in the search"):
+                await reader.dismiss_job("123")
+
+    async def test_an_absent_job_names_the_search_it_ran(self, mock_page):
+        reader = _reader(mock_page)
+        title, act, read, sleep = self._stub(
+            reader, "absent", posting=("Backend Engineer", "Globex")
+        )
+        with title, act, read, sleep:
+            with pytest.raises(LinkedInOperationError) as raised:
+                await reader.dismiss_job("4400000202")
+
+        message = str(raised.value)
+        assert "worldwide search for 'Backend Engineer Globex'" in message
+        assert "already dismissed" in message
+        assert "first page" in message
+
+    @pytest.mark.parametrize(
+        ("outcome", "message"),
+        [
+            ("no_button", "dismiss button could not be found"),
+            ("not_dismissed", "did not change"),
+        ],
+    )
+    async def test_a_dismissal_that_did_not_happen_is_an_error(
+        self, mock_page, outcome, message
+    ):
+        reader = _reader(mock_page)
+        title, act, read, sleep = self._stub(reader, outcome)
+        with title, act, read as reading, sleep:
+            with pytest.raises(LinkedInOperationError, match=message):
+                await reader.dismiss_job("123")
+
+        reading.assert_not_awaited()
+
+    async def test_an_unreadable_posting_stops_before_any_search(self, mock_page):
+        reader = _reader(mock_page)
+        title, act, read, sleep = self._stub(reader, "dismissed", False)
+        with title as titling, act as acting, read, sleep:
+            titling.side_effect = LinkedInOperationError("never named")
+            with pytest.raises(LinkedInOperationError, match="never named"):
+                await reader.dismiss_job("123")
+
+        acting.assert_not_awaited()

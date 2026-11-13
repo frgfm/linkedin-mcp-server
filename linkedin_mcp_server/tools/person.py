@@ -1,5 +1,5 @@
 """
-LinkedIn person profile scraping tools.
+LinkedIn person profile reading tools.
 
 Uses innerText extraction for resilient profile data capture
 with configurable section selection.
@@ -10,16 +10,17 @@ import logging
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
-from fastmcp.exceptions import ToolError
 from pydantic import BeforeValidator, Field
 
 from linkedin_mcp_server.callbacks import MCPContextProgressCallback
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
-from linkedin_mcp_server.core.exceptions import AuthenticationError
-from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
-from linkedin_mcp_server.error_handler import raise_tool_error
-from linkedin_mcp_server.scraping import parse_person_sections
-from linkedin_mcp_server.scraping.contracts import FilterValidationError
+from linkedin_mcp_server.dependencies import get_ready_extractor, tool_errors
+from linkedin_mcp_server.error_handler import CodedToolError, ErrorCode
+from linkedin_mcp_server.linkedin import parse_person_sections
+from linkedin_mcp_server.linkedin.legacy import _extractor_for as legacy_extractor_for
+from linkedin_mcp_server.linkedin.contracts import FilterValidationError
+from linkedin_mcp_server.linkedin.identifiers import normalize_person_identifier
+from linkedin_mcp_server.linkedin.search_urls import build_people_search_url
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +66,9 @@ def register_person_tools(
         timeout=tool_timeout,
         title="Get Person Profile",
         annotations={"readOnlyHint": True, "openWorldHint": True},
-        tags={"person", "scraping"},
+        tags={"person"},
     )
+    @tool_errors
     async def get_person_profile(
         linkedin_username: str,
         ctx: Context,
@@ -79,11 +81,11 @@ def register_person_tools(
         Args:
             linkedin_username: LinkedIn username (e.g., "stickerdaniel", "williamhgates"). A full profile URL is accepted too and is reduced to the username.
             ctx: FastMCP context for progress reporting
-            sections: Comma-separated list of extra sections to scrape.
+            sections: Comma-separated list of extra sections to read.
                 The main profile page is always included.
-                Available sections: experience, education, interests, honors, languages, certifications, skills, projects, contact_info, posts
+                Available sections: experience, education, interests, honors, volunteering, languages, certifications, skills, projects, contact_info, posts
                 Examples: "experience,education", "contact_info", "skills,projects", "honors,languages", "posts"
-                Default (None) scrapes only the main profile page.
+                Default (None) reads only the main profile page.
             max_scrolls: Maximum pagination attempts per section to load more content.
                 On detail sections (experience, certifications, skills, etc.) this
                 is the max number of "Show more" button clicks. On activity/posts
@@ -95,50 +97,42 @@ def register_person_tools(
 
         Returns:
             Dict with url, sections (name -> raw text or structured payload),
-            and optional references. Sections may be absent if extraction
-            yielded no content for that page. Includes unknown_sections
-            list when unrecognised names are passed.
-
-            The main_profile section is structured (not raw text) with these
-            keys: name, headline, location, profile_picture_url,
-            connection_count, follower_count, mutual_connection_count,
-            main_organization, main_education, about, experience, education.
-            Text fields are None when LinkedIn doesn't render them; counts
-            are None when LinkedIn shows a non-exact value (e.g. "500+"
-            connections). The experience/education lists contain structured
-            entries (title/organization/dates/...). All other sections still
-            return raw innerText for the LLM to parse.
+            and optional references and section_errors. ``main_profile`` is a
+            structured object with profile, organization, education, experience,
+            count and about fields. Other sections remain raw text.
         """
-        try:
-            extractor = await get_ready_extractor(ctx, tool_name="get_person_profile")
-            requested, unknown = parse_person_sections(sections)
+        linkedin_username = normalize_person_identifier(linkedin_username)
+        extractor = await get_ready_extractor(ctx, tool_name="get_person_profile")
+        extractor = legacy_extractor_for(extractor)
+        requested, unknown = parse_person_sections(sections)
 
-            logger.info(
-                "Scraping profile: %s (sections=%s)",
+        logger.info(
+            "Reading profile: %s (sections=%s)",
+            linkedin_username,
+            sections,
+        )
+
+        cb = MCPContextProgressCallback(ctx)
+        legacy = legacy_extractor_for(extractor)
+        if legacy is extractor:
+            result = await extractor.read_person(
                 linkedin_username,
-                sections,
+                requested,
+                callbacks=cb,
+                max_scrolls=max_scrolls,
             )
-
-            cb = MCPContextProgressCallback(ctx)
-            result = await getattr(extractor, "scrape_person")(
+        else:
+            result = await legacy.scrape_person(
                 linkedin_username,
                 requested,
                 callbacks=cb,
                 max_scrolls=max_scrolls,
             )
 
-            if unknown:
-                result["unknown_sections"] = unknown
+        if unknown:
+            result["unknown_sections"] = unknown
 
-            return result
-
-        except AuthenticationError as e:
-            try:
-                await handle_auth_error(e, ctx)
-            except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "get_person_profile")
-        except Exception as e:
-            raise_tool_error(e, "get_person_profile")  # NoReturn
+        return result
 
     @mcp.tool(
         timeout=tool_timeout,
@@ -146,12 +140,14 @@ def register_person_tools(
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"person", "search"},
     )
+    @tool_errors
     async def search_people(
         keywords: str,
         ctx: Context,
         location: str | None = None,
         network: StrList | None = None,
         current_company: str | None = None,
+        connection_of: str | None = None,
     ) -> dict[str, Any]:
         """
         Search for people on LinkedIn.
@@ -159,7 +155,12 @@ def register_person_tools(
         Args:
             keywords: Search keywords (e.g., "software engineer", "recruiter at Google")
             ctx: FastMCP context for progress reporting
-            location: Optional location filter (e.g., "New York", "Remote")
+            location: Optional location filter, as LinkedIn's numeric geo URN
+                id (e.g., "103644278" for the United States). Plain-text place
+                names are silently ignored by LinkedIn and return unfiltered
+                results, so they are refused here. The id is the geoUrn value
+                in the URL of a LinkedIn people search filtered to that place;
+                without one, put the place in keywords instead.
             network: Optional connection-degree filter. Each element is one of
                 "F" (1st-degree), "S" (2nd-degree), "O" (3rd-degree and beyond).
                 Example: ["F"] to only return 1st-degree connections. A single
@@ -173,53 +174,66 @@ def register_person_tools(
                 exposed under references["about"]. For company-wide employee
                 demographics (location/education/function breakdown) plus a
                 slug-based lookup, use get_company_employees instead.
+            connection_of: Optional profile id (e.g. "ACoAAB...") limiting
+                results to that member's connections. Combine with
+                network=["F"] to list the mutual connections you share with
+                them; keywords may be "". Take the id from get_person_profile's
+                "profile_urn"; a vanity name is refused, because LinkedIn
+                ignores it and returns unfiltered results. LinkedIn also
+                drops the filter, without saying so, when the member is
+                3rd-degree or beyond (you share no connections): the result
+                is then your unfiltered network, not an empty list.
 
         Returns:
             Dict with url, sections (name -> raw text), and optional references.
             The LLM should parse the raw text to extract individual people and their profiles.
         """
         try:
-            extractor = await get_ready_extractor(ctx, tool_name="search_people")
-            logger.info(
-                "Searching people: keywords='%s', location='%s', network=%s, current_company='%s'",
+            # The builder refuses a filter LinkedIn would ignore. Doing it here
+            # keeps that refusal off the browser: get_ready_extractor can install
+            # Chromium or rotate a login before this call would have failed.
+            build_people_search_url(
+                keywords,
+                location=location,
+                network=network,
+                current_company=current_company,
+                connection_of=connection_of,
+            )
+        except FilterValidationError as e:
+            raise CodedToolError(str(e), ErrorCode.INVALID_ARGUMENT) from e
+
+        extractor = await get_ready_extractor(ctx, tool_name="search_people")
+        logger.info(
+            "Searching people: keywords='%s', location='%s', network=%s, "
+            "current_company='%s', connection_of='%s'",
+            keywords,
+            location,
+            network,
+            current_company,
+            connection_of,
+        )
+
+        await ctx.report_progress(
+            progress=0, total=100, message="Starting people search"
+        )
+
+        try:
+            result = await extractor.search_people(
                 keywords,
                 location,
-                network,
-                current_company,
+                network=network,
+                current_company=current_company,
+                connection_of=connection_of,
             )
+        except FilterValidationError as e:
+            # Validation messages carry actionable detail; surface
+            # them as ToolError so mask_error_details doesn't reduce
+            # them to "Error calling tool 'search_people'".
+            raise CodedToolError(str(e), ErrorCode.INVALID_ARGUMENT) from e
 
-            await ctx.report_progress(
-                progress=0, total=100, message="Starting people search"
-            )
+        await ctx.report_progress(progress=100, total=100, message="Complete")
 
-            try:
-                result = await extractor.search_people(
-                    keywords,
-                    location,
-                    network=network,
-                    current_company=current_company,
-                )
-            except FilterValidationError as e:
-                # Validation messages carry actionable detail; surface
-                # them as ToolError so mask_error_details doesn't reduce
-                # them to "Error calling tool 'search_people'".
-                raise ToolError(str(e)) from e
-
-            await ctx.report_progress(progress=100, total=100, message="Complete")
-
-            return result
-
-        except ToolError:
-            # Already a properly formatted client-facing error; do not
-            # log it as "Unexpected error" via raise_tool_error.
-            raise
-        except AuthenticationError as e:
-            try:
-                await handle_auth_error(e, ctx)
-            except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "search_people")
-        except Exception as e:
-            raise_tool_error(e, "search_people")  # NoReturn
+        return result
 
     @mcp.tool(
         timeout=tool_timeout,
@@ -227,6 +241,7 @@ def register_person_tools(
         annotations={"destructiveHint": True, "openWorldHint": True},
         tags={"person", "actions"},
     )
+    @tool_errors
     async def connect_with_person(
         linkedin_username: str,
         ctx: Context,
@@ -250,54 +265,54 @@ def register_person_tools(
             note_not_supported, custom_note_limit_reached,
             connected, or accepted.
 
+            ``connected`` means this call submitted the invitation and the
+            re-read profile no longer exposes Connect; it does not mean a
+            1st-degree connection. The ``message`` names the state read after
+            the send, normally pending. ``pending`` means an invitation was
+            already outstanding before the call, and ``accepted`` means an
+            incoming invitation was accepted.
+
             When status is ``custom_note_limit_reached`` LinkedIn rejected
             personalized invite notes because the free note quota for the
             account is exhausted. The ``message`` is the raw Premium dialog
             text read from LinkedIn.
 
             A status of ``outcome_unknown`` comes from the transport rather
-            than the page: the browser process went away with the call in
-            flight, so whether the invitation was sent is unknown. It carries
+            than the page: the call's answer never arrived from the browser
+            process, so whether the invitation was sent is unknown. It carries
             ``retry_safe: False`` and no ``note_sent``; check the profile
             before calling again, because a repeat may invite twice.
         """
-        try:
-            extractor = await get_ready_extractor(ctx, tool_name="connect_with_person")
-            logger.info(
-                "Connecting with person: %s (note=%s)",
-                linkedin_username,
-                note is not None,
-            )
+        linkedin_username = normalize_person_identifier(linkedin_username)
+        extractor = await get_ready_extractor(ctx, tool_name="connect_with_person")
+        logger.info(
+            "Connecting with person: %s (note=%s)",
+            linkedin_username,
+            note is not None,
+        )
 
-            await ctx.report_progress(
-                progress=0,
-                total=100,
-                message="Starting LinkedIn connection flow",
-            )
+        await ctx.report_progress(
+            progress=0,
+            total=100,
+            message="Starting LinkedIn connection flow",
+        )
 
-            result = await extractor.connect_with_person(
-                linkedin_username,
-                note=note,
-            )
+        result = await extractor.connect_with_person(
+            linkedin_username,
+            note=note,
+        )
 
-            await ctx.report_progress(progress=100, total=100, message="Complete")
+        await ctx.report_progress(progress=100, total=100, message="Complete")
 
-            return result
-
-        except AuthenticationError as e:
-            try:
-                await handle_auth_error(e, ctx)
-            except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "connect_with_person")
-        except Exception as e:
-            raise_tool_error(e, "connect_with_person")  # NoReturn
+        return result
 
     @mcp.tool(
         timeout=tool_timeout,
         title="Get Sidebar Profiles",
         annotations={"readOnlyHint": True, "openWorldHint": True},
-        tags={"person", "scraping"},
+        tags={"person"},
     )
+    @tool_errors
     async def get_sidebar_profiles(
         linkedin_username: str,
         ctx: Context,
@@ -311,7 +326,7 @@ def register_person_tools(
         linkedin.com/premium are skipped.
 
         Args:
-            linkedin_username: LinkedIn username of the profile page to scrape; a full profile URL is accepted too
+            linkedin_username: LinkedIn username of the profile page to read; a full profile URL is accepted too
                 (e.g., "stickerdaniel", "williamhgates")
             ctx: FastMCP context for progress reporting
 
@@ -319,34 +334,27 @@ def register_person_tools(
             Dict with url and sidebar_profiles mapping section key to a list of
             /in/username/ paths. Only sections present on the page are included.
         """
-        try:
-            extractor = await get_ready_extractor(ctx, tool_name="get_sidebar_profiles")
-            logger.info("Getting sidebar profiles for: %s", linkedin_username)
+        linkedin_username = normalize_person_identifier(linkedin_username)
+        extractor = await get_ready_extractor(ctx, tool_name="get_sidebar_profiles")
+        logger.info("Getting sidebar profiles for: %s", linkedin_username)
 
-            await ctx.report_progress(
-                progress=0, total=100, message="Extracting sidebar profiles"
-            )
+        await ctx.report_progress(
+            progress=0, total=100, message="Extracting sidebar profiles"
+        )
 
-            result = await extractor.get_sidebar_profiles(linkedin_username)
+        result = await extractor.get_sidebar_profiles(linkedin_username)
 
-            await ctx.report_progress(progress=100, total=100, message="Complete")
+        await ctx.report_progress(progress=100, total=100, message="Complete")
 
-            return result
-
-        except AuthenticationError as e:
-            try:
-                await handle_auth_error(e, ctx)
-            except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "get_sidebar_profiles")
-        except Exception as e:
-            raise_tool_error(e, "get_sidebar_profiles")  # NoReturn
+        return result
 
     @mcp.tool(
         timeout=tool_timeout,
         title="Get My Profile",
         annotations={"readOnlyHint": True, "openWorldHint": True},
-        tags={"person", "scraping"},
+        tags={"person"},
     )
+    @tool_errors
     async def get_my_profile(
         ctx: Context,
         sections: str | None = None,
@@ -356,49 +364,42 @@ def register_person_tools(
         Get the authenticated user's own LinkedIn profile.
 
         Navigates to /in/me/ and resolves the redirect to obtain the real
-        username before scraping, so the url field in the result is the actual
+        username before reading the profile, so the url field in the result is the actual
         profile URL (e.g. linkedin.com/in/johndoe/) rather than /in/me/.
 
         Args:
             ctx: FastMCP context for progress reporting
-            sections: Comma-separated list of extra sections to scrape.
+            sections: Comma-separated list of extra sections to read.
                 The main profile page is always included.
-                Available sections: experience, education, interests, honors, languages, certifications, skills, projects, contact_info, posts
+                Available sections: experience, education, interests, honors, volunteering, languages, certifications, skills, projects, contact_info, posts
                 Examples: "experience,education", "contact_info", "skills,projects"
-                Default (None) scrapes only the main profile page.
+                Default (None) reads only the main profile page.
             max_scrolls: Maximum pagination attempts per section (same as get_person_profile).
 
         Returns:
-            Dict with url, sections (name -> raw text or structured payload),
-            and optional references. The url field reflects the resolved
-            profile URL, revealing the real username.
-
-            The main_profile section is structured (see get_person_profile
-            docstring for the field list); all other sections return raw
-            innerText.
+            Dict with url, sections (name -> raw text), and optional references and section_errors.
+            The url field reflects the resolved profile URL, revealing the real username.
+            Sections may be absent if extraction yielded no content for that page.
+            contact_info is read only from an accepted contact-overlay root. If no such root
+            is found, the section is omitted and section_errors explains the failure;
+            underlying profile text and links are never substituted. Existing suspected
+            rate-limit retry and stop behavior is retained.
+            Includes unknown_sections when unrecognised names are passed.
         """
-        try:
-            extractor = await get_ready_extractor(ctx, tool_name="get_my_profile")
-            requested, unknown = parse_person_sections(sections)
+        extractor = await get_ready_extractor(ctx, tool_name="get_my_profile")
+        requested, unknown = parse_person_sections(sections)
 
-            logger.info("Scraping own profile (sections=%s)", sections)
+        logger.info("Reading own profile (sections=%s)", sections)
 
-            cb = MCPContextProgressCallback(ctx)
-            result = await extractor.get_my_profile(
-                sections=requested,
-                callbacks=cb,
-                max_scrolls=max_scrolls,
-            )
+        cb = MCPContextProgressCallback(ctx)
+        legacy = legacy_extractor_for(extractor)
+        result = await legacy.get_my_profile(
+            sections=requested,
+            callbacks=cb,
+            max_scrolls=max_scrolls,
+        )
 
-            if unknown:
-                result["unknown_sections"] = unknown
+        if unknown:
+            result["unknown_sections"] = unknown
 
-            return result
-
-        except AuthenticationError as e:
-            try:
-                await handle_auth_error(e, ctx)
-            except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "get_my_profile")
-        except Exception as e:
-            raise_tool_error(e, "get_my_profile")  # NoReturn
+        return result

@@ -12,6 +12,10 @@
       "get_page_text"
     ],
     "methods": {
+      "archive_conversation": {
+        "coroutine": true,
+        "signature": "(self, thread_id: 'str') -> 'dict[str, Any]'"
+      },
       "click_button_by_text": {
         "coroutine": true,
         "signature": "(self, text: 'str', *, scope: 'str' = 'main', timeout: 'int' = 5000) -> 'bool'"
@@ -19,6 +23,10 @@
       "connect_with_person": {
         "coroutine": true,
         "signature": "(self, username: 'str', *, note: 'str | None' = None) -> 'dict[str, Any]'"
+      },
+      "dismiss_job": {
+        "coroutine": true,
+        "signature": "(self, job_id: 'str') -> 'dict[str, Any]'"
       },
       "extract_feed": {
         "coroutine": true,
@@ -35,6 +43,10 @@
       "get_conversation": {
         "coroutine": true,
         "signature": "(self, linkedin_username: 'str | None' = None, thread_id: 'str | None' = None, index: 'int' = 0) -> 'dict[str, Any]'"
+      },
+      "get_easy_apply_form": {
+        "coroutine": true,
+        "signature": "(self, job_id: 'str') -> 'dict[str, Any]'"
       },
       "get_inbox": {
         "coroutine": true,
@@ -54,7 +66,7 @@
       },
       "get_saved_jobs": {
         "coroutine": true,
-        "signature": "(self, max_pages: 'int' = 3) -> 'dict[str, Any]'"
+        "signature": "(self, max_pages: 'int' = 3, stage: 'JobsTrackerStage' = 'saved') -> 'dict[str, Any]'"
       },
       "get_sidebar_profiles": {
         "coroutine": true,
@@ -72,6 +84,10 @@
         "coroutine": true,
         "signature": "(self, username: 'str', requested: 'set[str]', callbacks: 'ProgressCallback | None' = None, max_scrolls: 'int | None' = None, *, main_profile_already_loaded: 'bool' = False, allow_self_alias: 'bool' = False) -> 'dict[str, Any]'"
       },
+      "reply_to_conversation": {
+        "coroutine": true,
+        "signature": "(self, thread_id: 'str', message: 'str', *, confirm_send: 'bool') -> 'dict[str, Any]'"
+      },
       "search_companies": {
         "coroutine": true,
         "signature": "(self, keywords: 'str') -> 'dict[str, Any]'"
@@ -86,11 +102,11 @@
       },
       "search_people": {
         "coroutine": true,
-        "signature": "(self, keywords: 'str', location: 'str | None' = None, network: 'list[str] | None' = None, current_company: 'str | None' = None) -> 'dict[str, Any]'"
+        "signature": "(self, keywords: 'str', location: 'str | None' = None, network: 'list[str] | None' = None, current_company: 'str | None' = None, connection_of: 'str | None' = None) -> 'dict[str, Any]'"
       },
       "search_posts": {
         "coroutine": true,
-        "signature": "(self, keywords: 'str', date_posted: 'str | None' = None, max_pages: 'int' = 3) -> 'dict[str, Any]'"
+        "signature": "(self, keywords: 'str', date_posted: 'str | None' = None, max_pages: 'int' = 3, content_type: 'str | None' = None) -> 'dict[str, Any]'"
       },
       "send_message": {
         "coroutine": true,
@@ -98,11 +114,14 @@
       }
     },
     "tool_methods": [
+      "archive_conversation",
       "connect_with_person",
+      "dismiss_job",
       "extract_feed",
       "extract_page",
       "get_company_employees",
       "get_conversation",
+      "get_easy_apply_form",
       "get_inbox",
       "get_job_apply_url",
       "get_my_profile",
@@ -111,6 +130,7 @@
       "read_company",
       "read_job",
       "read_person",
+      "reply_to_conversation",
       "search_companies",
       "search_conversations",
       "search_jobs",
@@ -125,6 +145,7 @@
           "properties": {
             "index": {
               "default": 0,
+              "description": "Thread index for username lookups.",
               "minimum": 0,
               "type": "integer"
             },
@@ -137,7 +158,8 @@
                   "type": "null"
                 }
               ],
-              "default": null
+              "default": null,
+              "description": "Participant's LinkedIn username when resolving\na thread or using message_url."
             },
             "message_url": {
               "anyOf": [
@@ -148,7 +170,8 @@
                   "type": "null"
                 }
               ],
-              "default": null
+              "default": null,
+              "description": "Invitation compose URL from get_pending_invitations.\nRequires linkedin_username and cannot be combined with thread_id."
             },
             "thread_id": {
               "anyOf": [
@@ -159,7 +182,8 @@
                   "type": "null"
                 }
               ],
-              "default": null
+              "default": null,
+              "description": "LinkedIn messaging thread ID, as get_inbox,\nsearch_conversations or get_conversation return it."
             }
           },
           "type": "object"
@@ -203,6 +227,25 @@
           },
           "required": [
             "linkedin_username"
+          ],
+          "type": "object"
+        },
+        "output": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
+      "dismiss_job": {
+        "input": {
+          "additionalProperties": false,
+          "properties": {
+            "job_id": {
+              "description": "LinkedIn job ID (e.g., \"4252026496\", \"3856789012\")",
+              "type": "string"
+            }
+          },
+          "required": [
+            "job_id"
           ],
           "type": "object"
         },
@@ -348,7 +391,7 @@
             },
             "max_scrolls": {
               "default": 3,
-              "description": "How many times to scroll the message list back to\nload older history (0-20, default 3). LinkedIn virtualizes\nthe list, so message count grows with scroll count; raise\nthis value to retrieve older history at the cost of latency.",
+              "description": "Number of times to scroll back for older messages.",
               "maximum": 20,
               "minimum": 0,
               "type": "integer"
@@ -385,13 +428,32 @@
           "type": "object"
         }
       },
+      "get_easy_apply_form": {
+        "input": {
+          "additionalProperties": false,
+          "properties": {
+            "job_id": {
+              "description": "LinkedIn job ID (e.g., \"4252026496\", \"3856789012\")",
+              "type": "string"
+            }
+          },
+          "required": [
+            "job_id"
+          ],
+          "type": "object"
+        },
+        "output": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
       "get_feed": {
         "input": {
           "additionalProperties": false,
           "properties": {
             "num_posts": {
               "default": 10,
-              "description": "Number of posts to fetch (1-50, default 10).\n       Posts are loaded in batches of ~5 as the page scrolls.",
+              "description": "Number of posts to fetch (1-50, default 10).\n       Posts are loaded in batches of ~5 as the page scrolls,\n       so the actual count may slightly exceed the target.",
               "maximum": 50,
               "minimum": 1,
               "type": "integer"
@@ -410,7 +472,7 @@
           "properties": {
             "limit": {
               "default": 20,
-              "description": "Maximum conversations to load per inbox tab (1-50, default 20)",
+              "description": "Maximum number of conversations to load (1-50, default 20)",
               "maximum": 50,
               "minimum": 1,
               "type": "integer"
@@ -489,7 +551,7 @@
                 }
               ],
               "default": null,
-              "description": "Comma-separated list of extra sections to scrape.\nThe main profile page is always included.\nAvailable sections: experience, education, interests, honors, languages, certifications, skills, projects, contact_info, posts\nExamples: \"experience,education\", \"contact_info\", \"skills,projects\"\nDefault (None) scrapes only the main profile page."
+              "description": "Comma-separated list of extra sections to read.\nThe main profile page is always included.\nAvailable sections: experience, education, interests, honors, volunteering, languages, certifications, skills, projects, contact_info, posts\nExamples: \"experience,education\", \"contact_info\", \"skills,projects\"\nDefault (None) reads only the main profile page."
             }
           },
           "type": "object"
@@ -557,7 +619,7 @@
                 }
               ],
               "default": null,
-              "description": "Comma-separated list of extra sections to scrape.\nThe main profile page is always included.\nAvailable sections: experience, education, interests, honors, languages, certifications, skills, projects, contact_info, posts\nExamples: \"experience,education\", \"contact_info\", \"skills,projects\", \"honors,languages\", \"posts\"\nDefault (None) scrapes only the main profile page."
+              "description": "Comma-separated list of extra sections to read.\nThe main profile page is always included.\nAvailable sections: experience, education, interests, honors, volunteering, languages, certifications, skills, projects, contact_info, posts\nExamples: \"experience,education\", \"contact_info\", \"skills,projects\", \"honors,languages\", \"posts\"\nDefault (None) reads only the main profile page."
             }
           },
           "required": [
@@ -576,12 +638,34 @@
           "properties": {
             "max_pages": {
               "default": 3,
-              "description": "Maximum number of saved-jobs pages to load (1-10, default 3)",
+              "description": "Maximum number of tracker pages to load (1-10, default 3)",
               "maximum": 10,
               "minimum": 1,
               "type": "integer"
+            },
+            "stage": {
+              "default": "saved",
+              "description": "Tracker tab: saved (default), in_progress, applied or\narchived. applied lists Easy Apply submissions and external\napplications the user confirmed to LinkedIn.",
+              "enum": [
+                "saved",
+                "in_progress",
+                "applied",
+                "archived"
+              ],
+              "type": "string"
             }
           },
+          "type": "object"
+        },
+        "output": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
+      "get_session_status": {
+        "input": {
+          "additionalProperties": false,
+          "properties": {},
           "type": "object"
         },
         "output": {
@@ -594,7 +678,7 @@
           "additionalProperties": false,
           "properties": {
             "linkedin_username": {
-              "description": "LinkedIn username of the profile page to scrape; a full profile URL is accepted too\n(e.g., \"stickerdaniel\", \"williamhgates\")",
+              "description": "LinkedIn username of the profile page to read; a full profile URL is accepted too\n(e.g., \"stickerdaniel\", \"williamhgates\")",
               "type": "string"
             }
           },
@@ -646,6 +730,35 @@
           "required": [
             "linkedin_username",
             "message_url",
+            "message",
+            "confirm_send"
+          ],
+          "type": "object"
+        },
+        "output": {
+          "additionalProperties": true,
+          "type": "object"
+        }
+      },
+      "reply_to_conversation": {
+        "input": {
+          "additionalProperties": false,
+          "properties": {
+            "confirm_send": {
+              "description": "Must be True to send. False is a dry run that verifies\nthe thread and composer, types nothing, and says who the reply\nwould go to.",
+              "type": "boolean"
+            },
+            "message": {
+              "description": "Message text, read as send_message reads it: LF, CRLF and\nCR all end a line, empty lines are kept, and the whole message\nis trimmed. Tab, other control characters, DEL, U+0085, U+2028\nand U+2029 are refused.",
+              "type": "string"
+            },
+            "thread_id": {
+              "description": "LinkedIn messaging thread ID, or a /messaging/thread/<id>/\nreference as another tool returned it",
+              "type": "string"
+            }
+          },
+          "required": [
+            "thread_id",
             "message",
             "confirm_send"
           ],
@@ -719,7 +832,7 @@
             },
             "easy_apply": {
               "default": false,
-              "description": "Only show Easy Apply jobs (default false)",
+              "description": "Only show Easy Apply jobs (default false). Classic search only.",
               "type": "boolean"
             },
             "experience_level": {
@@ -732,7 +845,7 @@
                 }
               ],
               "default": null,
-              "description": "Filter by experience level, comma-separated (internship, entry, associate, mid_senior, director, executive)"
+              "description": "Filter by experience level, comma-separated (internship, entry, associate, mid_senior, director, executive). Classic search only."
             },
             "job_type": {
               "anyOf": [
@@ -744,7 +857,7 @@
                 }
               ],
               "default": null,
-              "description": "Filter by job type, comma-separated (full_time, part_time, contract, temporary, volunteer, internship, other)"
+              "description": "Filter by job type, comma-separated (full_time, part_time, contract, temporary, volunteer, internship, other). Classic search only."
             },
             "keywords": {
               "description": "Search keywords (e.g., \"software engineer\", \"data scientist\")",
@@ -760,7 +873,7 @@
                 }
               ],
               "default": null,
-              "description": "Optional location filter (e.g., \"San Francisco\", \"Remote\")"
+              "description": "Optional location filter (e.g., \"San Francisco\", \"Remote\"). Classic search only."
             },
             "max_pages": {
               "default": 3,
@@ -779,7 +892,7 @@
                 }
               ],
               "default": null,
-              "description": "Sort results (date, relevance)"
+              "description": "Sort results (date, relevance). Classic search only."
             },
             "work_type": {
               "anyOf": [
@@ -791,7 +904,7 @@
                 }
               ],
               "default": null,
-              "description": "Filter by work type, comma-separated (on_site, remote, hybrid)"
+              "description": "Filter by work type, comma-separated (on_site, remote, hybrid). Classic search only."
             }
           },
           "required": [
@@ -808,6 +921,18 @@
         "input": {
           "additionalProperties": false,
           "properties": {
+            "connection_of": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Optional profile id (e.g. \"ACoAAB...\") limiting\nresults to that member's connections. Combine with\nnetwork=[\"F\"] to list the mutual connections you share with\nthem; keywords may be \"\". Take the id from get_person_profile's\n\"profile_urn\"; a vanity name is refused, because LinkedIn\nignores it and returns unfiltered results. LinkedIn also\ndrops the filter, without saying so, when the member is\n3rd-degree or beyond (you share no connections): the result\nis then your unfiltered network, not an empty list."
+            },
             "current_company": {
               "anyOf": [
                 {
@@ -834,7 +959,7 @@
                 }
               ],
               "default": null,
-              "description": "Optional location filter (e.g., \"New York\", \"Remote\")"
+              "description": "Optional location filter, as LinkedIn's numeric geo URN\nid (e.g., \"103644278\" for the United States). Plain-text place\nnames are silently ignored by LinkedIn and return unfiltered\nresults, so they are refused here. The id is the geoUrn value\nin the URL of a LinkedIn people search filtered to that place;\nwithout one, put the place in keywords instead."
             },
             "network": {
               "anyOf": [
@@ -866,6 +991,18 @@
         "input": {
           "additionalProperties": false,
           "properties": {
+            "content_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Optional \"Content type\" filter. One of\n\"documents\" (PDFs and slide decks people upload), \"images\",\n\"videos\", \"live_videos\", \"job_posts\". Omit for all posts."
+            },
             "date_posted": {
               "anyOf": [
                 {
@@ -905,13 +1042,15 @@
           "additionalProperties": false,
           "properties": {
             "confirm_send": {
+              "description": "Must be True to send the message",
               "type": "boolean"
             },
             "linkedin_username": {
+              "description": "LinkedIn username of the recipient; a full profile URL is accepted too",
               "type": "string"
             },
             "message": {
-              "description": "Message text to send; line breaks are preserved. Other control characters are rejected.",
+              "description": "Message text. LF, CRLF and CR all end a line; an empty line\nseparates paragraphs and is kept. Whitespace-only lines count as\nempty, and leading and trailing whitespace of the whole message\nis removed, as LinkedIn does when sending. Tab, other control\ncharacters, DEL, U+0085, U+2028 and U+2029 are refused.",
               "type": "string"
             },
             "profile_urn": {
@@ -923,7 +1062,8 @@
                   "type": "null"
                 }
               ],
-              "default": null
+              "default": null,
+              "description": "Optional profile URN (e.g. ACoAAB...) to verify against\nthe URN exposed by the loaded profile before opening its Message\naction. It never bypasses recipient verification. Obtain via\nget_person_profile. Note: inbox may not always show all messages;\nuse search_conversations as a fallback."
             }
           },
           "required": [

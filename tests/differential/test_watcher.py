@@ -52,6 +52,15 @@ from differential.watcher import (
 WATCHER = Path(__file__).with_name("watcher.py")
 PROFILE = "/tmp/differential-profile"
 
+#: The owner module as each build in a row names it: the frozen baseline's flat
+#: module, and this checkout's package. Spelled out rather than imported, so a
+#: dropped spelling in the observers cannot hide behind the same constant.
+OWNER_SPELLINGS = pytest.mark.parametrize(
+    "owner",
+    ["linkedin_mcp_server.daemon_owner", "linkedin_mcp_server.daemon.owner"],
+    ids=["baseline", "candidate"],
+)
+
 
 def _browser(pid: int, ppid: int, *extra: str, profile: str = PROFILE, start=1.0):
     return record(
@@ -155,6 +164,32 @@ def test_starts_and_exits_are_keyed_by_create_time():
 )
 def test_actors_are_named_from_the_command_line(cmdline, actor):
     assert classify(ProcessRecord(1, 0, 0.0, None, tuple(cmdline))) == actor
+
+
+@OWNER_SPELLINGS
+def test_every_owner_observer_recognises_either_builds_owner(owner):
+    """The watcher's actor, the row's owner launches, its release gate and its
+    owner lifetimes all name an owner under either build's module name."""
+    python = "/venv/bin/python"
+    command = [python, "-P", "-m", owner, "--job-name", "Local\\j"]
+    gate = harness.gate_script(harness.REPO_ROOT)
+    gate_command = [python, "-I", "-S", "-u", str(gate), "ab" * 32, "--", *command]
+    started = {
+        "kind": "process.start",
+        "actor": "owner",
+        "pid": 77,
+        "ppid": 1,
+        "start_identity": 5.0,
+        "in_row": True,
+        "t": 5.0,
+        "cmdline": command,
+    }
+
+    assert classify(ProcessRecord(77, 1, 5.0, None, tuple(command))) == "owner"
+    assert harness.owner_launches([started]) == [77]
+    assert harness.owner_gate(gate_command, [gate])
+    owners, _ = harness.launch_lifetimes([started], [gate])
+    assert [lifetime[:2] for lifetime in owners] == [[77, 5.0]]
 
 
 def _stand_in_browser(profile: Path) -> subprocess.Popen[bytes]:
@@ -410,9 +445,12 @@ def test_a_watcher_stopped_on_request_after_the_actors_covers_them(tmp_path):
         )
         == []
     )
-    # The evidence states what sampling cost on this machine.
+    # Costs use a monotonic clock; sample_log uses wall time. Check the
+    # published values here and their arithmetic with fixed durations below.
+    assert math.isfinite(summary["sample_seconds_mean"])
     assert summary["sample_seconds_mean"] > 0
-    assert summary["sample_seconds_p95"] >= summary["sample_seconds_mean"] * 0.5
+    assert math.isfinite(summary["sample_seconds_p95"])
+    assert summary["sample_seconds_p95"] >= 0
     assert summary["first_sample_cached"] > 0
     assert summary["reads_per_sample_max"] >= 1
     # Every sample is logged, and each event's time is a logged sample's end.
@@ -1107,9 +1145,20 @@ def test_the_summary_states_what_sampling_cost(no_exec):
         assert (stats["first_sample_cached"], stats["first_sample_watched"]) == (2, 1)
         # Every process in the first sample, then only the harness and 61.
         assert sampler.reads_per_sample == [4, 2, 2]
-    assert duration_stats([0.01, 0.02, 0.03]) == {
-        "sample_seconds_mean": 0.02,
-        "sample_seconds_p95": 0.03,
+
+
+@pytest.mark.parametrize(
+    ("durations", "mean", "p95"),
+    [
+        ([0.01, 0.02, 0.03], 0.02, 0.03),
+        ([0.0019] * 99 + [1.0019], 0.0119, 0.0019),
+    ],
+    ids=["uniform", "one-slow-sample"],
+)
+def test_sample_duration_statistics(durations, mean, p95):
+    assert duration_stats(durations) == {
+        "sample_seconds_mean": mean,
+        "sample_seconds_p95": p95,
     }
 
 
@@ -1345,14 +1394,15 @@ def test_only_a_row_server_or_owner_is_asked_for_its_environment(ppid, cmdline):
     assert sampler.sample()[2].launcher is None
 
 
-def test_a_row_owner_records_its_launcher():
+@OWNER_SPELLINGS
+def test_a_row_owner_records_its_launcher(owner):
     table = _row_table()
     sampler, tracker = _sampler(table), Tracker()
     _observe(sampler, tracker, 0.0)
     table[2] = {
         "start": 2.0,
         "ppid": 1,
-        "cmdline": [FRAMEWORK_PYTHON, "-P", "-m", "linkedin_mcp_server.daemon_owner"],
+        "cmdline": [FRAMEWORK_PYTHON, "-P", "-m", owner],
         "environ": {"__PYVENV_LAUNCHER__": BASELINE_VENV_PYTHON},
     }
     _observe(sampler, tracker, 1.0)
@@ -2320,7 +2370,9 @@ class _BlockedWrites(io.TextIOBase):
         return self._out.write(s)
 
     def flush(self) -> None:
-        self._out.flush()
+        # Collection closes this wrapper too, after the test closed the file.
+        if not self._out.closed:
+            self._out.flush()
 
 
 def test_a_stop_request_publishes_the_whole_summary_behind_a_slow_writer(

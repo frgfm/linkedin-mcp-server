@@ -1250,6 +1250,9 @@ async def test_the_row_picks_its_idle_timeout_once_for_every_use(
     monkeypatch.setattr(harness, "stage_frozen_session", stage_frozen_session)
     monkeypatch.setattr(harness, "wait_until_dead", wait_until_dead)
     monkeypatch.setattr(harness, "interpreter_failures", lambda *a, **k: [])
+    # The modelled owner publishes through this checkout's descriptor seams,
+    # which the frozen layout does not read.
+    monkeypatch.setattr(harness, "BASELINE_LAYOUT", harness.CANDIDATE_LAYOUT)
     frozen = Runtime(
         python=sys.executable,
         checkout=tmp_path / "baseline",
@@ -2802,13 +2805,10 @@ def _direct_second(row, monkeypatch, tmp_path):  # noqa: F811 - the imported fix
             id="failed-census",
         ),
         pytest.param(
-            lambda scene, mp: (
-                mp.setattr(harness, "_BROWSER_GONE_SECONDS", 0.2),
-                setattr(
-                    scene,
-                    "census_after_b",
-                    lambda: harness.ProfileCensus(processes=[SimpleNamespace(pid=900)]),
-                ),
+            lambda scene, mp: setattr(
+                scene,
+                "census_after_b",
+                lambda: harness.ProfileCensus(processes=[SimpleNamespace(pid=900)]),
             ),
             "host B's browser is not shown gone",
             id="residual-browser",
