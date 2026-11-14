@@ -8136,12 +8136,28 @@ class TestElectionSettlement:
         profile = _profile(tmp_path)
         config = _config(profile)
         _publish_stale_owner(profile.parent, profile, config)
+        lookup = daemon_module._inspect(profile.parent, profile, config)
+        assert lookup.attachment is not None
+        clock = [100.0]
+        read_budgets: list[float] = []
         probe_budgets: list[float] = []
+
+        def inspect_until(_inspector: object, *, timeout: float) -> OwnerLookup:
+            read_budgets.append(timeout)
+            clock[0] += 0.02
+            return lookup
+
+        def monotonic() -> float:
+            return clock[0]
 
         def answer(_attachment: Attachment, timeout: float) -> Reach:
             probe_budgets.append(timeout)
             return Reach.ANSWERED
 
+        monkeypatch.setattr(
+            election_module._DescriptorInspector, "inspect_until", inspect_until
+        )
+        monkeypatch.setattr(election_module.time, "monotonic", monotonic)
         outcome = obtain_owner(
             profile.parent,
             profile,
@@ -8152,8 +8168,9 @@ class TestElectionSettlement:
         )
 
         assert outcome.worth_connecting
-        assert len(probe_budgets) == 1
-        assert 0 < probe_budgets[0] <= 0.05 + 1e-12
+        assert len(read_budgets) == 1
+        assert 0 < read_budgets[0] <= 0.05
+        assert probe_budgets == pytest.approx([0.03])
 
     def test_zero_total_budget_starts_no_operation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
