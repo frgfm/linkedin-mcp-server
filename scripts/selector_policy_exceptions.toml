@@ -75,3 +75,66 @@ symbol = "_MESSAGE_COMPOSER_INSPECT_JS"
 text = ".msg-form__send-toggle"
 count = 1
 reason = "enterToSend uses the send-toggle class only when the verified composer has no Send button (#1107)."
+
+[[exception]]
+file = "linkedin_mcp_server/linkedin/network.py"
+symbol = "_CLICK_WITHDRAW_CONFIRM_JS"
+text = ".artdeco-modal"
+count = 1
+reason = "Breaks ties between visible role=dialog wrappers when choosing the outgoing-invitation confirmation modal."
+
+[[exception]]
+file = "linkedin_mcp_server/linkedin/network.py"
+symbol = "_withdraw_outgoing_invitation"
+text = ".artdeco-modal"
+count = 1
+reason = "Waits for the outgoing-invitation confirmation modal rather than an equally scored dialog wrapper."
+
+[[exception]]
+file = "linkedin_mcp_server/scraping/capture.py"
+symbol = "_extract_overlay_content"
+text = ".artdeco-modal__content"
+count = 3
+reason = "Legacy contact-info overlay root beside dialog[open]: the wait, root list, and error message name both."
+
+[[exception]]
+file = "linkedin_mcp_server/scraping/conversations.py"
+symbol = "_extract_conversation_thread_refs"
+text = '[class*="listitem__link"]'
+count = 1
+reason = "No role or aria attributes exist on the clickable conversation-list element."
+
+[[exception]]
+file = "linkedin_mcp_server/scraping/job_pages.py"
+symbol = "_get_total_search_pages"
+text = ".jobs-search-pagination__page-state"
+count = 1
+reason = "The page-count element is screen-reader-only, so its text is not available through innerText."
+
+[[exception]]
+file = "linkedin_mcp_server/scraping/job_pages.py"
+symbol = "_get_total_list_pages"
+text = ".artdeco-pagination__pages"
+count = 1
+reason = "The legacy my-items pager exposes no page count in innerText or a stable attribute to count."
+
+[[exception]]
+file = "linkedin_mcp_server/scraping/message_sender.py"
+symbol = "_MESSAGE_COMPOSER_INSPECT_JS"
+text = ".msg-form__send-toggle"
+count = 1
+reason = "enterToSend uses the send-toggle class only when the verified composer has no Send button (#1107)."
+
+[[exception]]
+file = "linkedin_mcp_server/scraping/network.py"
+symbol = "_CLICK_WITHDRAW_CONFIRM_JS"
+text = ".artdeco-modal"
+count = 1
+reason = "Breaks ties between visible role=dialog wrappers when choosing the outgoing-invitation confirmation modal."
+
+[[exception]]
+file = "linkedin_mcp_server/scraping/network.py"
+symbol = "_withdraw_outgoing_invitation"
+text = ".artdeco-modal"
+count = 1
+reason = "Waits for the outgoing-invitation confirmation modal rather than an equally scored dialog wrapper."
