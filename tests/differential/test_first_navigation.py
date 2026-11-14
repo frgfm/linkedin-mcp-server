@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -22,7 +24,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -33,7 +35,7 @@ from patchright.async_api import Error as PlaywrightError
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 from patchright.async_api import async_playwright
 
-from differential import harness
+from differential import first_navigation, harness
 from differential.baseline import REPO_ROOT, BaselineRefused, Runtime
 from differential.events import EventLog, publish
 from differential.first_navigation import (
@@ -139,7 +141,7 @@ class _Origin:
 
 
 @contextlib.asynccontextmanager
-async def _browser(profile: Path) -> AsyncIterator[Any]:
+async def _browser(profile: Path) -> AsyncGenerator[Any]:
     """A driver and a persistent context on *profile*, both ended after."""
     playwright = await async_playwright().start()
     try:
@@ -184,6 +186,83 @@ async def _until(condition: Callable[[], Any], seconds: float, what: str) -> Any
     pytest.fail(f"{what} within {seconds}s")
 
 
+#: Whole reads of the process tree a sampler wait allows. One shows what was
+#: there when it began; the rest cover a process read that failed and is
+#: asked again on the next one.
+SAMPLER_READS = 3
+
+#: How long a sampler wait tolerates a sampler that makes no read at all.
+#: Measured under ``-n 4`` with every browser case running: one read took at
+#: most 8 ms and reads began at most 123 ms apart. A stall this long is the
+#: host's, and the failure says so instead of blaming the sampler.
+SAMPLER_STALL_SECONDS = 60.0
+
+
+async def _sampled(
+    sampler: LifetimeSampler,
+    condition: Callable[[dict[str, Any]], Any],
+    what: str,
+) -> Any:
+    """*condition* of the sampler's document, bounded by the sampler's reads.
+
+    For a process that exists before the wait begins. The wait fails once
+    ``SAMPLER_READS`` whole reads, each begun after the wait, have not shown
+    *condition*. A host that holds the sampler only delays the answer: a
+    clock bound read such a stall as a running browser left unidentified.
+    """
+    document = sampler.document
+    # The read under way may have listed the tree before this wait began, so
+    # the reads that count start with the one after it. Read k is whole once
+    # read k + 1 has begun.
+    enough = document["samples"] + 2 + SAMPLER_READS
+    seen, moved = document["samples"], time.monotonic()
+    while True:
+        # Counted before the condition is read, so a read that ends between
+        # the two cannot fail a wait it has just satisfied.
+        samples = document["samples"]
+        value = condition(document)
+        if value:
+            return value
+        if document["sampler"] != "running":
+            pytest.fail(f"{what}: the sampler is {document['sampler']}")
+        if samples >= enough:
+            pytest.fail(f"{what} in {SAMPLER_READS} reads of the process tree")
+        if samples != seen:
+            seen, moved = samples, time.monotonic()
+        elif time.monotonic() - moved > SAMPLER_STALL_SECONDS:
+            pytest.fail(
+                f"{what}: the sampler made no read for {SAMPLER_STALL_SECONDS:g}s"
+            )
+        await asyncio.sleep(0.05)
+
+
+def _started_samplers(monkeypatch: pytest.MonkeyPatch) -> list[LifetimeSampler]:
+    """Every sampler started from here on, ``observing``'s own included."""
+    started: list[LifetimeSampler] = []
+    start = LifetimeSampler.start
+
+    def recorded(self: LifetimeSampler) -> LifetimeSampler:
+        started.append(self)
+        return start(self)
+
+    monkeypatch.setattr(LifetimeSampler, "start", recorded)
+    return started
+
+
+def _dead(process: psutil.Process) -> bool:
+    """Whether *process* has ended: a zombie on POSIX, gone on Windows."""
+    try:
+        return process.status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
+
+
+def _roots(document: dict[str, Any]) -> list[dict[str, Any]]:
+    """The browser roots a lifetimes document holds, in identification order."""
+    found = [p for p in document.get("processes", []) if p["role"] == "browser-root"]
+    return sorted(found, key=lambda p: p["identified_ms"])
+
+
 # --- Which phase a stalled first navigation reached ----------------------------
 
 
@@ -207,8 +286,10 @@ async def test_a_black_hole_origin_is_a_navigation_stalled_before_its_response(
     assert navigation["timeout_ms"] is None, "the default bound, not one of ours"
     assert navigation["ended_ms"] - navigation["started_ms"] >= 29_000
     assert navigation["phases"]["request"] is not None
-    assert navigation["phases"]["response"] is None
     assert record["first_failed_navigation"] == 0
+    # Read when the goto gave up. The phases themselves are not: the recorder
+    # listens until the page closes, so a stall that delays the close records
+    # the answer at 35 s as well.
     assert record["stalled_phase"] == "response"
 
 
@@ -294,20 +375,8 @@ async def test_a_browser_killed_under_a_living_driver_is_an_unexpected_end(tmp_p
             with observe_navigation(path, label="killed") as recorder:
                 async with _browser(profile) as context:
                     page = context.pages[0]
-
-                    def root() -> dict[str, Any] | None:
-                        document = read_document(lifetimes_path) or {}
-                        return next(
-                            (
-                                p
-                                for p in document.get("processes", [])
-                                if p["role"] == "browser-root"
-                            ),
-                            None,
-                        )
-
-                    found = await _until(
-                        root, 15, "the browser root was not identified"
+                    (found,) = await _sampled(
+                        lifetimes, _roots, "the browser root was not identified"
                     )
                     process = psutil.Process(found["pid"])
                     assert process.create_time() == pytest.approx(
@@ -341,6 +410,74 @@ async def test_a_browser_killed_under_a_living_driver_is_an_unexpected_end(tmp_p
     assert processes["browser-root"]["ended"] == "unexpected"
     assert processes["browser-root"]["exit_code"] is None
     assert processes["driver"]["ended"] == "alive-at-stop"
+
+
+# --- A relaunch inside one observation --------------------------------------------
+
+
+@_browser_case
+async def test_a_relaunch_keeps_the_first_launch_and_reads_its_own_ends(
+    tmp_path, monkeypatch
+):
+    """Staging's relaunch after a stall: two browsers on one profile, observed
+    by the harness's own ``observing``. The first launch keeps the top level
+    and its stalled navigation; the second is appended, and its browser lost
+    before its own close reads as unexpected, not as ended by the first's."""
+    evidence = tmp_path / "evidence"
+    profile = tmp_path / "profile"
+    started = _started_samplers(monkeypatch)
+
+    with _Origin() as origin:
+        with observing(evidence, profile=profile, label="relaunch") as path:
+            (sampler,) = started
+            async with _browser(profile) as context:
+                with pytest.raises(PlaywrightTimeoutError):
+                    await context.pages[0].goto(
+                        origin.url("/black-hole"), timeout=1_000
+                    )
+                await _sampled(
+                    sampler, _roots, "the first browser root was not identified"
+                )
+            async with _browser(profile) as context:
+                page = context.pages[0]
+                await page.goto(origin.url("/"))
+                second = await _sampled(
+                    sampler,
+                    lambda document: len(_roots(document)) == 2 and _roots(document)[1],
+                    "the second browser root was not identified",
+                )
+                root = psutil.Process(second["pid"])
+                # The driver reaps its browser. Held stopped across the kill,
+                # the sampler can only find the root as a zombie, which is the
+                # read the CI runs raced into.
+                reaper = root.parent()
+                reaper.suspend()
+                try:
+                    root.kill()
+                    # The kernel's part first: the reads count from a dead root.
+                    await _until(lambda: _dead(root), 15, "the killed root did not end")
+                    await _sampled(
+                        sampler,
+                        lambda document: _roots(document)[1]["gone_ms"] is not None,
+                        "the second browser root was not seen gone",
+                    )
+                finally:
+                    reaper.resume()
+    record = _record(path)
+    assert [n["launch"] for n in record["navigations"]] == [1, 2]
+    assert (record["first_failed_navigation"], record["stalled_phase"]) == (
+        0,
+        "response",
+    )
+    (relaunch,) = record["relaunches"]
+    assert record["close_requested_ms"] < relaunch["launch"]["started_ms"]
+    assert relaunch["close_requested_ms"] > relaunch["launch"]["started_ms"]
+    assert record["driver"]["pid"] != relaunch["driver"]["pid"]
+    first, second = (
+        root["ended"] for root in _roots(_record(evidence / BROWSER_LIFETIMES_FILE))
+    )
+    assert first in ("after-close-request", "ambiguous")
+    assert second == "unexpected"
 
 
 # --- Observers that leave ---------------------------------------------------------
@@ -443,18 +580,29 @@ async def test_a_killed_staging_process_leaves_what_it_had_observed(tmp_path):
             deadline = time.monotonic() + 30
             while not requested():
                 if child.poll() is not None:
-                    pytest.skip(f"the staging process ended first: {child.stderr}")
+                    # A surviving driver can hold stderr open past the
+                    # child's exit, so the read is bounded.
+                    try:
+                        _, stderr = child.communicate(timeout=5)
+                    except subprocess.TimeoutExpired as exc:
+                        stderr = exc.stderr or b""
+                    pytest.skip(
+                        f"the staging process ended first: {stderr.decode(errors='replace')}"
+                    )
                 if time.monotonic() > deadline:
                     pytest.fail("the staging process never sent its request")
                 await asyncio.sleep(0.05)
         finally:
-            tree = [psutil.Process(child.pid)]
-            with contextlib.suppress(psutil.Error):
-                tree += tree[0].children(recursive=True)
-            for process in tree:
+            # poll() reaps a child that has ended, which frees its pid for
+            # reuse: only a child not yet reaped is walked and killed.
+            if child.poll() is None:
+                tree = [psutil.Process(child.pid)]
                 with contextlib.suppress(psutil.Error):
-                    process.kill()
-            psutil.wait_procs(tree, timeout=10)
+                    tree += tree[0].children(recursive=True)
+                for process in tree:
+                    with contextlib.suppress(psutil.Error):
+                        process.kill()
+                psutil.wait_procs(tree, timeout=10)
             child.wait(10)
     record = _record(path)
     assert record["label"] == "killed-staging"
@@ -705,6 +853,76 @@ async def test_a_frozen_staging_failure_is_recorded_by_the_staging_interpreter(
     assert lifetimes["label"] == "frozen-staging"
 
 
+def _list_descendants(monkeypatch: pytest.MonkeyPatch, listed: list[Any]) -> None:
+    """Make the sampler's walk list *listed*, on every platform."""
+    monkeypatch.setattr(
+        first_navigation,
+        "_this_process",
+        lambda psutil: SimpleNamespace(children=lambda recursive: listed),
+    )
+
+
+def _walk_over(
+    monkeypatch: pytest.MonkeyPatch,
+    tree: dict[int, list[int]],
+    *,
+    gone: frozenset[int] = frozenset(),
+    error: int | None = None,
+) -> Any:
+    """The macOS walk on any platform: libproc answers from *tree*, parent
+    pid to child pids, and psutil finds every pid in *gone* already gone."""
+
+    def list_children(pid: int, buffer: Any, size: int) -> int:
+        if error is not None:
+            ctypes.set_errno(error)
+            return -1
+        children = tree.get(pid, [])
+        count = min(len(children), size // ctypes.sizeof(ctypes.c_int))
+        for index in range(count):
+            buffer[index] = children[index]
+        return count
+
+    class Process:
+        def __init__(self, pid: int) -> None:
+            if pid in gone:
+                raise psutil.NoSuchProcess(pid)
+            self.pid = pid
+
+        def create_time(self) -> float:
+            return 1.0
+
+    library = SimpleNamespace(proc_listchildpids=list_children)
+    monkeypatch.setattr(
+        first_navigation.ctypes, "CDLL", lambda path, use_errno: library
+    )
+    fake = SimpleNamespace(Process=Process, NoSuchProcess=psutil.NoSuchProcess)
+    return first_navigation._MacDescendants(fake)
+
+
+def test_the_macos_walk_lists_more_children_than_one_buffer_holds(monkeypatch):
+    # Above the walk's own pid, which is the runner's, so none of them is it.
+    me = os.getpid()
+    children = [me + offset for offset in range(1, 101)]
+    grandchild = me + 1_000
+    walk = _walk_over(monkeypatch, {me: children, children[-1]: [grandchild]})
+    listed = sorted(process.pid for process in walk.children(recursive=True))
+    assert listed == [*children, grandchild]
+
+
+def test_the_macos_walk_skips_a_child_gone_before_it_was_read(monkeypatch):
+    me = os.getpid()
+    walk = _walk_over(monkeypatch, {me: [me + 1, me + 2]}, gone=frozenset({me + 1}))
+    assert [process.pid for process in walk.children(recursive=True)] == [me + 2]
+
+
+def test_a_failed_macos_listing_is_an_error_and_not_an_empty_tree(monkeypatch):
+    # An empty listing would mark every tracked process gone.
+    walk = _walk_over(monkeypatch, {}, error=errno.ESRCH)
+    with pytest.raises(OSError) as raised:
+        walk.children(recursive=True)
+    assert raised.value.errno == errno.ESRCH
+
+
 class _SlowChild:
     """A descendant whose every read takes *delay*, as on a loaded host."""
 
@@ -728,7 +946,7 @@ def test_a_slow_process_table_cannot_hold_the_stop_past_its_bound(
 ):
     # One full sample here takes six seconds, three times the stop bound.
     slow = [_SlowChild(pid, 0.3) for pid in range(100_000, 100_020)]
-    monkeypatch.setattr(psutil.Process, "children", lambda self, recursive: slow)
+    _list_descendants(monkeypatch, slow)
     label = f"slow-{os.getpid()}"
     lifetimes = LifetimeSampler(
         tmp_path / BROWSER_LIFETIMES_FILE, profile=tmp_path / "profile", label=label
@@ -753,6 +971,8 @@ def test_a_cut_short_sample_marks_nothing_gone(tmp_path):
     (record,) = lifetimes.document["processes"]
     assert record["gone_ms"] is None
     assert lifetimes.document["truncated_samples"] == 1
+    lifetimes.stop(exc=None, requested={})
+    assert record["ended"] == "unknown"
 
 
 def test_the_closing_sample_still_reads_after_a_stop_request(tmp_path, monkeypatch):
@@ -764,7 +984,7 @@ def test_the_closing_sample_still_reads_after_a_stop_request(tmp_path, monkeypat
         cmdline=lambda: ["chromium", f"--user-data-dir={profile}"],
         parent=lambda: None,
     )
-    monkeypatch.setattr(psutil.Process, "children", lambda self, recursive: [root])
+    _list_descendants(monkeypatch, [root])
     lifetimes = LifetimeSampler(
         tmp_path / BROWSER_LIFETIMES_FILE, profile=profile, label="closing"
     )
@@ -774,6 +994,77 @@ def test_the_closing_sample_still_reads_after_a_stop_request(tmp_path, monkeypat
     lifetimes._run()
     (record,) = lifetimes.document["processes"]
     assert (record["role"], record["pid"]) == ("browser-root", 4343)
+
+
+def _listed(pid: int, status: Any) -> SimpleNamespace:
+    """A descendant as ``children`` lists it, with its create time cached."""
+    return SimpleNamespace(pid=pid, create_time=lambda: 1.0, status=status)
+
+
+def _reaped(pid: int) -> Any:
+    def status() -> str:
+        raise psutil.NoSuchProcess(pid)
+
+    return status
+
+
+def test_a_root_reaped_after_the_listing_is_gone_not_unreadable(tmp_path):
+    lifetimes = LifetimeSampler(
+        tmp_path / BROWSER_LIFETIMES_FILE, profile=tmp_path / "profile", label="reaped"
+    )
+    lifetimes._track((4242, 1.0), "browser-root", 0.0)
+    lifetimes._track((4141, 1.0), "driver", 0.0)
+    # The driver reaped the killed root between the listing and the read.
+    listed = [_listed(4242, _reaped(4242)), _listed(4141, lambda: "running")]
+    me = SimpleNamespace(children=lambda recursive: listed)
+    lifetimes._sample(psutil, me)
+    lifetimes.stop(exc=None, requested={})
+    ends = {
+        p["role"]: p["ended"]
+        for p in _record(tmp_path / BROWSER_LIFETIMES_FILE)["processes"]
+    }
+    assert ends == {"browser-root": "unexpected", "driver": "alive-at-stop"}
+
+
+def _unreadable(pid: int) -> Any:
+    def status() -> str:
+        raise psutil.AccessDenied(pid)
+
+    return status
+
+
+_RUNNING = SimpleNamespace(
+    children=lambda recursive: [_listed(4141, lambda: "running")]
+)
+_UNREADABLE = SimpleNamespace(
+    children=lambda recursive: [_listed(4141, _unreadable(4141))]
+)
+
+
+@pytest.mark.parametrize(
+    ("first", "last", "ended"),
+    [
+        # A routine sample the stop request cut short, then the closing one.
+        ((_RUNNING, time.monotonic() - 1), (_RUNNING, None), "alive-at-stop"),
+        # An earlier sample that could not read the driver, then one that did.
+        ((_UNREADABLE, None), (_RUNNING, None), "alive-at-stop"),
+        # The driver seen alive, then a closing sample that could not read it.
+        ((_RUNNING, None), (_UNREADABLE, None), "unknown"),
+    ],
+    ids=["cut-short-then-read", "unreadable-then-read", "read-then-unreadable"],
+)
+def test_only_the_closing_sample_says_whether_a_process_is_alive(
+    tmp_path, first, last, ended
+):
+    lifetimes = LifetimeSampler(
+        tmp_path / BROWSER_LIFETIMES_FILE, profile=tmp_path / "profile", label="last"
+    )
+    lifetimes._track((4141, 1.0), "driver", 0.0)
+    for me, deadline in (first, last):
+        lifetimes._sample(psutil, me, deadline=deadline)
+    lifetimes.stop(exc=None, requested={})
+    (driver,) = _record(tmp_path / BROWSER_LIFETIMES_FILE)["processes"]
+    assert driver["ended"] == ended
 
 
 def test_the_origin_record_drops_the_query(tmp_path):
@@ -814,12 +1105,16 @@ def test_a_stop_does_not_wait_out_a_read_past_its_bound(tmp_path, monkeypatch):
         def cmdline(self) -> list[str]:
             return ["not-chromium"]
 
-    monkeypatch.setattr(
-        psutil.Process, "children", lambda self, recursive: [Blocking()]
-    )
+    _list_descendants(monkeypatch, [Blocking()])
     lifetimes = LifetimeSampler(
         tmp_path / BROWSER_LIFETIMES_FILE, profile=tmp_path / "profile", label="held"
-    ).start()
+    )
+    # A driver the last finished sample saw alive, which may die while the
+    # next one is blocked.
+    lifetimes._track((8, 1.0), "driver", 0.0)
+    driver = SimpleNamespace(children=lambda recursive: [_listed(8, lambda: "running")])
+    lifetimes._sample(psutil, driver)
+    lifetimes.start()
     assert holding.wait(5), "the sampler never reached the blocking read"
     stopper = threading.Thread(target=lambda: lifetimes.stop(exc=None, requested=None))
     stopper.start()
@@ -828,6 +1123,8 @@ def test_a_stop_does_not_wait_out_a_read_past_its_bound(tmp_path, monkeypatch):
     release.set()
     stopper.join(5)
     assert lifetimes.document["stopped_within_bound"] is False
+    (record,) = lifetimes.document["processes"]
+    assert record["ended"] == "unknown"
 
 
 def test_an_unreadable_process_is_not_recorded_as_gone(tmp_path):
@@ -854,33 +1151,93 @@ def test_an_unreadable_process_is_not_recorded_as_gone(tmp_path):
     assert record["gone_ms"] is None
 
 
-def test_a_death_read_during_a_sample_is_not_ordered_before_a_close(tmp_path):
+def test_a_close_after_the_machine_slept_is_not_unexpected(tmp_path, monkeypatch):
+    """The monotonic clock stops while the machine sleeps; the wall clock, which
+    the close request is stamped with, does not."""
+    lifetimes = LifetimeSampler(
+        tmp_path / BROWSER_LIFETIMES_FILE, profile=tmp_path / "profile", label="slept"
+    )
+    lifetimes._track((4242, 1.0), "browser-root", 0.0)
+    alive = SimpleNamespace(
+        children=lambda recursive: [_listed(4242, lambda: "running")]
+    )
+    gone = SimpleNamespace(children=lambda recursive: [])
+    lifetimes._sample(psutil, alive)
+    awake = time.time
+    monkeypatch.setattr(time, "time", lambda: awake() + 370)
+    asked = time.time()
+    lifetimes._sample(psutil, alive)
+    lifetimes._sample(psutil, gone)
+    lifetimes.stop(exc=None, requested={"browser-root": asked})
+    (root,) = _record(tmp_path / BROWSER_LIFETIMES_FILE)["processes"]
+    assert root["ended"] == "after-close-request"
+
+
+def test_a_wall_clock_set_back_leaves_the_order_open(tmp_path, monkeypatch):
+    lifetimes = LifetimeSampler(
+        tmp_path / BROWSER_LIFETIMES_FILE, profile=tmp_path / "profile", label="back"
+    )
+    lifetimes._track((4242, 1.0), "browser-root", 0.0)
+    alive = SimpleNamespace(
+        children=lambda recursive: [_listed(4242, lambda: "running")]
+    )
+    gone = SimpleNamespace(children=lambda recursive: [])
+    asked = time.time()
+    # Seen alive after the close was asked for, then gone once the clock is set
+    # back past the request.
+    lifetimes._sample(psutil, alive)
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() - 60)
+    lifetimes._sample(psutil, gone)
+    lifetimes.stop(exc=None, requested={"browser-root": asked})
+    (root,) = _record(tmp_path / BROWSER_LIFETIMES_FILE)["processes"]
+    assert root["ended"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    ("while_reading", "ended"),
+    [
+        # Nothing happened between the sample's start and the read.
+        (None, "unexpected"),
+        # The close was asked for after the sample began, before the zombie
+        # was read: the death may have followed it.
+        ("close", "ambiguous"),
+        # The clock was set back after the close, before the zombie was read.
+        ("clock-back", "ambiguous"),
+    ],
+)
+def test_a_zombie_is_ordered_by_when_it_was_read(
+    tmp_path, monkeypatch, while_reading, ended
+):
+    """A root its driver has not reaped yet is gone. Its end is ordered by when
+    the sampler read it, never by when that sample began."""
     lifetimes = LifetimeSampler(
         tmp_path / BROWSER_LIFETIMES_FILE, profile=tmp_path / "profile", label="order"
     )
     lifetimes._track((6161, 1.0), "browser-root", 0.0)
+    asked: dict[str, float] = {}
+    real = time.time
 
-    class DiedWhileReading:
-        pid = 6161
-
-        def create_time(self) -> float:
-            return 1.0
-
-        def status(self) -> str:
-            return psutil.STATUS_ZOMBIE
+    def zombie() -> str:
+        if while_reading is not None and not asked:
+            asked["browser-root"] = real()
+            time.sleep(0.02)
+        if while_reading == "clock-back":
+            monkeypatch.setattr(time, "time", lambda: real() - 60)
+        return psutil.STATUS_ZOMBIE
 
     lifetimes._sample(
-        psutil, SimpleNamespace(children=lambda recursive: [DiedWhileReading()])
+        psutil, SimpleNamespace(children=lambda recursive: [_listed(6161, zombie)])
     )
     (record,) = lifetimes.document["processes"]
-    assert record["order_uncertain"] is True
     first_gone = record["gone_ms"]
     lifetimes._sample(
-        psutil, SimpleNamespace(children=lambda recursive: [DiedWhileReading()])
+        psutil, SimpleNamespace(children=lambda recursive: [_listed(6161, zombie)])
     )
-    assert record["gone_ms"] == first_gone
-    asked = {"browser-root": first_gone / 1000 + lifetimes._began_wall + 5}
-    assert lifetimes._ended(record, asked) == "ambiguous"
+    assert record["gone_ms"] == first_gone, "only the first read is its end"
+    asked.setdefault("browser-root", real() + 5)
+    lifetimes.stop(exc=None, requested=asked)
+    assert record["ended"] == ended
 
 
 def test_a_sampler_that_cannot_start_does_not_stop_the_launch(tmp_path, monkeypatch):

@@ -1,7 +1,7 @@
 # -- Stage 1: Build virtual environment --
 FROM python:3.13.13-slim-bookworm@sha256:355bfa66770995d7e9a0da4b3473b44d0cb451f6b56f5615ad9c39e3c4eca03f AS builder
 
-COPY --from=ghcr.io/astral-sh/uv:latest@sha256:b485bd65cc2cf1c9a93b3554012c9c3778cf7b1b5fd3d3096ce9e1226c97e1e6 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:latest@sha256:96f40d3904aad8d0bd010539001d36c8e2188b981e1334471a90c4a1d93bb490 /uv /uvx /bin/
 
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
@@ -53,6 +53,8 @@ RUN patchright install-deps chromium && \
 RUN install -d -m 0700 -o pwuser -g pwuser /home/pwuser/.linkedin-mcp
 
 COPY --chmod=755 scripts/docker-entrypoint.sh /usr/local/bin/linkedin-mcp-entrypoint
+# The login viewer's page, next to the noVNC it imports (`websockify --web`).
+COPY --chmod=644 scripts/login-viewer.html /usr/share/novnc/login.html
 
 # A full headed browser on a virtual display. No window reaches the host, and
 # HEADLESS stays overridable for anyone who deliberately wants Chromium's real
@@ -60,6 +62,9 @@ COPY --chmod=755 scripts/docker-entrypoint.sh /usr/local/bin/linkedin-mcp-entryp
 # X server to collide with.
 ENV DISPLAY=:99
 ENV HEADLESS=false
+# Names the install kind for the optional-tools request, which leaves before
+# any container detection could run.
+ENV LINKEDIN_MCP_RUNTIME=docker
 
 USER pwuser
 

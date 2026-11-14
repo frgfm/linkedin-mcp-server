@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
 from difflib import unified_diff
 from pathlib import Path
@@ -103,7 +103,7 @@ class TraceCallbacks:
 
 
 @contextmanager
-def _diagnostics_bindings(diagnostics: Any) -> Iterator[None]:
+def _diagnostics_bindings(diagnostics: Any) -> Generator[None, None, None]:
     """Bind the issue-report boundary in each exercised scraping module.
 
     A separate context manager rather than more items in `boundaries`, which
@@ -131,7 +131,7 @@ async def boundaries(
     clock: FakeClock,
     *,
     auth_result: str | None = None,
-) -> AsyncIterator[None]:
+) -> AsyncGenerator[None, None]:
     real_scroll_body = session_module.scroll_to_bottom
     real_scroll_sidebar = session_module.scroll_job_sidebar
     real_drain = feed_module.FeedScraper._drain_listener_tasks

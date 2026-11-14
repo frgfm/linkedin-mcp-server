@@ -19,6 +19,7 @@ from linkedin_mcp_server.linkedin.contracts import (
 from linkedin_mcp_server.linkedin.conversations import ConversationReader
 from linkedin_mcp_server.linkedin.feed import FeedReader
 from linkedin_mcp_server.linkedin.job_pages import JobPageReader
+from linkedin_mcp_server.linkedin.job_policy import JobsTrackerStage
 from linkedin_mcp_server.linkedin.jobs import JobReader
 from linkedin_mcp_server.linkedin.message_sender import MessageSender
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
@@ -161,6 +162,10 @@ class LinkedInExtractor:
         """Read how a job posting takes applications and the employer's link."""
         return await self._jobs.get_job_apply_url(job_id)
 
+    async def get_easy_apply_form(self, job_id: str) -> dict[str, Any]:
+        """Read the questions of a job posting's Easy Apply form."""
+        return await self._jobs.get_easy_apply_form(job_id)
+
     async def search_jobs(
         self,
         keywords: str,
@@ -188,9 +193,15 @@ class LinkedInExtractor:
             tool_timeout,
         )
 
-    async def get_saved_jobs(self, max_pages: int = 3) -> dict[str, Any]:
-        """List the authenticated user's saved job postings."""
-        return await self._jobs.get_saved_jobs(max_pages)
+    async def get_saved_jobs(
+        self, max_pages: int = 3, stage: JobsTrackerStage = "saved"
+    ) -> dict[str, Any]:
+        """List the authenticated user's jobs at one job-tracker stage."""
+        return await self._jobs.get_saved_jobs(max_pages, stage)
+
+    async def dismiss_job(self, job_id: str) -> dict[str, Any]:
+        """Dismiss a job from job search through its result card."""
+        return await self._jobs.dismiss_job(job_id)
 
     async def search_people(
         self,
@@ -198,6 +209,7 @@ class LinkedInExtractor:
         location: str | None = None,
         network: list[str] | None = None,
         current_company: str | None = None,
+        connection_of: str | None = None,
     ) -> dict[str, Any]:
         """Search for people and extract the results page."""
         return await self._person.search_people(
@@ -205,6 +217,7 @@ class LinkedInExtractor:
             location=location,
             network=network,
             current_company=current_company,
+            connection_of=connection_of,
         )
 
     async def search_companies(self, keywords: str) -> dict[str, Any]:
@@ -216,12 +229,14 @@ class LinkedInExtractor:
         keywords: str,
         date_posted: str | None = None,
         max_pages: int = 3,
+        content_type: str | None = None,
     ) -> dict[str, Any]:
         """Search LinkedIn posts and extract the results page."""
         return await self._posts.search_posts(
             keywords,
             date_posted=date_posted,
             max_pages=max_pages,
+            content_type=content_type,
         )
 
     async def get_inbox(self, limit: int = 20) -> dict[str, Any]:
@@ -245,6 +260,10 @@ class LinkedInExtractor:
         """Search messages by keyword."""
         return await self._conversations.search_conversations(keywords, limit)
 
+    async def archive_conversation(self, thread_id: str) -> dict[str, Any]:
+        """Archive one messaging thread by its thread id."""
+        return await self._conversations.archive_conversation(thread_id)
+
     async def send_message(
         self,
         linkedin_username: str,
@@ -261,130 +280,16 @@ class LinkedInExtractor:
             profile_urn=profile_urn,
         )
 
-
-def _legacy_extractor(extractor: LinkedInExtractor) -> Any:
-    """Build the downstream-only compatibility facade on demand."""
-    from linkedin_mcp_server.scraping.extractor import (
-        LinkedInExtractor as LegacyExtractor,
-    )
-
-    content = getattr(extractor, "_content")
-    session = getattr(content, "_session")
-    return LegacyExtractor(getattr(session, "page"))
-
-
-async def _scrape_person(
-    self: LinkedInExtractor,
-    username: str,
-    requested: set[str],
-    callbacks: Any = None,
-    max_scrolls: int | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    return await self.read_person(username, requested, callbacks, max_scrolls, **kwargs)
-
-
-async def _scrape_company(
-    self: LinkedInExtractor,
-    company_name: str,
-    requested: set[str],
-    callbacks: Any = None,
-) -> dict[str, Any]:
-    return await self.read_company(company_name, requested, callbacks)
-
-
-async def _scrape_job(self: LinkedInExtractor, job_id: str) -> dict[str, Any]:
-    return await self.read_job(job_id)
-
-
-async def _extract_structured_feed(self: LinkedInExtractor, num_posts: int = 10) -> Any:
-    return await _legacy_extractor(self).extract_feed(num_posts)
-
-
-async def _get_conversation_with_options(
-    self: LinkedInExtractor,
-    linkedin_username: str | None = None,
-    thread_id: str | None = None,
-    message_url: str | None = None,
-    index: int = 0,
-    max_scrolls: int = 3,
-) -> dict[str, Any]:
-    if message_url is not None or max_scrolls != 3:
-        return await _legacy_extractor(self).get_conversation(
-            linkedin_username, thread_id, message_url, index, max_scrolls
-        )
-    return await self.get_conversation(linkedin_username, thread_id, index)
-
-
-async def _send_message_with_compose_url(
-    self: LinkedInExtractor,
-    linkedin_username: str,
-    message: str,
-    *,
-    confirm_send: bool,
-    profile_urn: str | None = None,
-    compose_url: str | None = None,
-) -> dict[str, Any]:
-    if compose_url is None:
-        return await self.send_message(
-            linkedin_username,
+    async def reply_to_conversation(
+        self,
+        thread_id: str,
+        message: str,
+        *,
+        confirm_send: bool,
+    ) -> dict[str, Any]:
+        """Reply inside an existing thread with explicit confirmation gating."""
+        return await self._message_sender.reply_to_conversation(
+            thread_id,
             message,
             confirm_send=confirm_send,
-            profile_urn=profile_urn,
         )
-    return await _legacy_extractor(self).send_message(
-        linkedin_username,
-        message,
-        confirm_send=confirm_send,
-        profile_urn=profile_urn,
-        compose_url=compose_url,
-    )
-
-
-async def _archive_conversation(
-    self: LinkedInExtractor,
-    linkedin_username: str | None = None,
-    thread_id: str | None = None,
-    message_url: str | None = None,
-    index: int = 0,
-) -> dict[str, Any]:
-    return await _legacy_extractor(self).archive_conversation(
-        linkedin_username, thread_id, message_url, index
-    )
-
-
-async def _get_pending_invitations(
-    self: LinkedInExtractor, limit: int = 20, kind: str = "received"
-) -> dict[str, Any]:
-    return await _legacy_extractor(self).get_pending_invitations(limit=limit, kind=kind)
-
-
-async def _get_connections(self: LinkedInExtractor, limit: int = 20) -> dict[str, Any]:
-    return await _legacy_extractor(self).get_connections(limit=limit)
-
-
-async def _act_on_invitation(
-    self: LinkedInExtractor,
-    linkedin_username: str,
-    action: str,
-) -> dict[str, Any]:
-    return await _legacy_extractor(self).act_on_invitation(linkedin_username, action)
-
-
-for _name, _method in {
-    "scrape_person": _scrape_person,
-    "scrape_company": _scrape_company,
-    "scrape_job": _scrape_job,
-    "extract_structured_feed": _extract_structured_feed,
-    "get_conversation_with_options": _get_conversation_with_options,
-    "send_message_with_compose_url": _send_message_with_compose_url,
-    "archive_conversation": _archive_conversation,
-    "get_pending_invitations": _get_pending_invitations,
-    "get_connections": _get_connections,
-    "act_on_invitation": _act_on_invitation,
-}.items():
-    setattr(
-        LinkedInExtractor,
-        _name,
-        property(lambda self, method=_method: method.__get__(self, type(self))),
-    )

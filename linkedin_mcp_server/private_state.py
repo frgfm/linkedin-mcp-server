@@ -32,7 +32,7 @@ import sys
 import tempfile
 import threading
 import contextlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -80,7 +80,7 @@ def _same_entry(first: os.stat_result, second: os.stat_result) -> bool:
 
 
 @contextmanager
-def _as_private_state_error(path: Path, action: str) -> Iterator[None]:
+def _as_private_state_error(path: Path, action: str) -> Generator[None]:
     """Turn a filesystem failure into this module's own error.
 
     Every entry point here promises to raise :class:`PrivateStateError` when it
@@ -341,9 +341,15 @@ def harden_file(path: Path) -> None:
     # step afterwards names the descriptor, so there is no second lookup to
     # race. The only caller writes into a directory hardened to 0700 first, so
     # nothing else can plant the link there, but a promise this specific should
-    # not rest on where it happens to be called from.
+    # not rest on where it happens to be called from. O_NONBLOCK for the same
+    # reason: a FIFO swapped in after the check above would otherwise hold the
+    # open until a writer came, before fstat below could refuse it. It changes
+    # nothing for a regular file.
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        fd = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+        )
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.EMLINK):
             raise PrivateStateError(

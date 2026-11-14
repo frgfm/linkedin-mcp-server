@@ -1,9 +1,11 @@
 """
-LinkedIn feed scraping tool.
+LinkedIn feed reading tool.
 
-Fetches structured posts from the authenticated user's LinkedIn home feed.
-Scroll progress uses permalinks observed in SDUI pagination responses; post
-fields come from minimal DOM structure plus innerText.
+Fetches posts from the authenticated user's LinkedIn home feed using
+innerText extraction. Scrolls until the requested number of post
+permalinks have been observed in SDUI pagination responses — a
+locale-independent progress signal, since the feed DOM exposes no
+stable per-post container selector.
 """
 
 import logging
@@ -13,12 +15,12 @@ from fastmcp import Context, FastMCP
 from pydantic import Field
 
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
-from linkedin_mcp_server.core.exceptions import AuthenticationError
-from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
-from linkedin_mcp_server.error_handler import raise_tool_error
-from linkedin_mcp_server.scraping.contracts import RATE_LIMITED_SECTION_TEXT
-from linkedin_mcp_server.scraping.contracts import rate_limited_section_error
-from linkedin_mcp_server.scraping.link_metadata import FeedPost, Reference
+from linkedin_mcp_server.dependencies import get_ready_extractor, tool_errors
+from linkedin_mcp_server.linkedin.contracts import RATE_LIMITED_SECTION_TEXT
+from linkedin_mcp_server.linkedin.contracts import rate_limited_section_error
+from linkedin_mcp_server.linkedin.legacy import _extractor_for as legacy_extractor_for
+from linkedin_mcp_server.linkedin.link_metadata import Reference
+from linkedin_mcp_server.scraping.link_metadata import FeedPost
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +34,9 @@ def register_feed_tools(
         timeout=tool_timeout,
         title="Get Feed",
         annotations={"readOnlyHint": True, "openWorldHint": True},
-        tags={"feed", "scraping"},
+        tags={"feed"},
     )
+    @tool_errors
     async def get_feed(
         ctx: Context,
         num_posts: Annotated[int, Field(ge=1, le=50)] = 10,
@@ -44,16 +47,15 @@ def register_feed_tools(
         Args:
             ctx: FastMCP context for progress reporting
             num_posts: Number of posts to fetch (1-50, default 10).
-                       Posts are loaded in batches of ~5 as the page scrolls.
+                       Posts are loaded in batches of ~5 as the page scrolls,
+                       so the actual count may slightly exceed the target.
 
         Returns:
             Dict with url, sections, and optional keys:
             - sections["feed"]: list of structured posts. Each entry is
               {url, post_age, author: {name, profile_url, headline, degree},
               content, is_promoted, media, reactions_count, comment_count,
-              repost_count}. ``url``/``profile_url`` are relative paths;
-              ``media`` is null or {type: link|image|video, url}; counts are
-              null when LinkedIn renders none. See FeedPost in link_metadata.py.
+              repost_count}.
             - references["feed"]: list of {kind: "feed_post", url, ...}
               entries. URLs are relative paths and may carry either
               ``/feed/update/<urn>/`` (DOM-anchor-derived) or
@@ -62,54 +64,39 @@ def register_feed_tools(
             - section_errors: present when the feed is rate-limited or
               extraction fails.
 
-            Truncated post bodies are not auto-expanded. Follow the post's
-            ``url`` when present; otherwise use ``references["feed"]``.
+            Truncated posts are not auto-expanded; full text for any post
+            is reachable via its permalink in references["feed"]. The LLM
+            should parse sections["feed"] for post bodies.
         """
-        try:
-            extractor = await get_ready_extractor(ctx, tool_name="get_feed")
-            logger.info("Scraping feed (num_posts=%d)", num_posts)
+        extractor = await get_ready_extractor(ctx, tool_name="get_feed")
+        logger.info("Reading feed (num_posts=%d)", num_posts)
 
-            await ctx.report_progress(
-                progress=0, total=100, message="Starting feed scrape"
-            )
+        await ctx.report_progress(
+            progress=0, total=100, message="Reading the home feed"
+        )
 
-            if hasattr(type(extractor), "extract_structured_feed"):
-                extracted = await getattr(extractor, "extract_structured_feed")(
-                    num_posts=num_posts
-                )
-            else:
-                extracted = await extractor.extract_feed(num_posts=num_posts)
+        extracted = await legacy_extractor_for(extractor).extract_feed(
+            num_posts=num_posts
+        )
 
-            url = "https://www.linkedin.com/feed/"
-            # Only ever holds sections["feed"] -> list[FeedPost]; typed precisely
-            # rather than dict[str, Any] so a stray value can't slip in.
-            sections: dict[str, list[FeedPost]] = {}
-            references: dict[str, list[Reference]] = {}
-            section_errors: dict[str, dict[str, Any]] = {}
-            if extracted.text == RATE_LIMITED_SECTION_TEXT:
-                section_errors["feed"] = rate_limited_section_error()
-            elif extracted.error:
-                section_errors["feed"] = extracted.error
-            else:
-                # sections["feed"] is the structured FeedPost list (possibly
-                # empty); the raw-innerText blob is no longer surfaced.
-                sections["feed"] = getattr(extracted, "posts", [])
-                if extracted.references:
-                    references["feed"] = extracted.references
+        url = "https://www.linkedin.com/feed/"
+        sections: dict[str, list[FeedPost]] = {}
+        references: dict[str, list[Reference]] = {}
+        section_errors: dict[str, dict[str, Any]] = {}
+        if extracted.text == RATE_LIMITED_SECTION_TEXT:
+            section_errors["feed"] = rate_limited_section_error()
+        elif extracted.error:
+            section_errors["feed"] = extracted.error
+        else:
+            sections["feed"] = getattr(extracted, "posts", [])
+            if extracted.references:
+                references["feed"] = extracted.references
 
-            await ctx.report_progress(progress=100, total=100, message="Complete")
+        await ctx.report_progress(progress=100, total=100, message="Complete")
 
-            result: dict[str, Any] = {"url": url, "sections": sections}
-            if references:
-                result["references"] = references
-            if section_errors:
-                result["section_errors"] = section_errors
-            return result
-
-        except AuthenticationError as e:
-            try:
-                await handle_auth_error(e, ctx)
-            except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "get_feed")
-        except Exception as e:
-            raise_tool_error(e, "get_feed")
+        result: dict[str, Any] = {"url": url, "sections": sections}
+        if references:
+            result["references"] = references
+        if section_errors:
+            result["section_errors"] = section_errors
+        return result

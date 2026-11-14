@@ -133,7 +133,15 @@ async def test_registered_tools_match_extractor_delegates():
     tools = await create_mcp_server().list_tools()
     tool_names = {tool.name for tool in tools}
 
-    assert tool_names == {*TOOL_DELEGATES, "get_job_apply_url", "close_session"}
+    assert tool_names == {
+        *TOOL_DELEGATES,
+        "get_job_apply_url",
+        "get_easy_apply_form",
+        "dismiss_job",
+        "reply_to_conversation",
+        "get_session_status",
+        "close_session",
+    }
     assert set(TOOL_DELEGATES.values()) == TOOL_FACADE_METHODS
     assert "close_session" not in TOOL_DELEGATES
 

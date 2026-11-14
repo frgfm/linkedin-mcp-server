@@ -23,6 +23,8 @@ _SPEC.loader.exec_module(run_uv_audit)
 _CI_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "ci.yml"
 _AUDIT_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "dependency-audit.yml"
 _RELEASE_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "release.yml"
+_EVIDENCE_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "differential-evidence.yml"
+_FORWARDER_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "forwarder-compat.yml"
 _DEPENDENCY_REVIEW = (
     "actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0"
 )
@@ -122,7 +124,8 @@ def test_dependency_audit_is_scheduled_manual_and_informational() -> None:
     assert "push" not in triggers
     assert audit["strategy"]["fail-fast"] is False
     assert audit["strategy"]["matrix"]["scope"] == ["runtime", "full"]
-    assert audit["steps"][1]["with"]["version"] == "0.12.13"
+    # An exact release, so a new uv cannot change the audit output on its own.
+    assert re.fullmatch(r"\d+\.\d+\.\d+", audit["steps"][1]["with"]["version"])
     assert audit["steps"][1]["with"]["enable-cache"] is False
     assert "scripts/run_uv_audit.py" in audit["steps"][2]["run"]
     assert audit["steps"][3]["if"] == "always()"
@@ -314,7 +317,13 @@ def test_full_audit_includes_the_development_group(
 
 
 def test_new_workflow_actions_are_sha_pinned() -> None:
-    for path in (_CI_WORKFLOW, _AUDIT_WORKFLOW, _RELEASE_WORKFLOW):
+    for path in (
+        _CI_WORKFLOW,
+        _AUDIT_WORKFLOW,
+        _RELEASE_WORKFLOW,
+        _EVIDENCE_WORKFLOW,
+        _FORWARDER_WORKFLOW,
+    ):
         workflow = path.read_text(encoding="utf-8")
         uses = [line for line in workflow.splitlines() if "uses:" in line]
         assert uses

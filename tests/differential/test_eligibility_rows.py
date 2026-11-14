@@ -31,7 +31,7 @@ import contextlib
 import os
 import sys
 import uuid
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -165,7 +165,9 @@ def _point_at(profile: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @contextlib.contextmanager
-def planted(row: str, profile: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+def planted(
+    row: str, profile: Path, monkeypatch: pytest.MonkeyPatch
+) -> Generator[Path]:
     """The cell's provider metadata in place for the whole cell, and the
     profile it runs on; removed exactly afterwards, whatever the cell did.
 
@@ -183,7 +185,7 @@ def planted(row: str, profile: Path, monkeypatch: pytest.MonkeyPatch) -> Iterato
         )
     if os.environ.get("PYTEST_XDIST_WORKER"):
         pytest.fail("provider metadata cells run one at a time, never under xdist")
-    from linkedin_mcp_server import daemon_descriptor
+    from linkedin_mcp_server.daemon import descriptor as daemon_descriptor
     from linkedin_mcp_server.session_state import canonical
 
     if case.plant == CLOUD_STORAGE:

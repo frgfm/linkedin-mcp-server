@@ -1,12 +1,13 @@
 """The harness core: account boundary, watcher, host stub, and row H-R1.
 
 **Account boundary.** Spawned actors use the account's *real* daemon state
-root, because ``daemon_descriptor._account_home`` ignores ``HOME`` on purpose
-and the owner is started by production code that has nowhere to inject a
-redirection. What keeps them off the user's state is the key: the daemon
-directory is a hash of the auth root, and every row's auth root is a fresh
-temporary directory, so cleanup has one exact target (``daemon_dir``). This is
-the policy of ``real_state_root`` in ``tests/test_daemon_election.py``.
+root, as the gate in ``docs/decisions/2026-09-26-daemon-default-on-contract.md``
+specifies, and the frozen baseline has no other root to use. The rest of the
+suite gives its processes a temporary account home instead
+(``isolate_daemon_state`` in ``tests/conftest.py``), which the rows opt out of.
+What keeps them off the user's state is the key: the daemon directory is a hash
+of the auth root, and every row's auth root is a fresh temporary directory, so
+cleanup has one exact target (``daemon_dir``).
 
 The one auth root no row may ever use is the user's, ``~/.linkedin-mcp``.
 ``claim_account`` refuses it, and anything that contains it or sits inside it,
@@ -84,7 +85,9 @@ serve settles that successor in the identified owner's place. **Rows H-R8 and
 H-R9** (``owner_loss``) lose the owner before a call and after the dispatch of
 a mutating one, through ``OwnerLossSeams``: killed or stopped through the
 handle the row tied it by, or its old address answered by a declared
-responder; a stopped owner is resumed on every path. **Rows H-R10a, H-R10b
+responder; a stopped owner is resumed on every path. **Row H-R6-contended**
+(``crash_overlap``, Windows) kills the same way under a contender armed on the
+profile's lock and asks for a successor's browser at once. **Rows H-R10a, H-R10b
 and H-R15** (``profile_commands``) run the profile commands themselves, the
 row's own command line with ``--logout``, ``--login``,
 ``--import-from-browser`` or ``--status``, on a pseudo-terminal or on pipes,
@@ -114,6 +117,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import socket
@@ -123,9 +127,10 @@ import sys
 import threading
 import time
 from collections.abc import (
-    AsyncIterator,
+    AsyncGenerator,
     Awaitable,
     Callable,
+    Generator,
     Iterable,
     Iterator,
     Mapping,
@@ -155,6 +160,7 @@ from typing_extensions import Unpack
 from differential import (
     auth_repair,
     call_loss,
+    crash_overlap,
     eligibility_rows,
     host_comparison,
     lease_probe,
@@ -172,7 +178,19 @@ from differential.baseline import (
     interpreter_failures,
     stage_frozen_session,
 )
-from differential.events import EventLog, read_jsonl
+from differential.daemon_state import (
+    BASELINE_LAYOUT,
+    CANDIDATE_LAYOUT,
+    DaemonStateLayout,
+)
+from differential.events import (
+    OUTPUT_FILES,
+    OWNER_LOG_FILE,
+    CappedOutput,
+    EventLog,
+    keep_capped,
+    read_jsonl,
+)
 from differential.fault_overlay import events as fault_events
 from differential.fault_overlay import (
     publish_activation,
@@ -238,8 +256,10 @@ from differential.session import (
     write_synthetic_cookie_file,
 )
 from differential.signals import COMPLETE as ORACLE_COMPLETE
+from differential.signals import HELD as O2_HELD
 from differential.signals import INCOMPLETE as O2_INCOMPLETE
 from differential.signals import UNAVAILABLE as ORACLE_UNAVAILABLE
+from differential.signals import UNKNOWN as O2_UNKNOWN
 from differential.signals import UNOBSERVED as O2_UNOBSERVED
 from differential.signals import VIOLATED as O2_VIOLATED
 from differential.signals import (
@@ -306,7 +326,7 @@ from differential.unconfirmed_close import _ended as _popen_ended
 from differential.unconfirmed_close import POST_SETTLEMENT as R7_POST_SETTLEMENT
 from differential.watcher import (
     LAUNCHER_ENV,
-    OWNER_MODULE,
+    OWNER_MODULES,
     SERVER_MODULE,
     USER_DATA_DIR_FLAG,
     another_user,
@@ -318,10 +338,10 @@ from differential.watcher import (
     read_arguments,
     user_data_dir,
 )
-from linkedin_mcp_server import daemon_descriptor
+from linkedin_mcp_server.daemon import descriptor as daemon_descriptor
 from linkedin_mcp_server.config.loaders import EnvironmentKeys
-from linkedin_mcp_server.daemon_auth import MARKER_KEY as AUTH_MARKER_KEY
-from linkedin_mcp_server.daemon_liveness import REFUSAL_KEY
+from linkedin_mcp_server.daemon.auth_repair import MARKER_KEY as AUTH_MARKER_KEY
+from linkedin_mcp_server.daemon.liveness import REFUSAL_KEY
 from linkedin_mcp_server.session_state import portable_cookie_path
 
 REAL_AUTH_ROOT_NAME = ".linkedin-mcp"
@@ -542,6 +562,9 @@ class ActorAccount:
     """A profile the harness may hand to actors. Built only by ``claim_account``."""
 
     profile: Path
+    #: Where the row's runtime keeps its daemon state: the candidate's own,
+    #: unless the row runs the frozen baseline (``run_row``).
+    layout: DaemonStateLayout = CANDIDATE_LAYOUT
 
     @property
     def auth_root(self) -> Path:
@@ -665,7 +688,7 @@ def actor_environment(
 
 
 @contextlib.contextmanager
-def process_environment(settings: Mapping[str, str]) -> Iterator[None]:
+def process_environment(settings: Mapping[str, str]) -> Generator[None]:
     """*settings* over this process's own environment for the block, then
     exactly what was there before, an absent name absent again.
 
@@ -1128,6 +1151,60 @@ def watcher_failures(
     return failures
 
 
+#: The driver's own line, as written when its stderr is not a terminal:
+#: ``toISOString()``, a space, the ``pw:browser`` channel, a space. Measured
+#: on both locked drivers. A server record is JSON and starts with ``{``, so
+#: the channel token has to be here and not merely somewhere in the line: a
+#: Chrome path can contain the words ``pw:browser``.
+_DRIVER_LINE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z pw:browser(?:\s|$)"
+)
+
+
+#: What the driver did with the browser, a few lines per launch. The text
+#: file keeps its head, so an exit that follows a storm of browser output is
+#: past the cap; these are what that exit has to leave in the event log.
+def driver_diagnostic(line: str) -> bool:
+    """Whether *line* is the driver's browser log rather than the server's.
+
+    The ``<launching>`` line names the browser cache. A cache directory called
+    ``login`` matches the loss notice (``session._LOSS``), so a lost session
+    the server never mentioned would read as one it announced.
+    """
+    return _DRIVER_LINE.match(line) is not None
+
+
+#: What the driver did with the browser, as it logs it: ``<launching>`` and
+#: ``[pid=N] <process did exit: ...>``, ``<gracefully close start>``,
+#: ``<kill>`` and ``<will force kill>``. The browser's own output is
+#: ``[pid=N][err]`` or ``[pid=N][out]`` and can quote the same words; that is
+#: chatter, one line per thing the browser prints, and it stays in the capped
+#: file. Measured in the locked drivers.
+_DRIVER_LIFECYCLE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z pw:browser "
+    r"(?:<launching> |\[pid=\d+\] <(?:"
+    r"process did exit|gracefully close start|will force kill|kill))"
+)
+
+
+def driver_lifecycle(line: str) -> bool:
+    """A driver line that says it launched, closed, killed or saw the exit."""
+    return _DRIVER_LIFECYCLE.match(line) is not None
+
+
+def note_server_output(session: Any, line: str) -> None:
+    """Remember *line* as what the server showed, unless the driver wrote it.
+
+    Both lists are what a row classifies (``user_lines`` for who was told,
+    ``stderr`` for the server's own reports). The line still goes to the
+    evidence file through the caller's own callback.
+    """
+    if driver_diagnostic(line):
+        return
+    session.stderr.append(line)
+    session.user_lines.append(line)
+
+
 # --- Host stub ---------------------------------------------------------------
 
 
@@ -1256,19 +1333,25 @@ class HostQuitTransport(ClientTransport):
         its next write finds the pipe broken: what the kernel does to both
         pipes when a host goes away, named pipe loss here and never host
         death, which ``StubHost`` makes. A failure is ``loss_error``.
+
+        Stdout goes first. Both closes reach their descriptors from the loop's
+        callback queue, which runs in order, so the server cannot read EOF
+        while its stdout still takes a write. Closed after stdin, the server
+        had until this coroutine was next scheduled to answer the EOF with a
+        write that went through.
         """
         process = self.process
         assert process is not None and process.stdin is not None
         self.mark_lost(termination)
         errors = []
-        try:
-            await process.stdin.aclose()
-        except Exception as exc:  # noqa: BLE001 - recorded, and judged by the row
-            errors.append(f"closing stdin: {type(exc).__name__}: {exc}")
         if termination == call_loss.PIPE_LOSS:
             problem = close_read_end(process, 1)
             if problem is not None:
                 errors.append(problem)
+        try:
+            await process.stdin.aclose()
+        except Exception as exc:  # noqa: BLE001 - recorded, and judged by the row
+            errors.append(f"closing stdin: {type(exc).__name__}: {exc}")
         self.loss_error = "; ".join(errors) or None
 
     async def server_exit(self, seconds: float) -> dict[str, Any]:
@@ -1302,7 +1385,7 @@ class HostQuitTransport(ClientTransport):
         *,
         transport_options: TransportOptions | None = None,
         **session_kwargs: Unpack[SessionKwargs],
-    ) -> AsyncIterator[ClientSession]:
+    ) -> AsyncGenerator[ClientSession]:
         options = transport_options or TransportOptions()
         process = await anyio.open_process(
             self.command,
@@ -1624,8 +1707,7 @@ async def run_host_session(
     session = HostSession()
 
     def remember(line: str) -> None:
-        session.stderr.append(line)
-        session.user_lines.append(line)
+        note_server_output(session, line)
         on_stderr(line)
 
     transport = HostQuitTransport(
@@ -1876,7 +1958,7 @@ class StubHost:
             self.on_stderr(buffer.rstrip("\r"))
 
     @contextlib.asynccontextmanager
-    async def running(self) -> AsyncIterator[StubHost]:
+    async def running(self) -> AsyncGenerator[StubHost]:
         """The stub started, its server started and initialized, until left;
         then the corrective stop, whatever ended it."""
         process = await anyio.open_process(
@@ -2217,7 +2299,7 @@ class HttpHost:
             await process.wait()
 
     @contextlib.asynccontextmanager
-    async def running(self) -> AsyncIterator[HttpHost]:
+    async def running(self) -> AsyncGenerator[HttpHost]:
         """The server started and listening, until left; then the corrective
         stop, whatever ended it."""
         process = await anyio.open_process(
@@ -2295,8 +2377,7 @@ async def run_http_host_session(
     session = HostSession(transport=STREAMABLE_HTTP)
 
     def remember(line: str) -> None:
-        session.stderr.append(line)
-        session.user_lines.append(line)
+        note_server_output(session, line)
         on_stderr(line)
 
     host = HttpHost(
@@ -2405,8 +2486,7 @@ async def run_stub_host_session(
     session = HostSession()
 
     def remember(line: str) -> None:
-        session.stderr.append(line)
-        session.user_lines.append(line)
+        note_server_output(session, line)
         on_stderr(line)
 
     host = StubHost(command, env=env, cwd=cwd, on_stderr=remember)
@@ -2570,13 +2650,16 @@ class ProfileCensus:
     ``complete`` only when every process could be judged: its command line
     read, or it established as unrelated the way the watcher establishes it
     (another user, or a readable executable that cannot be the browser), or,
-    for a zombie, the whole process shown to have exited. An empty
-    ``processes`` from an incomplete census is not an empty profile.
+    for a zombie, the whole process shown to have exited (``zombie_unresolved``).
+    An empty ``processes`` from an incomplete census is not an empty profile.
     """
 
     processes: list[Any] = field(default_factory=list)
     #: Processes whose arguments could not be read and that were not excluded.
     unresolved: list[int] = field(default_factory=list)
+    #: Why each of ``unresolved`` was kept, in the same order, each with its
+    #: ``pid`` and the ``phase`` that could not judge it. Evidence only.
+    provenance: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def pids(self) -> list[int]:
@@ -2585,6 +2668,37 @@ class ProfileCensus:
     @property
     def complete(self) -> bool:
         return not self.unresolved
+
+    def unresolve(self, pid: int, **why: Any) -> None:
+        """Keep *pid* unresolved, with what the census read of it."""
+        self.unresolved.append(pid)
+        self.provenance.append({"pid": pid, **why})
+
+
+#: ``pid_state``: nothing is at the pid any more.
+PID_GONE = "gone"
+#: ``pid_state``: a process, a zombie included, is at the pid.
+PID_PRESENT = "present"
+
+
+def pid_state(pid: int, *, open_process: Callable[[int], Any] = psutil.Process) -> str:
+    """Whether anything is at *pid*, looked up now.
+
+    ``PID_GONE`` only when the lookup finds nothing, ``PID_PRESENT`` for any
+    process there, and otherwise ``unknown: ...`` with what failed. A zombie
+    is present even though psutil raises it as a ``NoSuchProcess``. A later
+    process at a reused pid is present too: telling it apart would take a
+    start time, and the public one moves with the wall clock.
+    """
+    try:
+        open_process(pid)
+    except psutil.ZombieProcess:
+        return PID_PRESENT
+    except psutil.NoSuchProcess:
+        return PID_GONE
+    except (psutil.Error, OSError) as exc:
+        return f"unknown: {type(exc).__name__}"
+    return PID_PRESENT
 
 
 def thread_count(process: Any) -> int | None:
@@ -2618,6 +2732,40 @@ def exited_zombie(
     if not (sys.platform.startswith("linux") if linux is None else linux):
         return True
     return threads_of(process) == 1
+
+
+def zombie_unresolved(
+    process: Any,
+    *,
+    linux: bool | None = None,
+    threads_of: Callable[[Any], int | None] = thread_count,
+    open_process: Callable[[int], Any] = psutil.Process,
+) -> dict[str, Any] | None:
+    """Why a zombie the census listed cannot be excluded; None once its whole
+    process is shown to have exited.
+
+    First ``exited_zombie``. A count that shows nothing on Linux can also mean
+    the zombie was reaped after the table was read, which takes its
+    ``/proc/<pid>/task`` with it, so the pid is looked up again: excluded only
+    once nothing is there, never because a read failed.
+    """
+    counted: list[int | None] = []
+
+    def count(target: Any) -> int | None:
+        counted.append(threads_of(target))
+        return counted[-1]
+
+    if exited_zombie(process, linux=linux, threads_of=count):
+        return None
+    lookup = pid_state(process.pid, open_process=open_process)
+    if lookup == PID_GONE:
+        return None
+    return {
+        "phase": "zombie",
+        "status": psutil.STATUS_ZOMBIE,
+        "threads": counted[-1] if counted else None,
+        "lookup": lookup,
+    }
 
 
 def process_table(attrs: Sequence[str]) -> Iterator[Any]:
@@ -2654,6 +2802,9 @@ def profile_census(
     browser_dir: str | Path | None = None,
     process_iter: Callable[..., Iterable[Any]] | None = None,
     user: object | None = None,
+    linux: bool | None = None,
+    threads_of: Callable[[Any], int | None] = thread_count,
+    open_process: Callable[[int], Any] = psutil.Process,
 ) -> ProfileCensus:
     """Every process, root or child, running a browser on this row's profile.
 
@@ -2665,17 +2816,25 @@ def profile_census(
     census = ProfileCensus()
     try:
         processes = list((process_iter or process_table)(["cmdline", "exe", "status"]))
-    except psutil.Error:
-        return ProfileCensus(unresolved=[-1])
+    except psutil.Error as exc:
+        census.unresolve(-1, phase="table", error=type(exc).__name__)
+        return census
     for process in processes:
         info = getattr(process, "info", {}) or {}
         cmdline = info.get("cmdline")
         if info.get("status") == psutil.STATUS_ZOMBIE:
             # Exited and not yet reaped, then nothing is running there; but
             # a zombie leader can still have threads that hold the profile.
-            if exited_zombie(process) or another_user(process_user(process), owner):
+            if another_user(process_user(process), owner):
                 continue
-            census.unresolved.append(process.pid)
+            why = zombie_unresolved(
+                process,
+                linux=linux,
+                threads_of=threads_of,
+                open_process=open_process,
+            )
+            if why is not None:
+                census.unresolve(process.pid, **why)
             continue
         if cmdline is None:
             if another_user(process_user(process), owner):
@@ -2683,7 +2842,9 @@ def profile_census(
             exe = info.get("exe")
             if exe and not possible_browser(exe, browser_exe, directory):
                 continue
-            census.unresolved.append(process.pid)
+            census.unresolve(
+                process.pid, phase="arguments", status=info.get("status"), exe=exe
+            )
             continue
         for argument in cmdline:
             if not argument.startswith(USER_DATA_DIR_FLAG):
@@ -3194,13 +3355,13 @@ def retire_daemon_state(
     Removed only once the owner is provably gone or was never published.
     Otherwise the directory stays, as the evidence of what was left running.
     """
-    directory = daemon_descriptor.daemon_dir(account.auth_root)
+    directory = account.layout.directory(account.auth_root)
     existed = directory.exists()
     published: PublishedOwner | None = None
     read_error: str | None = None
     if existed:
         try:
-            descriptor = daemon_descriptor.read(account.auth_root)
+            descriptor = account.layout.read(account.auth_root)
         except Exception as exc:  # noqa: BLE001 - the cleanup reports it
             read_error = f"{type(exc).__name__}: {exc}"
         else:
@@ -3442,7 +3603,7 @@ def owner_launches(observed: Iterable[dict[str, Any]]) -> list[int]:
             if record.get("kind") in ("process.start", "process.update")
             and record.get("in_row") is True
             and isinstance(record.get("cmdline"), list)
-            and invoked_module(record["cmdline"]) == OWNER_MODULE
+            and invoked_module(record["cmdline"]) in OWNER_MODULES
         }
     )
 
@@ -3469,12 +3630,12 @@ def owner_gate(cmdline: Sequence[str], gates: Sequence[Path]) -> bool:
 
     Exactly what ``process_tree.windows_gate_command`` builds around the
     owner: ``<python> -I -S -u <runtime>/linkedin_mcp_server/process_gate.py
-    <nonce> -- <python> ... -m linkedin_mcp_server.daemon_owner ...``, with
+    <nonce> -- <python> ... -m linkedin_mcp_server.daemon.owner ...``, with
     the gate one of *gates* after resolution, the nonce the 64 hex digits
-    ``process_gate`` accepts, and the target running the owner module by the
-    interpreter's own option grammar. The gate holds the owner until the
-    frontend releases it, so it shows an owner start was attempted, not that
-    owner code ran.
+    ``process_gate`` accepts, and the target running either build's owner
+    module (``OWNER_MODULES``) by the interpreter's own option grammar. The
+    gate holds the owner until the frontend releases it, so it shows an owner
+    start was attempted, not that owner code ran.
     """
     command = list(cmdline)
     if len(command) < 8 or command[1:4] != _GATE_FLAGS:
@@ -3486,7 +3647,7 @@ def owner_gate(cmdline: Sequence[str], gates: Sequence[Path]) -> bool:
         return False
     if command[6] != "--":
         return False
-    return invoked_module(command[7:]) == OWNER_MODULE
+    return invoked_module(command[7:]) in OWNER_MODULES
 
 
 def owner_gates(observed: Iterable[dict[str, Any]], gates: Sequence[Path]) -> list[int]:
@@ -3521,6 +3682,114 @@ def browser_lineage(observed: Iterable[dict[str, Any]]) -> list[list[Any]]:
     the watcher never saw that ancestor. A launch that read a page had a
     browser of its own, so this names which launch could have read what,
     whatever its process timing.
+    """
+    _, browsers, gone, parent_of = _lifetimes(observed)
+    roots = []
+    for key in sorted(browsers, key=lambda key: key[1]):
+        parent = parent_of(key)
+        if parent is not None and parent in browsers:
+            continue
+        launcher = parent_of(parent) if parent is not None else None
+        roots.append(
+            [
+                key[0],
+                key[1],
+                gone.get(key),
+                launcher[0] if launcher is not None else None,
+                launcher[1] if launcher is not None else None,
+            ]
+        )
+    return roots
+
+
+#: Arguments only a Chromium process carries: a child's process type, and
+#: the profile every browser launch names.
+_CHROMIUM_MARKERS = ("--type=", "--user-data-dir")
+
+
+def browser_processes(
+    observed: Iterable[dict[str, Any]], browser_key: str
+) -> list[list[Any]]:
+    """Every browser process the watcher saw this row's actors start, members
+    as well as roots, with its tree's root: ``[pid, start, gone, root pid,
+    root start]``. What a crash row holds an old browser's members to
+    (``crash_overlap``), where ``browser_lineage`` names the roots alone.
+
+    The watcher samples, so this is what its samples saw: a process whose
+    whole lifetime fell between two samples is in no record and not here.
+
+    A process a browser started is a browser too, whatever its command line;
+    *gone* and the parent rule are ``browser_lineage``'s. A browser outside
+    every tree roots one of its own only on proof: a record of it reads a
+    root's command line, ``--user-data-dir`` without ``--type=``, on the
+    profile *browser_key*, or, its arguments withheld, names that profile as
+    the watcher read it. Anything else that reaches no tree, its parent never
+    sampled or no browser, is listed with no root, ``[pid, start, gone, None,
+    None]``, when it could be a browser's helper whose ancestry was lost: it
+    runs a root's image, or its image was never read and its command line
+    carries a Chromium marker or was withheld. So a renderer is never taken
+    for a root, and never for a successor's.
+    """
+    observed = list(observed)
+    first, browsers, gone, parent_of = _lifetimes(observed)
+    # The image each lifetime last ran: the one it became, where it execs.
+    image: dict[tuple[int, float], str] = {}
+    # Lifetimes whose command line may be a Chromium process's.
+    marked: set[tuple[int, float]] = set()
+    # Lifetimes read as a browser root on the profile.
+    proven: set[tuple[int, float]] = set()
+    for record in observed:
+        pid, start, exe = (
+            record.get(name) for name in ("pid", "start_identity", "exe")
+        )
+        if type(pid) is not int or not isinstance(start, (int, float)):
+            continue
+        key = (pid, float(start))
+        if exe:
+            image[key] = str(exe)
+        arguments = record.get("cmdline") or ()
+        if (
+            record.get("cmdline_withheld")
+            or record.get("profile")
+            or any(str(a).startswith(_CHROMIUM_MARKERS) for a in arguments)
+        ):
+            marked.add(key)
+        profile = (
+            record.get("profile")
+            if record.get("cmdline_withheld")
+            else user_data_dir([str(a) for a in arguments])
+        )
+        if profile == browser_key:
+            proven.add(key)
+    root_of: dict[tuple[int, float], tuple[int | None, float | None]] = {}
+    for key in sorted(first, key=lambda key: key[1]):
+        parent = parent_of(key)
+        if parent is not None and parent in root_of:
+            root_of[key] = root_of[parent]
+        elif key in browsers and key in proven:
+            root_of[key] = key
+    roots = {
+        image[key] for key, root in root_of.items() if root == key and key in image
+    }
+    for key in first.keys() - root_of.keys():
+        if image.get(key) in roots or (key not in image and key in marked):
+            root_of[key] = (None, None)
+    return [
+        [key[0], key[1], gone.get(key), *root]
+        for key, root in sorted(root_of.items(), key=lambda item: item[0][1])
+    ]
+
+
+def _lifetimes(
+    observed: Iterable[dict[str, Any]],
+) -> tuple[
+    dict[tuple[int, float], dict[str, Any]],
+    set[tuple[int, float]],
+    dict[tuple[int, float], float],
+    Callable[[tuple[int, float]], tuple[int, float] | None],
+]:
+    """The watcher's records by lifetime: each one's first record, the
+    browsers, when each was seen gone, and each one's parent.
 
     A lifetime is a browser if any record of it says so: a child sampled
     between fork and exec is first seen with its parent's command line and
@@ -3548,30 +3817,18 @@ def browser_lineage(observed: Iterable[dict[str, Any]]) -> list[list[Any]]:
             record.get("t"), (int, float)
         ):
             gone.setdefault(key, float(record["t"]))
+    by_pid: dict[int, list[float]] = {}
+    for pid, start in first:
+        by_pid.setdefault(pid, []).append(start)
 
-    def parent_of(
-        child: tuple[int, float],
-    ) -> tuple[int, float] | None:
+    def parent_of(child: tuple[int, float]) -> tuple[int, float] | None:
         ppid = first[child].get("ppid")
-        found = [key for key in first if key[0] == ppid and key[1] <= child[1]]
-        return max(found, key=lambda key: key[1]) if found else None
+        if type(ppid) is not int:
+            return None
+        starts = [start for start in by_pid.get(ppid, ()) if start <= child[1]]
+        return (ppid, max(starts)) if starts else None
 
-    roots = []
-    for key in sorted(browsers, key=lambda key: key[1]):
-        parent = parent_of(key)
-        if parent is not None and parent in browsers:
-            continue
-        launcher = parent_of(parent) if parent is not None else None
-        roots.append(
-            [
-                key[0],
-                key[1],
-                gone.get(key),
-                launcher[0] if launcher is not None else None,
-                launcher[1] if launcher is not None else None,
-            ]
-        )
-    return roots
+    return first, browsers, gone, parent_of
 
 
 def launch_lifetimes(
@@ -3595,7 +3852,7 @@ def launch_lifetimes(
     """
 
     def kind(cmdline: Sequence[str]) -> str | None:
-        if invoked_module(cmdline) == OWNER_MODULE:
+        if invoked_module(cmdline) in OWNER_MODULES:
             return "owner"
         if owner_gate(cmdline, gates):
             return "gate"
@@ -3699,6 +3956,10 @@ _LINEAGE_EXPECTED = {
 }
 
 
+#: ``row_expectations``' O1: two browser roots on the profile in one sample.
+SECOND_BROWSER = "O1: a second browser ran on the profile, or O1 is unknown"
+
+
 def row_expectations(
     vector: RowVector,
     *,
@@ -3724,7 +3985,7 @@ def row_expectations(
     if not vector.browser_seen:
         failures.append("the watcher never saw a browser on the row's profile")
     if not vector.o1_single_browser:
-        failures.append("O1: a second browser ran on the profile, or O1 is unknown")
+        failures.append(SECOND_BROWSER)
     if not vector.origin_saw_feed:
         failures.append("the synthetic origin logged no /feed/ request in the row")
     if not vector.feed_carried_session:
@@ -3876,10 +4137,10 @@ def r6_verdict(
     that witness: K2 needs a complete required trace that shows the class
     ``guardian:principal-group``, while the rest of K2's outcome stays the
     baseline's to record. On macOS the guardian's argv is the witness. K3
-    (candidate daemon) must read ``=`` and have recovered on the second call.
-    K1 (Direct killed) reads ``=`` as the non-leader server a host starts. On
-    Windows there is no guardian, so the reading is not applicable; the kill
-    and K3's recovery still are.
+    (candidate daemon) and K0, its repeat, must read ``=`` and have recovered
+    on the second call. K1 (Direct killed) reads ``=`` as the non-leader
+    server a host starts. On Windows there is no guardian, so the reading is
+    not applicable; the kill and the candidate's recovery still are.
     """
     if linux is None:
         linux = sys.platform.startswith("linux")
@@ -3892,7 +4153,7 @@ def r6_verdict(
     # post; one that failed before reading is not the row this measures.
     if vector is None or not vector.tool_succeeded:
         problems.append("the first call did not read the synthetic post")
-    if experiment == "K3" and (vector is None or vector.recovered is not True):
+    if experiment in ("K3", "K0") and (vector is None or vector.recovered is not True):
         problems.append("the frontend did not recover on the call after the kill")
     if windows:
         return problems
@@ -4434,7 +4695,13 @@ def auth_files(root: Path) -> dict[str, str]:
                     names.remove(name)
             else:
                 try:
-                    files[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    # An empty file has nothing to read, and its read may be
+                    # refused: on Windows a live trace writer's exclusive
+                    # byte-range lock on its empty `.alive` marker denies
+                    # every other handle's read.
+                    empty = path.lstat().st_size == 0
+                    content = b"" if empty else path.read_bytes()
+                    files[key] = hashlib.sha256(content).hexdigest()
                 except OSError:
                     files[key] = "unreadable"
     return files
@@ -4861,11 +5128,11 @@ def continuation_problems(
     cleanup, census, installer family, script, runtime, restoration, clock).
     K1 is the reference: Direct has no adopted Job, so no planted failure is
     required, and one reached there is the wrong topology. K2 and K3: the
-    owner that closed and a positive fault witness inside its close. K3 also:
-    core.close's negative consumption, the stand-down, the owner's exit, a
-    post-settlement recovery with nothing protected changed by its boundary,
-    and a successor that served it. No cell says which caller ended an
-    installer.
+    owner that closed and a positive fault witness inside its close. K3, and
+    K0 as its repeat, also: core.close's negative consumption, the
+    stand-down, the owner's exit, a post-settlement recovery with nothing
+    protected changed by its boundary, and a successor that served it. No
+    cell says which caller ended an installer.
     """
     if continuation is None:
         return [f"{experiment} left no native continuation"]
@@ -4978,9 +5245,10 @@ def r11_composition(
     model's conditional branch, calibrated in this process against the exact
     sources the native runtimes imported (the baseline's prohibited
     selection, the candidate's abstention and every positive control); each
-    native continuation of this run through the common gate; and K3 no worse
-    than K1 on O1, O2 and O4. A missing calibration or cell fails it: K1 and
-    K3 selected alone compose nothing. Whole-system O2 stays what the vectors
+    native continuation of this run through the common gate; K3 no worse
+    than K1 on O1, O2 and O4; and K0, K3 repeated, reading as K3 did
+    (``compare_repeat``). A missing calibration or cell fails it: K1 and K3
+    selected alone compose nothing. Whole-system O2 stays what the vectors
     say, unobserved where nothing traced it.
     """
     cells, problems = ledger.take()
@@ -4990,7 +5258,7 @@ def r11_composition(
         if model.evidence != SOURCE_MODEL:
             problems.append(f"the calibration is {model.evidence!r}, not source-model")
         problems += [f"source model: {problem}" for problem in model.problems]
-    for experiment in ("K1", "K2", "K3"):
+    for experiment in ("K1", "K2", "K3", "K0"):
         cell = cells.get(experiment)
         problems += [
             f"{experiment}: {problem}"
@@ -5003,7 +5271,9 @@ def r11_composition(
         ]
         if cell is None or model is None:
             continue
-        modelled = model.sha256.get(CANDIDATE if experiment == "K3" else BASELINE)
+        modelled = model.sha256.get(
+            CANDIDATE if experiment in ("K3", "K0") else BASELINE
+        )
         if cell.process_tree_sha256 != modelled:
             problems.append(
                 f"{experiment}: the actors imported process_tree "
@@ -5017,6 +5287,15 @@ def r11_composition(
             problems += [
                 f"K3 differs from K1 frozen: {difference}"
                 for difference in compare_to_direct(reference.vector, candidate.vector)
+            ]
+    repeat = cells.get("K0")
+    if candidate is not None and repeat is not None:
+        if candidate.vector is None or repeat.vector is None:
+            problems.append("K3 or K0 left no vector to compare")
+        else:
+            problems += [
+                f"K0 differs from K3: {difference}"
+                for difference in compare_repeat(candidate.vector, repeat.vector)
             ]
     return problems
 
@@ -5467,6 +5746,7 @@ def observe_checkpoint(
     point["census"] = {
         "entries": [census_entry(process) for process in census.processes],
         "unresolved": list(census.unresolved),
+        "unresolved_provenance": list(census.provenance),
     }
     roots = host_comparison.census_roots(point["census"], account.browser_key) or []
     point["lineages"] = [
@@ -5503,7 +5783,7 @@ def observe_owner(
     the watcher saw this row start (``identify_owner``), and its instance."""
     seen: dict[str, Any] = {"label": label, "lifetime": None, "instance_id": None}
     try:
-        published = daemon_descriptor.read(account.auth_root)
+        published = account.layout.read(account.auth_root)
     except Exception as exc:  # noqa: BLE001 - the reading's own evidence
         seen["problem"] = f"the descriptor could not be read: {exc!r}"
         return seen
@@ -5550,6 +5830,7 @@ def observe_roots(
     roots = host_comparison.census_roots(found, account.browser_key)
     point["roots"] = [list(root) for root in roots] if roots is not None else None
     point["unresolved"] = list(census.unresolved)
+    point["unresolved_provenance"] = list(census.provenance)
     return point
 
 
@@ -5560,7 +5841,7 @@ def descriptor_written(account: ActorAccount) -> dict[str, Any]:
     an owner sets as it prepares its publication, so no later than the
     publication itself.
     """
-    path = daemon_descriptor.descriptor_path(account.auth_root)
+    path = account.layout.descriptor_path(account.auth_root)
     try:
         return {"written": path.stat().st_mtime}
     except FileNotFoundError:
@@ -5578,16 +5859,17 @@ def ask_to_stand_down(
 ) -> dict[str, Any]:
     """Ask the identified owner to stand down, as a newer build does.
 
-    The product's own request (``daemon_election._ask_to_stand_down``): a POST
-    with no body to ``daemon_owner.STAND_DOWN_PATH``, with the bearer token
-    read from the row's own auth root, through the owner's loopback client.
-    Sent only when the descriptor still names the owner the row identified,
-    so the request cannot reach another. The token goes into no record; the
-    answer's status and its ``standing_down`` flag do.
+    The product's own request (``daemon.election._ask_to_stand_down``): a POST
+    to ``daemon.owner.STAND_DOWN_PATH`` with the row runtime's turnover body
+    (``DaemonStateLayout.stand_down_body``), with the bearer token read from the
+    row's own auth root, through the owner's loopback client. Sent only when
+    the descriptor still names the owner the row identified, so the request
+    cannot reach another. The token goes into no record; the answer's status
+    and its ``standing_down`` flag do.
     """
     from urllib.parse import urlsplit, urlunsplit
 
-    from linkedin_mcp_server import daemon_owner
+    from linkedin_mcp_server.daemon import owner as daemon_owner
 
     found: dict[str, Any] = {
         "addressed": False,
@@ -5598,7 +5880,7 @@ def ask_to_stand_down(
         "error": None,
     }
     try:
-        published = daemon_descriptor.read(account.auth_root)
+        published = account.layout.read(account.auth_root)
         if (
             identified is None
             or published is None
@@ -5618,10 +5900,15 @@ def ask_to_stand_down(
         ) as client:
             headers = {
                 "Authorization": "Bearer "
-                + daemon_descriptor.read_token(account.auth_root, published)
+                + account.layout.read_token(account.auth_root, published)
             }
+            body = account.layout.stand_down_body(published.instance_id)
             found["sent_ns"] = time.monotonic_ns()
-            response = client.post(url, headers=headers)
+            response = (
+                client.post(url, headers=headers)
+                if body is None
+                else client.post(url, headers=headers, json=body)
+            )
             found["answered_ns"] = time.monotonic_ns()
     except Exception as exc:  # noqa: BLE001 - the request's own evidence
         found["error"] = type(exc).__name__
@@ -5656,7 +5943,7 @@ def bind_responder(
         "error": None,
     }
     try:
-        published = daemon_descriptor.read(account.auth_root)
+        published = account.layout.read(account.auth_root)
         if (
             identified is None
             or published is None
@@ -5680,13 +5967,20 @@ def bind_responder(
     return responder, found
 
 
+#: Traced O2 states that differ by timing alone (``compare_to_direct``).
+_SAMPLED_ALIKE = frozenset({O2_HELD, O2_UNKNOWN})
+
+
 def compare_repeat(first: RowVector, second: RowVector) -> list[str]:
-    """K0: every field of two runs of the same experiment must agree."""
+    """K0: every field of two runs of the same experiment must agree, except a
+    traced O2 of ``held`` against ``unknown``, which says only whether a
+    recipient outlived the next sample."""
     one, two = asdict(first), asdict(second)
     return [
         f"{name}: {one[name]!r} then {two[name]!r}"
         for name in one
         if one[name] != two[name]
+        and not (name == "o2_traced" and {one[name], two[name]} <= _SAMPLED_ALIKE)
     ]
 
 
@@ -6253,8 +6547,8 @@ class RaceSeams:
     """What a row racing the owner's retirement may read (``RowContext.race``).
 
     Readings, and one action on a row declared to take it
-    (``RowLifecycle.stands_down``): ``stand_down``, the product's own
-    bodyless stand-down request to the owner the row identified, with the
+    (``RowLifecycle.stands_down``): ``stand_down``, the turnover request of
+    the row's runtime to the owner the row identified, with the
     token read from the row's own auth root and kept out of every record.
     Nothing here signals or ends anything. Every reading waits and sends
     nothing, and the ones taken at a moment stamp it (``seen_ns``); none
@@ -6598,6 +6892,18 @@ ROWS: dict[str, RowLifecycle] = {
         owner_loss=True,
         traced=True,
     ),
+    # H-R6-contended: the owner, or Direct's server, killed under a contender
+    # armed on the profile's lock, and a successor asked for at once (#808).
+    crash_overlap.ROW: RowLifecycle(
+        idle_timeout=crash_overlap.IDLE_TIMEOUT_SECONDS,
+        recorded=True,
+        scenarios=False,
+        script=crash_overlap.script,
+        k2=crash_overlap.K2_NOT_APPLICABLE,
+        successor=True,
+        owner_loss=True,
+        traced=True,
+    ),
     # H-R10a, H-R10b and H-R15: profile commands beside a live owner or
     # Direct server, in the calibration's configuration. A confirmed logout
     # is expected to leave the session cleared, and nothing that could sign
@@ -6682,6 +6988,7 @@ ROW_VERDICTS: dict[str, RowVerdict] = {
     },
     **{row: owner_loss.h_r8_problems for row in owner_loss.H_R8_CASES},
     owner_loss.ROW_H_R9: owner_loss.h_r9_problems,
+    crash_overlap.ROW: crash_overlap.problems_for,
     **{row: profile_commands.problems_for for row in profile_commands.CASES},
     **{row: auth_repair.problems_for for row in auth_repair.CASES},
     **{row: eligibility_rows.problems_for for row in eligibility_rows.CASES},
@@ -7091,6 +7398,10 @@ async def measure_host_quit_row(
         expect_owner = daemon
     result = RowResult(experiment=experiment, mode=mode, reference=reference)
     runtime = runtime or candidate_runtime()
+    if runtime.frozen:
+        # The baseline's owners keep their state in its own namespace, and every
+        # lookup of the row's daemon state goes through this account.
+        account = replace(account, layout=BASELINE_LAYOUT)
     shim = job_query_shim
     overlay = r7.overlay if r7 is not None else None
     if shim is not None:
@@ -7107,8 +7418,29 @@ async def measure_host_quit_row(
     #: preservation session alike.
     runtime_settings = dict(lifecycle.runtime_environment or {})
 
+    #: Every line a host's server or a profile command wrote, whole, by actor
+    #: (``events.OUTPUT_FILES``). A line from anything but the row's own host
+    #: is prefixed with the host, phase or command the record names.
+    outputs = {
+        actor: CappedOutput(work_dir / name) for actor, name in OUTPUT_FILES.items()
+    }
+
     def emit(actor: str, kind: str, **fields: Any) -> None:
-        log.emit(experiment=experiment, row=row, actor=actor, kind=kind, **fields)
+        # The browser's own output is one line per thing it prints, and the
+        # event log keeps every record, so that chatter goes to the capped
+        # file only. A launch, exit, close or kill is a few lines, and it is
+        # the line a storm pushes past the cap. A server line is recorded as
+        # before.
+        line = fields.get("line")
+        diagnostic = (
+            kind == "user.output" and isinstance(line, str) and driver_diagnostic(line)
+        )
+        if not diagnostic or driver_lifecycle(line):
+            log.emit(experiment=experiment, row=row, actor=actor, kind=kind, **fields)
+        output = outputs.get(actor)
+        if kind == "user.output" and output is not None and isinstance(line, str):
+            label = fields.get("host") or fields.get("phase") or fields.get("command")
+            output.line(f"[{label}] {line}" if label else line)
 
     if runtime.frozen:
         identity = frozen_identity(runtime)
@@ -7512,16 +7844,16 @@ async def measure_host_quit_row(
     async def find_the_owner() -> None:
         nonlocal identified
         # A Direct server publishes nothing; a descriptor here would be one.
-        # Only looked at, never read into being: ``daemon_descriptor.read``
+        # Only looked at, never read into being: ``daemon.descriptor.read``
         # prepares the daemon directory before it reads, so calling it on a
         # row that must leave no daemon state would create that state itself.
-        owner["descriptor_present"] = daemon_descriptor.descriptor_path(
+        owner["descriptor_present"] = account.layout.descriptor_path(
             account.auth_root
         ).exists()
         if not daemon or not owner["descriptor_present"]:
             return
         try:
-            published = daemon_descriptor.read(account.auth_root)
+            published = account.layout.read(account.auth_root)
         except Exception as exc:  # noqa: BLE001 - the row reports it, the host still quits
             owner["read_error"] = f"{type(exc).__name__}: {exc}"
             return
@@ -7689,7 +8021,7 @@ async def measure_host_quit_row(
         found: OwnerIdentity | None = None
         successor.pop("identify_error", None)
         try:
-            published = daemon_descriptor.read(account.auth_root)
+            published = account.layout.read(account.auth_root)
         except Exception as exc:  # noqa: BLE001 - the row reports it
             successor["identify_error"] = f"{type(exc).__name__}: {exc}"
             published = None
@@ -8018,6 +8350,7 @@ async def measure_host_quit_row(
                 comparison["b_settlement"] = {
                     "remaining": census.pids,
                     "unresolved": list(census.unresolved),
+                    "unresolved_provenance": list(census.provenance),
                     "ended_ns": time.monotonic_ns(),
                 }
             except Exception as exc:  # noqa: BLE001 - the settlement's own evidence
@@ -8098,7 +8431,7 @@ async def measure_host_quit_row(
         found: OwnerIdentity | None = None
         problems: list[str] = []
         try:
-            published = daemon_descriptor.read(account.auth_root)
+            published = account.layout.read(account.auth_root)
         except Exception as exc:  # noqa: BLE001 - the row reports it
             hold_publication(None, f"{type(exc).__name__}: {exc}")
             return None, [f"the descriptor could not be read: {exc!r}"]
@@ -8441,7 +8774,7 @@ async def measure_host_quit_row(
         # Only looked at, never read into being (``find_the_owner``).
         if (
             serving is None
-            and daemon_descriptor.descriptor_path(account.auth_root).exists()
+            and account.layout.descriptor_path(account.auth_root).exists()
         ):
             found = await r7_step(
                 "find the serving owner", find_the_successor_r7, {}, seconds=30.0
@@ -8627,6 +8960,7 @@ async def measure_host_quit_row(
             )
             found["remaining"] = census.pids
             found["unresolved"] = list(census.unresolved)
+            found["unresolved_provenance"] = list(census.provenance)
             lock = await run_owned(
                 "the lock after the loss", read_lock, lock_path, seconds=60.0
             )
@@ -9299,6 +9633,9 @@ async def measure_host_quit_row(
     #: What ended the row's try, if anything: the teardown raises a
     #: cancellation it held only when that is not already one.
     row_failure: BaseException | None = None
+    #: A cancellation that reached the after-row lineage read of a row that
+    #: had not failed, raised once the teardown is done.
+    read_cancelled: BaseException | None = None
     try:
         watcher.start()
         # After the watcher's baseline, so it reports the canaries' starts and
@@ -9358,7 +9695,7 @@ async def measure_host_quit_row(
                 else None
             ),
             after_exit=first_post_exit if comparing else None,
-            **({"row_script": declared_script} if lifecycle.script is not None else {}),
+            row_script=declared_script if lifecycle.script is not None else None,
         )
         # Before the owner's exit is waited for: a stopped owner never leaves,
         # and a profile command still running could keep one from it.
@@ -9541,10 +9878,15 @@ async def measure_host_quit_row(
                 cookie_file=portable_cookie_path(account.profile),
                 expected_digest=staged.li_at_digest,
             )
-        except BaseException:
-            # A diagnostic miss, including cancellation of this read, must not
-            # skip the releases below or replace the row's own error.
+        except Exception:
+            # A diagnostic miss; the teardown goes on.
             pass
+        except BaseException as exc:
+            # A cancellation of this read must not skip the releases below or
+            # replace the row's own error, nor be lost: a row that had not
+            # failed raises it once its teardown is done.
+            if row_failure is None:
+                read_cancelled = exc
         if comparison is not None:
             # From here on the harness acts: a checkpoint after this marker
             # could be reading its cleanup rather than the product.
@@ -9751,6 +10093,17 @@ async def measure_host_quit_row(
             )
         row_requests = list(origin.requests[request_mark:])
         row_decisions = list(proxy.decisions[decision_mark:])
+        # The owner's whole log, every owner of the row's in turn, taken last
+        # before the cleanup below removes the daemon directory it sits in.
+        # The event log has only its tail, and the browser's exit, crashed or
+        # killed, is near the start of a row. Nothing in the verdict reads it.
+        with contextlib.suppress(Exception):
+            keep_capped(
+                Path(
+                    owner.get("log_path") or account.layout.log_path(account.auth_root)
+                ),
+                work_dir / OWNER_LOG_FILE,
+            )
         result.cleanup = retire_daemon_state(
             account, cleanup_owner if cleanup_owner is not None else identified
         )
@@ -9768,8 +10121,8 @@ async def measure_host_quit_row(
                 if owner_identity is not None
             }
             try:
-                if daemon_descriptor.descriptor_path(account.auth_root).exists():
-                    left_published = daemon_descriptor.read(account.auth_root)
+                if account.layout.descriptor_path(account.auth_root).exists():
+                    left_published = account.layout.read(account.auth_root)
                     if (
                         left_published is not None
                         and (left_published.pid, left_published.instance_id)
@@ -9818,7 +10171,16 @@ async def measure_host_quit_row(
                     held.add_note(
                         f"held while the row's teardown ran after {row_failure!r}"
                     )
+                if read_cancelled is not None:
+                    held.add_note(
+                        f"the after-row lineage read was also cancelled: "
+                        f"{read_cancelled!r}"
+                    )
                 raise held
+        if read_cancelled is not None:
+            # Last, so H-R7's held cancellation is raised first and keeps a
+            # note of this one; either way the row does not go on to a verdict.
+            raise read_cancelled
 
     host = result.host
     assert host is not None
@@ -10044,6 +10406,9 @@ async def measure_host_quit_row(
         row_record["owner_processes"] = owners
         row_record["gate_processes"] = gates
         row_record["browser_roots"] = browser_lineage(observed_events)
+        row_record["browser_processes"] = browser_processes(
+            observed_events, account.browser_key
+        )
         # Every server and frontend, each lifetime once: what a browser's
         # launcher is tied to the host that started it by.
         row_record["frontend_processes"] = frontend_lifetimes(
