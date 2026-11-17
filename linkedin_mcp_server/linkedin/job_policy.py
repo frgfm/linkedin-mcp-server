@@ -7,11 +7,13 @@ from ipaddress import IPv6Address, ip_address
 from typing import Literal
 from urllib.parse import parse_qs, urlparse
 
+
+from linkedin_mcp_server.linkedin.identifiers import job_id_from_path
 from linkedin_mcp_server.linkedin.link_metadata import (
-    JOB_PATH_RE,
     Reference,
     _SEARCH_RESULTS_REFERENCE_CAP,
 )
+from linkedin_mcp_server.linkedin.text import JobApplyTextTable
 
 
 def reconcile_search_references(
@@ -32,10 +34,9 @@ def reconcile_search_references(
 
     for ref in references:
         if ref.get("kind") == "job":
-            match = JOB_PATH_RE.match(str(ref.get("url", "")))
-            if match is None:
+            job_id = job_id_from_path(str(ref.get("url", "")))
+            if job_id is None:
                 continue
-            job_id = match.group(1)
             if job_id not in kept_ids or job_id in emitted_ids:
                 continue
             out.append(ref)
@@ -186,6 +187,32 @@ RESULTS_PER_LINKEDIN_PAGE = 25
 JOB_SEARCH_PATHS = frozenset({"/jobs/search", "/jobs/search-results"})
 
 
+# LinkedIn's "Worldwide" location. A search without a location is not
+# unscoped: LinkedIn applies the account's remembered location, so a posting
+# listed elsewhere drops out of it.
+WORLDWIDE_GEO_ID = "92000000"
+
+# A posting's document title is "<card title> | <company> | LinkedIn", with
+# "(3) " in front while notifications are unread. The card title can itself
+# hold " | ", so the split runs from the right.
+_UNREAD_PREFIX_RE = re.compile(r"^\(\d+\+?\)\s*")
+
+
+def parse_posting_title(title: str) -> tuple[str, str] | None:
+    """The card title and company named by a job posting's document title.
+
+    None while the title has another shape, such as the bare "LinkedIn" shown
+    before the posting renders.
+    """
+    parts = _UNREAD_PREFIX_RE.sub("", title.strip()).rsplit(" | ", 2)
+    if len(parts) != 3 or parts[2].strip() != "LinkedIn":
+        return None
+    card_title, company = parts[0].strip(), parts[1].strip()
+    if not card_title or not company:
+        return None
+    return card_title, company
+
+
 def route(target: str) -> tuple[str, str]:
     """Host and path, which is what identifies a LinkedIn page.
 
@@ -228,27 +255,28 @@ SCROLL_BUDGET_TOTAL = 60.0
 # developer search take 83s in total, 6.5s each, so this leaves the normal case
 # untouched and only catches a run that is genuinely running out.
 #
-# This predicts, it does not guarantee. Only the decision to *start* a page is
-# bounded; once started, a page runs to its own timeouts, and `goto` alone
-# allows 30s. The reserve is what covers that gap, and it has three claims on
-# it: the extraction and assembly after the last navigation, a page slower than
-# every page before it, and the browser startup inside `get_ready_extractor`,
-# which FastMCP is already timing before this budget begins. A page that
-# overruns the reserve is still cancelled and still loses every page gathered.
-# Bounding that too means handing the remaining budget down into navigation
-# and the rate-limit retry; see #754 rather than the margin. Scrolling is
-# already handed a deadline, so it takes what is left of this budget when
-# that is less than its own cap.
+# The prediction decides whether to *start* a page. Once started, the page is
+# handed the end of this budget: `goto` times out at it rather than after its
+# own 30s, the scroll takes what is left of it after navigating, and the
+# rate-limit retry is not started unless its backoff and a page fit before it.
+# The reserve still covers what runs past the end regardless: the `<main>`
+# wait and the settle after a redirect, each on its own short timeout, and the
+# extraction and assembly after the last navigation.
 #
 # The timeout arrives as an argument so this budget matches the timeout the
 # server registered for the tool, including directly constructed servers.
 SEARCH_TIMEOUT_FRACTION = 0.8
 
-SAVED_JOBS_URL = "https://www.linkedin.com/my-items/saved-jobs/"
-# Where a saved-jobs navigation may legitimately end. LinkedIn redirects the
-# first to the second and drops the query doing so, so the tool navigates to
-# one and arrives at the other.
+# The job tracker, which lists the account's jobs one stage at a time with
+# `?stage=`. The old `/my-items/saved-jobs/` redirects here and drops the
+# query on the way, so the tool navigates here directly.
+SAVED_JOBS_URL = "https://www.linkedin.com/jobs-tracker/"
+# Where a tracker navigation may legitimately end. The old route stays allowed
+# for accounts the redirect has not reached.
 SAVED_JOBS_PATHS = frozenset({"/my-items/saved-jobs", "/jobs-tracker"})
+# The tracker tabs, as LinkedIn spells them in `?stage=`. A page without the
+# parameter shows saved jobs.
+JobsTrackerStage = Literal["saved", "in_progress", "applied", "archived"]
 
 # The my-items lists page in 10s, unlike job search. Verified live: ?start=10
 # returns the 11th saved job, while ?start=25 lands past the end of a two-page
@@ -256,6 +284,33 @@ SAVED_JOBS_PATHS = frozenset({"/my-items/saved-jobs", "/jobs-tracker"})
 SAVED_JOBS_PAGE_SIZE = 10
 
 ApplyType = Literal["easy_apply", "external", "applied", "closed", "unknown"]
+
+
+def posting_state(
+    text: str, table: JobApplyTextTable
+) -> Literal["applied", "closed"] | None:
+    """The state a posting's captured text shows above its description, if any.
+
+    The same reading `get_job_apply_url` makes on the page, on the same lines,
+    so `get_job_details` answers it without a second navigation.
+    Applied is read first, as there. None covers an open posting and a capture
+    without any of its description headings alike: the lines are only trusted
+    above the earliest one, and without it there is no boundary.
+    """
+    lines = [line.strip() for line in text.splitlines()]
+    end = next(
+        (i for i, line in enumerate(lines) if line in table.description_headings),
+        None,
+    )
+    if end is None:
+        return None
+    top = lines[:end]
+    if any(table.applied_pattern.match(line) for line in top):
+        return "applied"
+    if any(line in table.closed_lines for line in top):
+        return "closed"
+    return None
+
 
 # LinkedIn's interstitial for links that leave the site, with the destination in
 # its `url` parameter. Measured on 2026-09-19: an external posting's Apply is
@@ -346,4 +401,22 @@ def apply_link_missing_section_error() -> dict[str, str]:
             "The Apply link names no employer address outside LinkedIn and "
             "this host's own network, so none is returned."
         ),
+    }
+
+
+EASY_APPLY_DRAFT_LEFT = (
+    "The Easy Apply dialog could not be closed and its draft discarded, so "
+    "LinkedIn may keep a saved application for this posting."
+)
+
+
+def easy_apply_draft_section_error() -> dict[str, str]:
+    """The ``section_errors`` entry for an Easy Apply dialog left open.
+
+    A saved draft is resumed, with whatever it holds, the next time Easy Apply
+    is opened on the posting, so the caller has to know one may exist.
+    """
+    return {
+        "error_type": "easy_apply_draft_left",
+        "error_message": EASY_APPLY_DRAFT_LEFT,
     }

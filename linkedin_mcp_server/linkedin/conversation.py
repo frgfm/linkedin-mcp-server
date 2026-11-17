@@ -512,7 +512,7 @@ def normalize_conversation_events(
 
 
 async def extract_conversation(
-    page: Page, root: Any | None = None
+    page: Page, root: Any | None = None, *, run_on_linkedin: Any | None = None
 ) -> tuple[list[Message], list[Member]]:
     """Pull structured messages + members from the current thread page.
 
@@ -521,9 +521,10 @@ async def extract_conversation(
     the in-page extraction script and normalizes its output. ``root`` may be
     a locator inside a messaging dialog; otherwise the parser uses ``main``.
     """
-    raw = (
-        await root.evaluate(_EXTRACT_SCRIPT)
-        if root is not None
-        else await page.evaluate(_EXTRACT_SCRIPT, None)
-    )
+    if root is not None:
+        raw = await root.evaluate(_EXTRACT_SCRIPT)
+    elif run_on_linkedin is not None:
+        raw = await run_on_linkedin(_EXTRACT_SCRIPT, None)
+    else:
+        raw = await page.evaluate(_EXTRACT_SCRIPT, None)
     return normalize_conversation_events(raw)

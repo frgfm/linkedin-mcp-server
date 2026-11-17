@@ -5,7 +5,6 @@ Uses innerText extraction for resilient job data capture.
 """
 
 import logging
-import inspect
 import time
 from typing import Annotated, Any
 
@@ -13,10 +12,9 @@ from fastmcp import Context, FastMCP
 from pydantic import Field
 
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
-from linkedin_mcp_server.core.exceptions import AuthenticationError
-from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
-from linkedin_mcp_server.error_handler import raise_tool_error
+from linkedin_mcp_server.dependencies import get_ready_extractor, tool_errors
 from linkedin_mcp_server.linkedin.identifiers import normalize_job_id
+from linkedin_mcp_server.linkedin.job_policy import JobsTrackerStage
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +30,7 @@ def register_job_tools(
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"job"},
     )
+    @tool_errors
     async def get_job_details(
         job_id: str,
         ctx: Context,
@@ -51,33 +50,23 @@ def register_job_tools(
             section_errors.job_posting.error_type "description_missing" means
             the captured text lacks the expected "About the job" heading.
             The text is kept but may be incomplete; calling again may return more.
+            A posting that shows it was applied to or has closed also carries
+            apply: {type: "applied" | "closed"}; no apply key means neither
+            was read, not that the posting is open.
         """
-        try:
-            job_id = normalize_job_id(job_id)
-            extractor = await get_ready_extractor(ctx, tool_name="get_job_details")
-            logger.info("Reading job: %s", job_id)
+        job_id = normalize_job_id(job_id)
+        extractor = await get_ready_extractor(ctx, tool_name="get_job_details")
+        logger.info("Reading job: %s", job_id)
 
-            await ctx.report_progress(
-                progress=0, total=100, message="Reading the job posting"
-            )
+        await ctx.report_progress(
+            progress=0, total=100, message="Reading the job posting"
+        )
 
-            reader = getattr(extractor, "read_job", None)
-            if reader is not None and inspect.iscoroutinefunction(reader):
-                result = await reader(job_id)
-            else:
-                result = await getattr(extractor, "scrape_job")(job_id)
+        result = await extractor.read_job(job_id)
 
-            await ctx.report_progress(progress=100, total=100, message="Complete")
+        await ctx.report_progress(progress=100, total=100, message="Complete")
 
-            return result
-
-        except AuthenticationError as e:
-            try:
-                await handle_auth_error(e, ctx)
-            except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "get_job_details")
-        except Exception as e:
-            raise_tool_error(e, "get_job_details")  # NoReturn
+        return result
 
     @mcp.tool(
         timeout=tool_timeout,
@@ -85,6 +74,7 @@ def register_job_tools(
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"job"},
     )
+    @tool_errors
     async def get_job_apply_url(
         job_id: str,
         ctx: Context,
@@ -105,28 +95,67 @@ def register_job_tools(
             it is not opened, so a short link is returned unexpanded.
             A posting that could not be read returns section_errors instead.
         """
-        try:
-            job_id = normalize_job_id(job_id)
-            extractor = await get_ready_extractor(ctx, tool_name="get_job_apply_url")
-            logger.info("Reading apply link: %s", job_id)
+        job_id = normalize_job_id(job_id)
+        extractor = await get_ready_extractor(ctx, tool_name="get_job_apply_url")
+        logger.info("Reading apply link: %s", job_id)
 
-            await ctx.report_progress(
-                progress=0, total=100, message="Opening job posting"
-            )
+        await ctx.report_progress(progress=0, total=100, message="Opening job posting")
 
-            result = await extractor.get_job_apply_url(job_id)
+        result = await extractor.get_job_apply_url(job_id)
 
-            await ctx.report_progress(progress=100, total=100, message="Complete")
+        await ctx.report_progress(progress=100, total=100, message="Complete")
 
-            return result
+        return result
 
-        except AuthenticationError as e:
-            try:
-                await handle_auth_error(e, ctx)
-            except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "get_job_apply_url")
-        except Exception as e:
-            raise_tool_error(e, "get_job_apply_url")  # NoReturn
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="Get Easy Apply Form",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        },
+        tags={"job"},
+    )
+    @tool_errors
+    async def get_easy_apply_form(
+        job_id: str,
+        ctx: Context,
+    ) -> dict[str, Any]:
+        """
+        Read the questions of a job posting's Easy Apply form, without answering them.
+
+        Opens Easy Apply and reads each step: every field's label, type, whether
+        it is required, its options, character limit and prefilled value. Next
+        is clicked only while LinkedIn accepts a step on its prefilled values,
+        so the first step that needs input ends the read. Nothing is typed,
+        Review and Submit are never clicked, and the dialog is closed with its
+        draft discarded.
+
+        Args:
+            job_id: LinkedIn job ID (e.g., "4252026496", "3856789012")
+            ctx: FastMCP context for progress reporting
+
+        Returns:
+            Dict with url and apply: {type} (easy_apply, external, applied,
+            closed or unknown). Easy Apply postings add form: {steps, complete},
+            each step {heading?, progress?, fields}. complete is false when
+            steps after the last one were not read; the fields LinkedIn refused
+            on that step carry its error. section_errors reports a form that
+            could not be read or a draft that could not be discarded.
+        """
+        job_id = normalize_job_id(job_id)
+        extractor = await get_ready_extractor(ctx, tool_name="get_easy_apply_form")
+        logger.info("Reading Easy Apply form: %s", job_id)
+
+        await ctx.report_progress(progress=0, total=100, message="Opening job posting")
+
+        result = await extractor.get_easy_apply_form(job_id)
+
+        await ctx.report_progress(progress=100, total=100, message="Complete")
+
+        return result
 
     @mcp.tool(
         timeout=tool_timeout,
@@ -134,6 +163,7 @@ def register_job_tools(
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"job", "search"},
     )
+    @tool_errors
     async def search_jobs(
         keywords: str,
         ctx: Context,
@@ -151,17 +181,25 @@ def register_job_tools(
 
         Returns job_ids that can be passed to get_job_details for full info.
 
+        LinkedIn is moving accounts to a redesigned job search, which keeps
+        only the keywords, date_posted and paging. It drops the filters
+        marked "Classic search only" and reports them in section_errors as
+        filters_dropped. When it drops the location or work type, search again
+        with them in the keywords ("remote python developer in Lyon") and keep
+        doing so; words such as "senior" or "internship" there narrow the
+        results too. Quotes do not make a phrase exact on that search.
+
         Args:
             keywords: Search keywords (e.g., "software engineer", "data scientist")
             ctx: FastMCP context for progress reporting
-            location: Optional location filter (e.g., "San Francisco", "Remote")
+            location: Optional location filter (e.g., "San Francisco", "Remote"). Classic search only.
             max_pages: Maximum number of result pages to load (1-10, default 3)
             date_posted: Filter by posting date (past_hour, past_24_hours, past_week, past_month)
-            job_type: Filter by job type, comma-separated (full_time, part_time, contract, temporary, volunteer, internship, other)
-            experience_level: Filter by experience level, comma-separated (internship, entry, associate, mid_senior, director, executive)
-            work_type: Filter by work type, comma-separated (on_site, remote, hybrid)
-            easy_apply: Only show Easy Apply jobs (default false)
-            sort_by: Sort results (date, relevance)
+            job_type: Filter by job type, comma-separated (full_time, part_time, contract, temporary, volunteer, internship, other). Classic search only.
+            experience_level: Filter by experience level, comma-separated (internship, entry, associate, mid_senior, director, executive). Classic search only.
+            work_type: Filter by work type, comma-separated (on_site, remote, hybrid). Classic search only.
+            easy_apply: Only show Easy Apply jobs (default false). Classic search only.
+            sort_by: Sort results (date, relevance). Classic search only.
 
         Returns:
             Dict with url, sections (name -> raw text), job_ids (list of
@@ -173,51 +211,45 @@ def register_job_tools(
             A search with no matches returns empty job_ids and a
             section_errors entry of type no_matching_jobs, rather than the
             unrelated recommendations LinkedIn shows in its place.
+            pagination ({pages_fetched, next_offset, reason}) says why paging
+            stopped: complete (the results ran out), max_pages, time_budget
+            (the tool timeout was near, so more results may exist) or
+            no_new_ids (a page repeated earlier results). It is absent when a
+            failure stopped the search, which section_errors then explains.
         """
-        try:
-            # Before the browser, because FastMCP is already timing this call
-            # and the extractor's budget is a fraction of the same figure. A
-            # cold start that spends three of ten seconds left it planning
-            # against eight it no longer had, and the call was cancelled with
-            # every page it had gathered.
-            started = time.monotonic()
-            extractor = await get_ready_extractor(ctx, tool_name="search_jobs")
-            logger.info(
-                "Searching jobs: keywords='%s', location='%s', max_pages=%d",
-                keywords,
-                location,
-                max_pages,
-            )
+        # Before the browser, because FastMCP is already timing this call
+        # and the extractor's budget is a fraction of the same figure. A
+        # cold start that spends three of ten seconds left it planning
+        # against eight it no longer had, and the call was cancelled with
+        # every page it had gathered.
+        started = time.monotonic()
+        extractor = await get_ready_extractor(ctx, tool_name="search_jobs")
+        logger.info(
+            "Searching jobs: keywords='%s', location='%s', max_pages=%d",
+            keywords,
+            location,
+            max_pages,
+        )
 
-            await ctx.report_progress(
-                progress=0, total=100, message="Starting job search"
-            )
+        await ctx.report_progress(progress=0, total=100, message="Starting job search")
 
-            result = await extractor.search_jobs(
-                keywords,
-                location=location,
-                max_pages=max_pages,
-                date_posted=date_posted,
-                job_type=job_type,
-                experience_level=experience_level,
-                work_type=work_type,
-                easy_apply=easy_apply,
-                sort_by=sort_by,
-                # What is left of the figure FastMCP cancels this call on.
-                tool_timeout=max(0.0, tool_timeout - (time.monotonic() - started)),
-            )
+        result = await extractor.search_jobs(
+            keywords,
+            location=location,
+            max_pages=max_pages,
+            date_posted=date_posted,
+            job_type=job_type,
+            experience_level=experience_level,
+            work_type=work_type,
+            easy_apply=easy_apply,
+            sort_by=sort_by,
+            # What is left of the figure FastMCP cancels this call on.
+            tool_timeout=max(0.0, tool_timeout - (time.monotonic() - started)),
+        )
 
-            await ctx.report_progress(progress=100, total=100, message="Complete")
+        await ctx.report_progress(progress=100, total=100, message="Complete")
 
-            return result
-
-        except AuthenticationError as e:
-            try:
-                await handle_auth_error(e, ctx)
-            except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "search_jobs")
-        except Exception as e:
-            raise_tool_error(e, "search_jobs")  # NoReturn
+        return result
 
     @mcp.tool(
         timeout=tool_timeout,
@@ -225,41 +257,82 @@ def register_job_tools(
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"job"},
     )
+    @tool_errors
     async def get_saved_jobs(
         ctx: Context,
         max_pages: Annotated[int, Field(ge=1, le=10)] = 3,
+        stage: JobsTrackerStage = "saved",
     ) -> dict[str, Any]:
         """
-        List job postings saved by the authenticated LinkedIn user.
+        List the authenticated user's jobs at one stage of LinkedIn's job tracker.
 
         Returns job_ids that can be passed to get_job_details for full info.
 
         Args:
             ctx: FastMCP context for progress reporting
-            max_pages: Maximum number of saved-jobs pages to load (1-10, default 3)
+            max_pages: Maximum number of tracker pages to load (1-10, default 3)
+            stage: Tracker tab: saved (default), in_progress, applied or
+                archived. applied lists Easy Apply submissions and external
+                applications the user confirmed to LinkedIn.
 
         Returns:
             Dict with url, sections (name -> raw text), job_ids (list of
             numeric job ID strings usable with get_job_details), and optional references.
         """
-        try:
-            extractor = await get_ready_extractor(ctx, tool_name="get_saved_jobs")
-            logger.info("Fetching saved jobs (max_pages=%d)", max_pages)
+        extractor = await get_ready_extractor(ctx, tool_name="get_saved_jobs")
+        logger.info("Fetching %s jobs (max_pages=%d)", stage, max_pages)
 
-            await ctx.report_progress(
-                progress=0, total=100, message="Loading saved jobs"
-            )
+        await ctx.report_progress(progress=0, total=100, message="Loading saved jobs")
 
-            result = await extractor.get_saved_jobs(max_pages=max_pages)
+        result = await extractor.get_saved_jobs(max_pages=max_pages, stage=stage)
 
-            await ctx.report_progress(progress=100, total=100, message="Complete")
+        await ctx.report_progress(progress=100, total=100, message="Complete")
 
-            return result
+        return result
 
-        except AuthenticationError as e:
-            try:
-                await handle_auth_error(e, ctx)
-            except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "get_saved_jobs")
-        except Exception as e:
-            raise_tool_error(e, "get_saved_jobs")  # NoReturn
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="Dismiss Job",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        },
+        tags={"job"},
+    )
+    @tool_errors
+    async def dismiss_job(
+        job_id: str,
+        ctx: Context,
+    ) -> dict[str, Any]:
+        """
+        Dismiss a job from LinkedIn job search so later searches never show it.
+
+        For jobs already applied to or rejected. Reads the job's title and
+        company from its posting, clicks the dismiss button on its card in a
+        worldwide search for them, then reloads that search to confirm the job
+        is gone. Irreversible: LinkedIn offers no undo after a reload. A job
+        that search does not list on its first page is an error, since an
+        already dismissed job and a search that missed it look the same.
+
+        Args:
+            job_id: LinkedIn job ID (e.g., "4252026496", "3856789012")
+            ctx: FastMCP context for progress reporting
+
+        Returns:
+            Dict with url (the search), job_id, keywords (the searched title
+            and company), dismissed (true) and already_dismissed, true when
+            the card was already dismissed.
+        """
+        job_id = normalize_job_id(job_id)
+        extractor = await get_ready_extractor(ctx, tool_name="dismiss_job")
+        logger.info("Dismissing job %s", job_id)
+
+        await ctx.report_progress(progress=0, total=100, message="Opening job posting")
+
+        result = await extractor.dismiss_job(job_id)
+
+        await ctx.report_progress(progress=100, total=100, message="Complete")
+
+        return result

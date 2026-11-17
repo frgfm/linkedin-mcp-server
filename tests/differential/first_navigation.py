@@ -40,7 +40,8 @@ only: the browser root on the profile (``--user-data-dir`` naming it, no
 create time) and an interval (identified, last seen alive, first seen gone).
 Its end is read against the close the driving process asked for: gone before
 any was asked for is ``unexpected``, and a sampling interval that straddles
-the request is ``ambiguous``.
+the request is ``ambiguous``. A process identified after a relaunch began is
+read against that relaunch's close, and the first launch keeps its own.
 
 **The session's lineage is counted, never copied.** ``record_cookie_lineage``
 reads the cookie file and the profile's own cookie store at named points:
@@ -50,10 +51,11 @@ so nothing it holds or locks changes for the browser that opens it next. No
 cookie value, header, raw event payload, or URL query or fragment reaches a
 file.
 
-**Bounded.** At most ``MAX_NAVIGATIONS`` navigations, ``MAX_EVENTS`` lifecycle
-events, ``MAX_PROCESSES`` processes and ``MAX_READINGS`` readings per file;
-the sampler stops within ``STOP_SECONDS``. A failure of an observer is
-counted in its file and never raised into the operation it watches.
+**Bounded.** At most ``MAX_NAVIGATIONS`` navigations, ``MAX_RELAUNCHES``
+launches after the first, ``MAX_EVENTS`` lifecycle events, ``MAX_PROCESSES``
+processes and ``MAX_READINGS`` readings per file; the sampler stops within
+``STOP_SECONDS``. A failure of an observer is counted in its file and never
+raised into the operation it watches.
 
 The three files are in ``events.PUBLISHED_FILES``. Stdlib only at import:
 ``baseline_stage.py`` runs ``observe_navigation`` under the frozen baseline's
@@ -64,16 +66,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import functools
 import hashlib
 import json
+import math
 import os
 import queue
 import re
 import sqlite3
+import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Generator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -88,6 +93,7 @@ COOKIE_LINEAGE_FILE = "cookie-lineage.json"
 PHASES = ("request", "response", "commit", "domcontentloaded")
 
 MAX_NAVIGATIONS = 8
+MAX_RELAUNCHES = 4
 MAX_EVENTS = 200
 MAX_PROCESSES = 16
 MAX_READINGS = 8
@@ -300,8 +306,34 @@ def _driver_process(owner: Any) -> Any:
     return getattr(transport, "_proc", None)
 
 
+def _launch_record() -> dict[str, Any]:
+    """One launch: its start and return, its driver, and its close request."""
+    return {
+        "launch": {
+            "started_ms": None,
+            "started_wall": None,
+            "returned_ms": None,
+            "error_type": None,
+        },
+        "driver": {
+            "pid": None,
+            "exit_code": None,
+            "exit_code_source": None,
+            "stop_requested_ms": None,
+            "stop_requested_wall": None,
+        },
+        "close_requested_ms": None,
+        "close_requested_wall": None,
+    }
+
+
 class NavigationRecorder:
-    """What one process's browser did, from before its launch to its close."""
+    """What one process's browser did, from before its launch to its close.
+
+    The first launch is the top level of the record. A later one, such as
+    staging's after a stall, is appended to ``relaunches`` in the same shape,
+    and every navigation names the launch it ran in (``launch``, from 1).
+    """
 
     def __init__(self, path: Path, *, label: str) -> None:
         self._file = _JsonFile.for_path(path)
@@ -312,6 +344,9 @@ class NavigationRecorder:
         #: The navigation each page is on, by page.
         self._current: list[tuple[Any, dict[str, Any]]] = []
         self._driver: Any = None
+        #: Each launch's driver record beside Patchright's handle on it.
+        self._drivers: list[tuple[dict[str, Any], Any]] = []
+        self._launches = 0
         self.document: dict[str, Any] = {
             "label": label,
             "pid": os.getpid(),
@@ -321,22 +356,14 @@ class NavigationRecorder:
             "error_type": None,
             #: The last step entered: setup, launch, navigation or close.
             "step": "setup",
-            "launch": {"started_ms": None, "returned_ms": None, "error_type": None},
-            "driver": {
-                "pid": None,
-                "exit_code": None,
-                "exit_code_source": None,
-                "stop_requested_ms": None,
-                "stop_requested_wall": None,
-            },
-            "close_requested_ms": None,
-            "close_requested_wall": None,
+            **_launch_record(),
+            "relaunches": [],
             "navigations": [],
             "first_failed_navigation": None,
             "stalled_phase": None,
             "lifecycle": [],
             "subresource_requests": 0,
-            "dropped": {"navigations": 0, "events": 0, "targets": 0},
+            "dropped": {"navigations": 0, "events": 0, "targets": 0, "launches": 0},
             "observer": {
                 "installed": False,
                 "unavailable": None,
@@ -347,6 +374,8 @@ class NavigationRecorder:
             },
             "write_failures": 0,
         }
+        #: The launch being recorded: the top level until a relaunch.
+        self._record: dict[str, Any] = self.document
         self.persist()
 
     def _ms(self) -> float:
@@ -478,16 +507,28 @@ class NavigationRecorder:
     # the call it wraps, and leaves that call's result and exception alone.
 
     def launching(self, browser_type: Any) -> None:
+        if self._launches:
+            # Never over the first launch, whose stall a relaunch follows.
+            # Past the bound it is still counted, into a record nobody keeps.
+            self._record = _launch_record()
+            relaunches = self.document["relaunches"]
+            if len(relaunches) < MAX_RELAUNCHES:
+                relaunches.append(self._record)
+            else:
+                self.document["dropped"]["launches"] += 1
+        self._launches += 1
         self.document["step"] = "launch"
-        self.document["launch"]["started_ms"] = self._ms()
+        self._record["launch"]["started_ms"] = self._ms()
+        self._record["launch"]["started_wall"] = time.time()
         process = _driver_process(browser_type)
         if process is not None:
             self._driver = process
-            self.document["driver"]["pid"] = getattr(process, "pid", None)
+            self._record["driver"]["pid"] = getattr(process, "pid", None)
+            self._drivers.append((self._record["driver"], process))
         self.persist()
 
     def launched(self, context: Any, exc: BaseException | None) -> None:
-        launch = self.document["launch"]
+        launch = self._record["launch"]
         if exc is not None:
             launch["error_type"] = type(exc).__name__
         else:
@@ -508,6 +549,7 @@ class NavigationRecorder:
         self._watch_page(page)
         timeout = options.get("timeout")
         navigation: dict[str, Any] = {
+            "launch": self._launches or None,
             "url": sanitized_url(url),
             "wait_until": _text(options.get("wait_until")),
             "timeout_ms": timeout if isinstance(timeout, (int, float)) else None,
@@ -543,18 +585,15 @@ class NavigationRecorder:
         self.persist()
 
     def closing(self, context: Any) -> None:
-        if (
-            not self._watched(context)
-            or self.document["close_requested_ms"] is not None
-        ):
+        if not self._watched(context) or self._record["close_requested_ms"] is not None:
             return
         self.document["step"] = "close"
-        self.document["close_requested_ms"] = self._ms()
-        self.document["close_requested_wall"] = time.time()
+        self._record["close_requested_ms"] = self._ms()
+        self._record["close_requested_wall"] = time.time()
         self.persist()
 
     def stopping(self, playwright: Any) -> None:
-        driver = self.document["driver"]
+        driver = self._record["driver"]
         if driver["stop_requested_ms"] is not None:
             return
         process = _driver_process(playwright)
@@ -571,21 +610,23 @@ class NavigationRecorder:
             self.document["outcome"] = outcome
             self.document["error_type"] = error
             self.document["ended_ms"] = self._ms()
-            driver = self.document["driver"]
-            code = getattr(self._driver, "returncode", None)
-            if self._driver is None:
-                driver["exit_code_source"] = "no driver was launched while observed"
-            elif code is None:
-                driver["exit_code_source"] = (
-                    "unknown: the driver had not been seen to exit when the "
-                    "observation ended"
+            if not self._drivers:
+                self.document["driver"]["exit_code_source"] = (
+                    "no driver was launched while observed"
                 )
-            else:
-                driver["exit_code"] = code
-                driver["exit_code_source"] = (
-                    "Patchright's own handle on the driver, whose parent is the "
-                    "observed process"
-                )
+            for driver, process in self._drivers:
+                code = getattr(process, "returncode", None)
+                if code is None:
+                    driver["exit_code_source"] = (
+                        "unknown: the driver had not been seen to exit when the "
+                        "observation ended"
+                    )
+                else:
+                    driver["exit_code"] = code
+                    driver["exit_code_source"] = (
+                        "Patchright's own handle on the driver, whose parent is "
+                        "the observed process"
+                    )
             self.persist()
 
     def detach(self) -> None:
@@ -716,7 +757,7 @@ def _uninstall() -> None:
 
 
 @contextlib.contextmanager
-def observe_navigation(path: Path, *, label: str) -> Iterator[NavigationRecorder]:
+def observe_navigation(path: Path, *, label: str) -> Generator[NavigationRecorder]:
     """Record every browser this process launches while entered, into *path*.
 
     The block's own exception, a cancellation included, leaves unchanged.
@@ -762,12 +803,36 @@ def requested_ends(
     # an intentional close look unexpected.
     if document is None:
         document = read_document(path) or {}
-    launch = document.get("launch")
+    return _ends(document)
+
+
+def relaunch_ends(
+    path: Path, document: Mapping[str, Any] | None = None
+) -> list[dict[str, float | None]]:
+    """``requested_ends`` of each relaunch, with when it began (``launched``).
+
+    A process the sampler identified after a relaunch began is that
+    relaunch's, and its end is read against that relaunch's requests.
+    """
+    if document is None:
+        document = read_document(path) or {}
+    relaunches = document.get("relaunches")
+    ends = []
+    for record in relaunches if isinstance(relaunches, list) else []:
+        asked = _ends(record) if isinstance(record, dict) else None
+        launched = record["launch"].get("started_wall") if asked is not None else None
+        if asked is not None and isinstance(launched, (int, float)):
+            ends.append({"launched": launched, **asked})
+    return ends
+
+
+def _ends(record: Mapping[str, Any]) -> dict[str, float | None] | None:
+    launch = record.get("launch")
     if not isinstance(launch, dict) or launch.get("started_ms") is None:
         return None
-    driver = document.get("driver")
+    driver = record.get("driver")
     stop = driver.get("stop_requested_wall") if isinstance(driver, dict) else None
-    close = document.get("close_requested_wall")
+    close = record.get("close_requested_wall")
     asked = [t for t in (close, stop) if isinstance(t, (int, float))]
     return {
         "browser-root": min(asked) if asked else None,
@@ -776,6 +841,72 @@ def requested_ends(
 
 
 # --- The lifetimes, from the harness process ----------------------------------
+
+
+class _MacDescendants:
+    """This process, listing its descendants as psutil's ``children`` does,
+    from libproc instead of from every process on the host.
+
+    On macOS psutil builds the parent map behind ``children`` from one read
+    per process on the machine: 0.2 to 0.5 s with 1,900 processes on an idle
+    Mac, and more than the second a closing sample gets on a loaded one.
+    libproc lists one parent's children, zombies included, in one call, so
+    this walk costs a call and a read per descendant.
+    """
+
+    def __init__(self, psutil: Any) -> None:
+        self._psutil = psutil
+        self._pid = os.getpid()
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        libproc.proc_listchildpids.argtypes = (
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        )
+        libproc.proc_listchildpids.restype = ctypes.c_int
+        self._list_children = libproc.proc_listchildpids
+
+    def _child_pids(self, pid: int) -> list[int]:
+        capacity = 64
+        while True:
+            buffer = (ctypes.c_int * capacity)()
+            count = self._list_children(pid, buffer, ctypes.sizeof(buffer))
+            if count < 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+            # A full buffer may have cut the list short: ask again with room.
+            if count < capacity:
+                return [child for child in buffer[:count] if child > 0]
+            capacity *= 2
+
+    def children(self, recursive: bool = False) -> list[Any]:
+        psutil = self._psutil
+        # psutil's own guard, against a fresh read of this process: a child
+        # created before it holds a reused pid.
+        began = psutil.Process(self._pid).create_time()
+        found: list[Any] = []
+        seen = {self._pid}
+        parents = [self._pid]
+        while parents:
+            for pid in self._child_pids(parents.pop()):
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                try:
+                    child = psutil.Process(pid)
+                    if child.create_time() < began:
+                        continue
+                except psutil.NoSuchProcess:  # a ZombieProcess is one as well
+                    continue
+                found.append(child)
+                if recursive:
+                    parents.append(pid)
+        return found
+
+
+def _this_process(psutil: Any) -> Any:
+    """This process, as the sampler lists its descendants."""
+    return _MacDescendants(psutil) if sys.platform == "darwin" else psutil.Process()
 
 
 class LifetimeSampler:
@@ -804,6 +935,10 @@ class LifetimeSampler:
         self._tracked: dict[tuple[int, float], dict[str, Any]] = {}
         #: Descendants established as not the root: Chromium's own children.
         self._settled: set[tuple[int, float]] = set()
+        #: Whether the latest sample read every descendant. Only that one says
+        #: what is alive at the stop; an earlier gap was settled by later ones.
+        self._complete = False
+        self._last_wall = self._began_wall
         self.document: dict[str, Any] = {
             "label": label,
             "began_wall": self._began_wall,
@@ -818,9 +953,11 @@ class LifetimeSampler:
             "stop_seconds": None,
             "stopped_within_bound": None,
             "requested_ends": None,
+            "relaunch_ends": [],
             "processes": [],
             "dropped_processes": 0,
             "write_failures": 0,
+            "wall_clock_stepped_back": False,
         }
         self._persist()
 
@@ -844,7 +981,7 @@ class LifetimeSampler:
                 self._persist()
             return
         try:
-            me = psutil.Process()
+            me = _this_process(psutil)
             while True:
                 self._sample(psutil, me)
                 if self._halt.wait(self._interval):
@@ -884,6 +1021,12 @@ class LifetimeSampler:
             "identified_ms": now,
             "last_alive_ms": now,
             "gone_ms": None,
+            # The same observations by wall clock, the one a close request in
+            # another process is stamped with. The ms fields are monotonic,
+            # which stops while the machine sleeps.
+            "identified_wall": time.time(),
+            "last_alive_wall": time.time(),
+            "gone_wall": None,
             "ended": None,
             "exit_code": None,
             "exit_code_source": _ROOT_EXIT_CODE
@@ -902,8 +1045,16 @@ class LifetimeSampler:
         except Exception:  # noqa: BLE001 - not knowing, asked again next time
             with self._lock:
                 self.document["sample_failures"] += 1
+                self._complete = False
             return
         now = self._ms()
+        wall = time.time()
+        with self._lock:
+            # A wall clock set back puts a later observation before an earlier
+            # request, so no end can be ordered against a close from then on.
+            if wall < self._last_wall:
+                self.document["wall_clock_stepped_back"] = True
+            self._last_wall = wall
         alive: set[tuple[int, float]] = set()
         changed = False
         truncated = False
@@ -939,21 +1090,31 @@ class LifetimeSampler:
             if key in self._tracked:
                 try:
                     zombie = child.status() == psutil.STATUS_ZOMBIE
+                except psutil.NoSuchProcess:
+                    # Reaped since the listing, which cached its create time:
+                    # gone, not unreadable.
+                    zombie = True
                 except Exception:  # noqa: BLE001 - unreadable, asked again
                     incomplete = True
                     with self._lock:
                         self.document["sample_failures"] += 1
                     continue
                 if zombie:
-                    # The first time it was seen gone, and not ordered against a
-                    # close asked for while this sample was still reading.
+                    # The first time it was seen gone. Stamped after the read,
+                    # not with the sample's start: a close asked for while this
+                    # sample was reading may have come before the death. The
+                    # stamp is checked for a clock set back like a sample's.
                     with self._lock:
                         if self.document["ended_ms"] is not None:
                             return
                         record = self._tracked[key]
                         if record["gone_ms"] is None:
+                            gone_wall = time.time()
+                            if gone_wall < self._last_wall:
+                                self.document["wall_clock_stepped_back"] = True
+                            self._last_wall = gone_wall
                             record["gone_ms"] = self._ms()
-                            record["order_uncertain"] = True
+                            record["gone_wall"] = gone_wall
                             changed = True
                 else:
                     alive.add(key)
@@ -998,11 +1159,14 @@ class LifetimeSampler:
             if truncated:
                 # Cut short, so a process not reached is unknown, not gone.
                 self.document["truncated_samples"] += 1
+            self._complete = not truncated and not incomplete
             for key, record in self._tracked.items():
                 if key in alive:
                     record["last_alive_ms"] = now
+                    record["last_alive_wall"] = wall
                 elif not truncated and not incomplete and record["gone_ms"] is None:
                     record["gone_ms"] = now
+                    record["gone_wall"] = wall
                     changed = True
             if changed:
                 self._persist()
@@ -1012,12 +1176,15 @@ class LifetimeSampler:
         *,
         exc: BaseException | None,
         requested: Mapping[str, float | None] | None,
+        relaunched: Sequence[Mapping[str, float | None]] = (),
     ) -> None:
         """End the sampler within ``STOP_SECONDS`` and read each end.
 
         *requested* is ``requested_ends`` of the driving process's record; None
-        when it could not be read, which leaves every end unknown. Only the
-        first call counts: what it read is not rewritten by a later one.
+        when it could not be read, which leaves every end unknown. *relaunched*
+        is its ``relaunch_ends``: a process identified after one began is read
+        against that one's requests instead. Only the first call counts: what
+        it read is not rewritten by a later one.
         """
         if self.document["ended_ms"] is not None:
             return
@@ -1045,11 +1212,21 @@ class LifetimeSampler:
                     stop_seconds=round(time.monotonic() - began, 3),
                     stopped_within_bound=stopped,
                     requested_ends=dict(requested) if requested is not None else None,
+                    relaunch_ends=[dict(ends) for ends in relaunched],
                 )
                 if self.document["sampler"] == "running":
                     self.document["sampler"] = "stopped" if stopped else "still running"
                 for record in self._tracked.values():
-                    record["ended"] = self._ended(record, requested)
+                    own = next(
+                        (
+                            ends
+                            for ends in reversed(relaunched)
+                            if (ends.get("launched") or math.inf)
+                            <= record["identified_wall"]
+                        ),
+                        requested,
+                    )
+                    record["ended"] = self._ended(record, own, stopped=stopped)
                 self._persist()
             finally:
                 self._lock.release()
@@ -1057,23 +1234,26 @@ class LifetimeSampler:
             pass
 
     def _ended(
-        self, record: Mapping[str, Any], requested: Mapping[str, float | None] | None
+        self,
+        record: Mapping[str, Any],
+        requested: Mapping[str, float | None] | None,
+        *,
+        stopped: bool,
     ) -> str:
         if record["gone_ms"] is None:
-            if self.document["truncated_samples"] or self.document["sample_failures"]:
-                return "unknown"
-            return "alive-at-stop"
+            # A sampler still reading at the bound saw nothing since its last
+            # sample, so that sample no longer speaks for the stop.
+            return "alive-at-stop" if stopped and self._complete else "unknown"
         if requested is None:
             return "unknown"
         asked = requested.get(record["role"])
         if asked is None:
             return "unexpected"
-        asked_ms = (asked - self._began_wall) * 1000
-        if record.get("order_uncertain"):
+        if self.document["wall_clock_stepped_back"]:
             return "ambiguous"
-        if record["gone_ms"] <= asked_ms:
+        if record["gone_wall"] <= asked:
             return "unexpected"
-        if record["last_alive_ms"] >= asked_ms:
+        if record["last_alive_wall"] >= asked:
             return "after-close-request"
         return "ambiguous"
 
@@ -1081,7 +1261,7 @@ class LifetimeSampler:
 @contextlib.contextmanager
 def observing(
     directory: Path, *, profile: Path, label: str, in_process: bool = True
-) -> Iterator[Path]:
+) -> Generator[Path]:
     """One launch's navigation and lifetimes, in *directory*, from before it.
 
     Yields where the navigation is recorded. *in_process* False is a launch
@@ -1113,11 +1293,13 @@ def observing(
         if lifetimes is not None:
             # The recorder's document, not the file: the close request is set
             # before its snapshot reaches the disc.
+            document = None if recorder is None else recorder.document
+            if document is None:
+                document = read_document(navigation) or {}
             lifetimes.stop(
                 exc=failure,
-                requested=requested_ends(
-                    navigation, None if recorder is None else recorder.document
-                ),
+                requested=requested_ends(navigation, document),
+                relaunched=relaunch_ends(navigation, document),
             )
 
 

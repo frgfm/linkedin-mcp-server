@@ -146,6 +146,14 @@
       "operation": "root_content",
       "program_digest": "e6b2be4ebddd",
       "section": "conversation"
+    },
+    {
+      "arg": null,
+      "call": "get_conversation",
+      "kind": "evaluate",
+      "operation": "conversation_messages",
+      "program_digest": "2ca1f3c10477",
+      "section": "conversation"
     }
   ],
   "result": {

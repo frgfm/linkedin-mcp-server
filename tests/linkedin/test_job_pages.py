@@ -5,15 +5,25 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import asyncio
+import time
 
+import anyio
 import pytest
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.linkedin import job_pages as job_pages_module
 from linkedin_mcp_server.linkedin.content import PageContentReader
-from linkedin_mcp_server.linkedin.contracts import ExtractedSection
-from linkedin_mcp_server.linkedin.job_pages import JobPageReader, _ScrollCharge
+from linkedin_mcp_server.linkedin.contracts import (
+    RATE_LIMITED_SECTION_TEXT,
+    ExtractedSection,
+)
+from linkedin_mcp_server.linkedin.job_pages import (
+    EasyApplyDraftLeftError,
+    JobPageReader,
+    _ScrollCharge,
+)
+from linkedin_mcp_server.linkedin.text import JOB_APPLY_EN_US
 from linkedin_mcp_server.linkedin.link_metadata import Reference
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
 from linkedin_mcp_server.linkedin.session import PageSession
@@ -1113,6 +1123,124 @@ class TestExtractSearchPage:
         assert capture.section.error is not None
         assert capture.scroll_seconds == 5.0
 
+    async def test_navigation_and_scroll_answer_to_the_page_deadline(self, mock_page):
+        """The deadline reaches `goto`, and the scroll gets what is left of it.
+
+        The scroll deadline is worked out before navigating. A `goto` that
+        spends 2.5s of the 4s left, and a `<main>` wait that spends another
+        second, would otherwise leave the scroll the whole twelve seconds it
+        was handed, on a budget that has already run out. Capped after `goto`
+        and not after the wait, the scroll still got 1.5s with 0.5s left.
+        """
+
+        class Clock:
+            def __init__(self) -> None:
+                self.now = 10.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        clock = Clock()
+        mock_page.url = "https://www.linkedin.com/jobs/search/?keywords=test"
+        navigated: list[float | None] = []
+        scrolled: list[float | None] = []
+
+        async def goto(url, *, deadline=None):
+            navigated.append(deadline)
+            clock.now += 2.5
+
+        async def scroll(page, **kwargs):
+            scrolled.append(kwargs.get("deadline"))
+            return False
+
+        async def wait_for_main(selector):
+            clock.now += 1.0
+
+        mock_page.wait_for_selector = AsyncMock(side_effect=wait_for_main)
+        reader = _reader(mock_page)
+        with (
+            patch.object(job_pages_module, "time", clock),
+            patch.object(PageNavigator, "_navigate_to_page", side_effect=goto),
+            patch(
+                "linkedin_mcp_server.linkedin.job_pages.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.job_pages.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.job_pages.scroll_job_sidebar",
+                side_effect=scroll,
+            ),
+            patch.object(
+                PageContentReader,
+                "_extract_root_content",
+                new_callable=AsyncMock,
+                return_value={
+                    "source": "root",
+                    "text": "Python Developer",
+                    "references": [],
+                },
+            ),
+        ):
+            await reader._extract_search_page(
+                "https://www.linkedin.com/jobs/search/?keywords=test",
+                section_name="search_results",
+                scroll_deadline=12.0,
+                page_deadline=14.0,
+            )
+
+        assert navigated == [14.0]
+        assert scrolled == [0.5]
+
+    @pytest.mark.parametrize(("left", "attempts"), [(11.0, 1), (12.0, 2)])
+    async def test_the_retry_starts_only_when_backoff_and_a_page_fit(
+        self, mock_page, left, attempts
+    ):
+        """A throttled page is retried only when the retry can finish.
+
+        The backoff alone is 5s and a search page 6.5s on average. Retrying
+        with less than both left sleeps the budget away and then times out in
+        navigation, replacing the rate-limit answer the first attempt already
+        had with a timeout that says nothing, or cancels the whole call.
+        """
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        once = AsyncMock(
+            side_effect=[
+                ExtractedSection(text=RATE_LIMITED_SECTION_TEXT, references=[]),
+                ExtractedSection(text="Python Developer", references=[]),
+            ]
+        )
+        reader = _reader(mock_page)
+        with (
+            patch.object(job_pages_module, "time", Clock()),
+            patch.object(reader, "_extract_search_page_once", once),
+            patch.object(
+                job_pages_module.asyncio, "sleep", new_callable=AsyncMock
+            ) as backoff,
+        ):
+            capture = await reader._extract_search_page(
+                "https://www.linkedin.com/jobs/search/?keywords=test",
+                section_name="search_results",
+                page_deadline=left,
+            )
+
+        assert [call.kwargs["page_deadline"] for call in once.await_args_list] == [
+            left
+        ] * attempts
+        assert backoff.await_count == attempts - 1
+        assert capture.section.text == (
+            RATE_LIMITED_SECTION_TEXT if attempts == 1 else "Python Developer"
+        )
+
     async def test_the_search_page_keeps_every_reference_it_found(self, mock_page):
         """No per-page cap here: the workflow reconciles against the rail.
 
@@ -1375,3 +1503,73 @@ class TestExtractJobIds:
             assert await reader._extract_job_ids(scoped=True) == ["101", "999"]
 
         assert "No results rail" in caplog.text
+
+
+class TestReadEasyApplyForm:
+    URL = "https://www.linkedin.com/jobs/view/123/"
+
+    async def test_a_failed_walk_that_leaves_a_draft_raises_its_own_type(
+        self, mock_page
+    ):
+        """The draft is what the caller must act on, so it names the error."""
+        reader = _reader(mock_page)
+        failure = RuntimeError("The Easy Apply dialog closed while it was read")
+        with (
+            patch.object(
+                reader,
+                "_read_apply_type",
+                new_callable=AsyncMock,
+                return_value=("easy_apply", None),
+            ),
+            patch.object(
+                reader, "_walk_easy_apply", new_callable=AsyncMock, side_effect=failure
+            ),
+            patch.object(
+                reader,
+                "_discard_easy_apply",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            with pytest.raises(EasyApplyDraftLeftError) as raised:
+                await reader.read_easy_apply_form(self.URL, "123", JOB_APPLY_EN_US)
+
+        assert raised.value.__cause__ is failure
+
+    async def test_a_tool_deadline_waits_for_the_discard_without_spinning(
+        self, mock_page
+    ):
+        """A tool timeout is an AnyIO deadline, re-delivered on every pass of
+        the event loop. The read still waits for the discard, and while it
+        waits the process stays idle: an unshielded wait re-entered after each
+        delivery spends the whole discard spinning on the CPU."""
+        reader = _reader(mock_page)
+        discarded = asyncio.Event()
+
+        async def walk(*_: object) -> bool:
+            await asyncio.sleep(10)
+            return True
+
+        async def discard(_grace: float) -> bool:
+            await asyncio.sleep(0.5)
+            discarded.set()
+            return True
+
+        with (
+            patch.object(
+                reader,
+                "_read_apply_type",
+                new_callable=AsyncMock,
+                return_value=("easy_apply", None),
+            ),
+            patch.object(reader, "_walk_easy_apply", side_effect=walk),
+            patch.object(reader, "_discard_easy_apply", side_effect=discard),
+        ):
+            started = time.process_time()
+            with pytest.raises(TimeoutError):
+                with anyio.fail_after(0.05):
+                    await reader.read_easy_apply_form(self.URL, "123", JOB_APPLY_EN_US)
+            spent = time.process_time() - started
+
+        assert discarded.is_set()
+        assert spent < 0.05

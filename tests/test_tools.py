@@ -1,23 +1,20 @@
 import asyncio
 import logging
-import sys
 from typing import Any, Callable, Coroutine, cast
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anyio
 import pytest
 from fastmcp import FastMCP
 from fastmcp.tools import FunctionTool
 
 from linkedin_mcp_server.callbacks import MCPContextProgressCallback
-from linkedin_mcp_server.scraping.contracts import (
+from linkedin_mcp_server.linkedin.contracts import (
     RATE_LIMITED_SECTION_TEXT,
     SEND_INTERRUPTED_WARNING,
-    ExtractedSection,
 )
-from linkedin_mcp_server.scraping.feed_payload import (
-    normalize_feed_post as _normalize_feed_post,
-)
-from linkedin_mcp_server.scraping.link_metadata import FeedPost
+from linkedin_mcp_server.linkedin.contracts import ExtractedSection
 
 
 async def get_tool_fn(
@@ -27,46 +24,37 @@ async def get_tool_fn(
     tool = await mcp.get_tool(name)
     if tool is None:
         raise ValueError(f"Tool '{name}' not found")
-    fn = cast(FunctionTool, tool).fn
-
-    async def call(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Keep the old test-only extractor injection seam out of tool schemas."""
-        extractor = kwargs.pop("extractor", None)
-        if extractor is None:
-            return await fn(*args, **kwargs)
-        module = cast(Any, sys.modules[fn.__module__])
-        ready = module.get_ready_extractor
-        module.get_ready_extractor = AsyncMock(return_value=extractor)
-        try:
-            return await fn(*args, **kwargs)
-        finally:
-            module.get_ready_extractor = ready
-
-    return call
+    return cast(FunctionTool, tool).fn
 
 
-def _make_mock_extractor(scrape_result: dict) -> MagicMock:
+def _make_mock_extractor(result: dict) -> MagicMock:
     """Create a mock LinkedInExtractor that returns the given result."""
     mock = MagicMock()
-    mock.scrape_person = AsyncMock(return_value=scrape_result)
-    mock.connect_with_person = AsyncMock(return_value=scrape_result)
-    mock.scrape_company = AsyncMock(return_value=scrape_result)
-    mock.scrape_job = AsyncMock(return_value=scrape_result)
-    mock.search_jobs = AsyncMock(return_value=scrape_result)
-    mock.get_saved_jobs = AsyncMock(return_value=scrape_result)
-    mock.search_people = AsyncMock(return_value=scrape_result)
-    mock.get_sidebar_profiles = AsyncMock(return_value=scrape_result)
-    mock.get_inbox = AsyncMock(return_value=scrape_result)
-    mock.get_conversation = AsyncMock(return_value=scrape_result)
-    mock.archive_conversation = AsyncMock(return_value=scrape_result)
-    mock.search_conversations = AsyncMock(return_value=scrape_result)
-    mock.send_message = AsyncMock(return_value=scrape_result)
-    mock.get_pending_invitations = AsyncMock(return_value=scrape_result)
-    mock.act_on_invitation = AsyncMock(return_value=scrape_result)
-    mock.get_my_profile = AsyncMock(return_value=scrape_result)
-    mock.search_companies = AsyncMock(return_value=scrape_result)
-    mock.search_posts = AsyncMock(return_value=scrape_result)
-    mock.get_company_employees = AsyncMock(return_value=scrape_result)
+    mock.read_person = AsyncMock(return_value=result)
+    mock.scrape_person = mock.read_person
+    mock.connect_with_person = AsyncMock(return_value=result)
+    mock.read_company = AsyncMock(return_value=result)
+    mock.read_job = AsyncMock(return_value=result)
+    mock.search_jobs = AsyncMock(return_value=result)
+    mock.get_saved_jobs = AsyncMock(return_value=result)
+    mock.get_job_apply_url = AsyncMock(return_value=result)
+    mock.dismiss_job = AsyncMock(return_value=result)
+    mock.get_easy_apply_form = AsyncMock(return_value=result)
+    mock.search_people = AsyncMock(return_value=result)
+    mock.get_sidebar_profiles = AsyncMock(return_value=result)
+    mock.get_inbox = AsyncMock(return_value=result)
+    mock.get_conversation = AsyncMock(return_value=result)
+    mock.search_conversations = AsyncMock(return_value=result)
+    mock.archive_conversation = AsyncMock(return_value=result)
+    mock.send_message = AsyncMock(return_value=result)
+    mock.reply_to_conversation = AsyncMock(return_value=result)
+    mock.get_my_profile = AsyncMock(return_value=result)
+    mock.search_companies = AsyncMock(return_value=result)
+    mock.search_posts = AsyncMock(return_value=result)
+    mock.get_company_employees = AsyncMock(return_value=result)
+    mock.get_pending_invitations = AsyncMock(return_value=result)
+    mock.get_connections = AsyncMock(return_value=result)
+    mock.act_on_invitation = AsyncMock(return_value=result)
     mock.extract_page = AsyncMock(
         return_value=ExtractedSection(text="some text", references=[])
     )
@@ -74,8 +62,567 @@ def _make_mock_extractor(scrape_result: dict) -> MagicMock:
     return mock
 
 
+_TOOL_MODULES = (
+    "person",
+    "company",
+    "job",
+    "messaging",
+    "feed",
+    "network",
+    "post",
+)
+
+
+@pytest.fixture
+def serve_extractor(monkeypatch: pytest.MonkeyPatch) -> Callable[[Any], AsyncMock]:
+    """Answer every tool's readiness call with the given extractor.
+
+    Patched in each tool module, which is where the tools look it up, so a tool
+    body runs unchanged from the readiness call onwards.
+    """
+
+    def serve(extractor: Any) -> AsyncMock:
+        ready = AsyncMock(return_value=extractor)
+        for module in _TOOL_MODULES:
+            monkeypatch.setattr(
+                f"linkedin_mcp_server.tools.{module}.get_ready_extractor", ready
+            )
+        return ready
+
+    return serve
+
+
+@pytest.mark.parametrize(
+    ("module_name", "tool_name", "arguments", "error_match"),
+    [
+        (
+            "person",
+            "get_person_profile",
+            {"linkedin_username": "/feed/"},
+            "not a personal profile",
+        ),
+        (
+            "person",
+            "connect_with_person",
+            {"linkedin_username": "/feed/"},
+            "not a personal profile",
+        ),
+        (
+            "person",
+            "get_sidebar_profiles",
+            {"linkedin_username": "/feed/"},
+            "not a personal profile",
+        ),
+        (
+            "person",
+            "search_people",
+            {"keywords": "engineer", "current_company": "SAP"},
+            "numeric LinkedIn company URN id",
+        ),
+        (
+            "person",
+            "search_people",
+            {"keywords": "engineer", "location": "New York"},
+            "numeric LinkedIn geo URN id",
+        ),
+        (
+            "person",
+            "search_people",
+            {"keywords": "", "connection_of": "williamhgates"},
+            "LinkedIn profile id",
+        ),
+        (
+            "company",
+            "get_company_profile",
+            {"company_name": "/feed/"},
+            "not a company page",
+        ),
+        (
+            "company",
+            "get_company_posts",
+            {"company_name": "/feed/"},
+            "not a company page",
+        ),
+        (
+            "company",
+            "get_company_employees",
+            {"company_name": "/feed/"},
+            "not a company page",
+        ),
+        (
+            "job",
+            "get_job_details",
+            {"job_id": "/feed/"},
+            "job_id is not a LinkedIn id",
+        ),
+        (
+            "job",
+            "get_job_apply_url",
+            {"job_id": "/feed/"},
+            "job_id is not a LinkedIn id",
+        ),
+        (
+            "job",
+            "get_easy_apply_form",
+            {"job_id": "/feed/"},
+            "job_id is not a LinkedIn id",
+        ),
+        (
+            "job",
+            "dismiss_job",
+            {"job_id": "/feed/"},
+            "job_id is not a LinkedIn id",
+        ),
+        (
+            "post",
+            "search_posts",
+            {"keywords": "python", "date_posted": "last-year"},
+            "Invalid date_posted",
+        ),
+        (
+            "post",
+            "search_posts",
+            {"keywords": "python", "content_type": "articles"},
+            "Invalid content_type",
+        ),
+        (
+            "messaging",
+            "reply_to_conversation",
+            {"thread_id": "/feed/", "message": "Hello", "confirm_send": False},
+            "thread_id is not a LinkedIn id",
+        ),
+        (
+            "messaging",
+            "reply_to_conversation",
+            {"thread_id": "2+abc", "message": "Hello", "confirm_send": False},
+            "thread_id is not a LinkedIn id",
+        ),
+        (
+            "messaging",
+            "get_conversation",
+            {"linkedin_username": "/feed/"},
+            "not a personal profile",
+        ),
+        (
+            "messaging",
+            "get_conversation",
+            {"thread_id": "/feed/"},
+            "thread_id is not a LinkedIn id",
+        ),
+        (
+            "messaging",
+            "get_conversation",
+            {"linkedin_username": "alice", "thread_id": "/feed/"},
+            "thread_id is not a LinkedIn id",
+        ),
+        (
+            "messaging",
+            "send_message",
+            {
+                "linkedin_username": "/feed/",
+                "message": "Hello",
+                "confirm_send": False,
+            },
+            "not a personal profile",
+        ),
+        (
+            "messaging",
+            "send_message",
+            {
+                "linkedin_username": "alice",
+                "profile_urn": "/feed/",
+                "message": "Hello",
+                "confirm_send": False,
+            },
+            "profile_urn is not a LinkedIn id",
+        ),
+        (
+            "messaging",
+            "send_message",
+            {
+                "linkedin_username": "alice",
+                "profile_urn": "urn:li:company:123",
+                "message": "Hello",
+                "confirm_send": False,
+            },
+            "profile_urn is not a LinkedIn id",
+        ),
+        (
+            "messaging",
+            "send_message",
+            {
+                "linkedin_username": "alice",
+                "profile_urn": "urn:li:fsd_profile:",
+                "message": "Hello",
+                "confirm_send": False,
+            },
+            "profile_urn is not a LinkedIn id",
+        ),
+    ],
+)
+async def test_invalid_reference_is_rejected_before_extractor(
+    module_name, tool_name, arguments, error_match
+):
+    from fastmcp.exceptions import ToolError
+
+    from linkedin_mcp_server.tools.company import register_company_tools
+    from linkedin_mcp_server.tools.job import register_job_tools
+    from linkedin_mcp_server.tools.messaging import register_messaging_tools
+    from linkedin_mcp_server.tools.person import register_person_tools
+    from linkedin_mcp_server.tools.post import register_post_tools
+
+    register_by_module = {
+        "company": register_company_tools,
+        "job": register_job_tools,
+        "messaging": register_messaging_tools,
+        "person": register_person_tools,
+        "post": register_post_tools,
+    }
+    mcp = FastMCP("test")
+    register_by_module[module_name](mcp)
+    ready = AsyncMock(side_effect=AssertionError("get_ready_extractor was called"))
+
+    with patch(f"linkedin_mcp_server.tools.{module_name}.get_ready_extractor", ready):
+        with pytest.raises(ToolError, match=error_match):
+            await mcp.call_tool(tool_name, arguments)
+
+    ready.assert_not_awaited()
+
+
+#: One call per registered tool that passes boundary validation, so the tool
+#: reaches its readiness call. `test_the_valid_calls_name_every_tool` keeps it
+#: complete, which is what makes the tests below cover a tool added later.
+_A_VALID_CALL = [
+    ("person", "get_person_profile", {"linkedin_username": "alice"}),
+    ("person", "search_people", {"keywords": "engineer"}),
+    ("person", "connect_with_person", {"linkedin_username": "alice"}),
+    ("person", "get_sidebar_profiles", {"linkedin_username": "alice"}),
+    ("person", "get_my_profile", {}),
+    ("company", "get_company_profile", {"company_name": "anthropic"}),
+    ("company", "get_company_posts", {"company_name": "anthropic"}),
+    ("company", "search_companies", {"keywords": "fintech"}),
+    ("company", "get_company_employees", {"company_name": "anthropic"}),
+    ("job", "get_job_details", {"job_id": "4252026496"}),
+    ("job", "get_job_apply_url", {"job_id": "4252026496"}),
+    ("job", "search_jobs", {"keywords": "python"}),
+    ("job", "get_saved_jobs", {}),
+    ("job", "dismiss_job", {"job_id": "4252026496"}),
+    ("job", "get_easy_apply_form", {"job_id": "4252026496"}),
+    ("messaging", "get_inbox", {}),
+    ("messaging", "get_conversation", {"linkedin_username": "alice"}),
+    ("messaging", "search_conversations", {"keywords": "hello"}),
+    ("messaging", "archive_conversation", {"thread_id": "2-abc123"}),
+    (
+        "messaging",
+        "message_invitation_sender",
+        {
+            "linkedin_username": "alice",
+            "message_url": "/messaging/compose/?recipient=ACoAAB&invitation=urn",
+            "message": "Hello",
+            "confirm_send": False,
+        },
+    ),
+    (
+        "messaging",
+        "send_message",
+        {"linkedin_username": "alice", "message": "Hello", "confirm_send": False},
+    ),
+    (
+        "messaging",
+        "reply_to_conversation",
+        {"thread_id": "2-abc123", "message": "Hello", "confirm_send": False},
+    ),
+    ("feed", "get_feed", {}),
+    ("network", "get_pending_invitations", {}),
+    ("network", "get_connections", {}),
+    ("network", "ignore_connection_request", {"linkedin_username": "alice"}),
+    ("network", "withdraw_invitation", {"linkedin_username": "alice"}),
+    ("post", "search_posts", {"keywords": "python"}),
+]
+
+
+def _register(mcp: FastMCP, module_name: str) -> None:
+    import importlib
+
+    module = importlib.import_module(f"linkedin_mcp_server.tools.{module_name}")
+    getattr(module, f"register_{module_name}_tools")(mcp)
+
+
+@pytest.mark.parametrize(("module_name", "tool_name", "arguments"), _A_VALID_CALL)
+async def test_valid_input_reaches_the_patched_readiness_call(
+    module_name, tool_name, arguments
+):
+    # The counterpart of the test above. Without it, a patch on an attribute
+    # the tool no longer reads would leave "never awaited" true for invalid
+    # input and prove nothing about validation order.
+    import importlib
+
+    module = importlib.import_module(f"linkedin_mcp_server.tools.{module_name}")
+    mcp = FastMCP("test")
+    getattr(module, f"register_{module_name}_tools")(mcp)
+    ready = AsyncMock(
+        return_value=_make_mock_extractor(
+            {"url": "https://www.linkedin.com/", "sections": {}}
+        )
+    )
+
+    with patch(f"linkedin_mcp_server.tools.{module_name}.get_ready_extractor", ready):
+        await mcp.call_tool(tool_name, arguments)
+
+    ready.assert_awaited_once()
+    assert ready.await_args is not None
+    assert ready.await_args.kwargs == {"tool_name": tool_name}
+
+
+async def test_the_valid_calls_name_every_tool():
+    mcp = FastMCP("test")
+    for module_name in _TOOL_MODULES:
+        _register(mcp, module_name)
+
+    registered = {tool.name for tool in await mcp.list_tools()}
+
+    assert registered == {tool_name for _, tool_name, _ in _A_VALID_CALL}
+
+
+@pytest.mark.parametrize(("module_name", "tool_name", "arguments"), _A_VALID_CALL)
+async def test_a_session_that_dies_during_a_call_asks_for_a_login(
+    module_name, tool_name, arguments, caplog
+):
+    """Every tool starts a login, and does not claim the call may run again.
+
+    The readiness call is only where the failure is injected, being the one call
+    every tool makes; the real readiness call answers its own auth failures.
+    """
+    from fastmcp import Context
+    from fastmcp.exceptions import ToolError
+
+    from linkedin_mcp_server.core.exceptions import AuthenticationError
+    from linkedin_mcp_server.exceptions import AuthenticationStartedError
+
+    mcp = FastMCP("test", mask_error_details=True)
+    _register(mcp, module_name)
+    signed_out = AuthenticationError("LinkedIn signed this session out")
+
+    with (
+        patch(
+            f"linkedin_mcp_server.tools.{module_name}.get_ready_extractor",
+            AsyncMock(side_effect=signed_out),
+        ),
+        patch(
+            "linkedin_mcp_server.dependencies.handle_auth_error",
+            AsyncMock(side_effect=AuthenticationStartedError("A login window opened")),
+        ) as relogin,
+        caplog.at_level(logging.INFO, logger="linkedin_mcp_server.error_handler"),
+        pytest.raises(ToolError, match="A login window opened"),
+    ):
+        await mcp.call_tool(tool_name, arguments)
+
+    relogin.assert_awaited_once()
+    assert relogin.await_args is not None
+    (failure, ctx), options = relogin.await_args
+    assert failure is signed_out
+    assert isinstance(ctx, Context)
+    assert options.get("nothing_ran_yet", False) is False
+    assert f"Authentication started in {tool_name}:" in caplog.text
+
+
+@pytest.mark.parametrize(("module_name", "tool_name", "arguments"), _A_VALID_CALL)
+async def test_a_known_failure_reaches_a_masked_client_shaped(
+    module_name, tool_name, arguments, caplog
+):
+    from fastmcp.exceptions import ToolError
+
+    from linkedin_mcp_server.core.exceptions import RateLimitError
+
+    mcp = FastMCP("test", mask_error_details=True)
+    _register(mcp, module_name)
+
+    with (
+        patch(
+            f"linkedin_mcp_server.tools.{module_name}.get_ready_extractor",
+            AsyncMock(side_effect=RateLimitError("throttled", suggested_wait_time=60)),
+        ),
+        patch(
+            "linkedin_mcp_server.dependencies.handle_auth_error",
+            new_callable=AsyncMock,
+        ) as relogin,
+        caplog.at_level(logging.WARNING, logger="linkedin_mcp_server.error_handler"),
+        pytest.raises(ToolError, match="Rate limit detected. Wait 60 seconds"),
+    ):
+        await mcp.call_tool(tool_name, arguments)
+
+    relogin.assert_not_awaited()
+    assert f"Rate limit in {tool_name}:" in caplog.text
+
+
+@pytest.mark.parametrize(("module_name", "tool_name", "arguments"), _A_VALID_CALL)
+async def test_a_quiescent_owner_lets_every_tool_be_replayed_after_sign_in(
+    module_name, tool_name, arguments
+):
+    """The readiness refusal crosses the tool with its replay marker intact.
+
+    Readiness runs for real up to the owner's latch, so the refusal says that
+    nothing ran yet from where it was raised, and the marker has to carry that
+    through the tool's own failure handling to the client.
+    """
+    from fastmcp import Client
+
+    from linkedin_mcp_server.bootstrap import go_auth_quiescent
+    from linkedin_mcp_server.daemon.auth_repair import (
+        MARKER_KEY,
+        OwnerAuthSignalMiddleware,
+    )
+    from linkedin_mcp_server.server_role import ServerRole, set_process_role
+
+    set_process_role(ServerRole.OWNER)
+    go_auth_quiescent("broken-generation")
+    mcp = FastMCP("owner", mask_error_details=True)
+    _register(mcp, module_name)
+    mcp.add_middleware(OwnerAuthSignalMiddleware())
+
+    with patch(
+        "linkedin_mcp_server.dependencies.get_or_create_browser",
+        AsyncMock(side_effect=AssertionError("a quiescent owner opened a browser")),
+    ):
+        async with Client(mcp) as client:
+            result = await client.call_tool(tool_name, arguments, raise_on_error=False)
+
+    assert result.is_error
+    marker = (result.meta or {})[MARKER_KEY]
+    assert marker["replayable"] is True
+    assert marker["generation"] == "broken-generation"
+
+
+@pytest.mark.parametrize(("module_name", "tool_name", "arguments"), _A_VALID_CALL)
+async def test_no_tool_hands_a_proxy_credential_to_the_client(
+    module_name, tool_name, arguments, monkeypatch
+):
+    """An error that is already shaped is still checked for the credentials."""
+    from fastmcp.exceptions import ToolError
+
+    from linkedin_mcp_server.config.schema import AppConfig
+
+    config = AppConfig()
+    config.browser.proxy_server = "http://gate.example:7000"
+    config.browser.proxy_username = "acctzone9"
+    config.browser.proxy_password = "s3cr3t"
+    monkeypatch.setattr("linkedin_mcp_server.config.get_config", lambda: config)
+    mcp = FastMCP("test", mask_error_details=True)
+    _register(mcp, module_name)
+    shaped = ToolError("Proxy refused http://acctzone9:s3cr3t@gate.example:7000")
+
+    with (
+        patch(
+            f"linkedin_mcp_server.tools.{module_name}.get_ready_extractor",
+            AsyncMock(side_effect=shaped),
+        ),
+        pytest.raises(ToolError) as excinfo,
+    ):
+        await mcp.call_tool(tool_name, arguments)
+
+    assert "gate.example:7000" in str(excinfo.value)
+    assert "s3cr3t" not in str(excinfo.value)
+    assert "acctzone9" not in str(excinfo.value)
+
+
+async def test_a_search_filter_refusal_does_not_echo_a_proxy_credential(
+    monkeypatch,
+):
+    """The refusal quotes the filter back, and is answered before readiness."""
+    from fastmcp.exceptions import ToolError
+
+    from linkedin_mcp_server.config.schema import AppConfig
+
+    config = AppConfig()
+    config.browser.proxy_server = "http://gate.example:7000"
+    config.browser.proxy_password = "s3cr3t"
+    monkeypatch.setattr("linkedin_mcp_server.config.get_config", lambda: config)
+    mcp = FastMCP("test", mask_error_details=True)
+    _register(mcp, "person")
+
+    with pytest.raises(ToolError, match="numeric LinkedIn company URN id") as excinfo:
+        await mcp.call_tool(
+            "search_people", {"keywords": "engineer", "current_company": "s3cr3t"}
+        )
+
+    assert "s3cr3t" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("module_name", "tool_name", "method", "arguments"),
+    [
+        ("person", "get_person_profile", "read_person", {"linkedin_username": "a"}),
+        ("person", "get_my_profile", "get_my_profile", {}),
+        (
+            "person",
+            "connect_with_person",
+            "connect_with_person",
+            {"linkedin_username": "alice"},
+        ),
+        ("messaging", "get_inbox", "get_inbox", {}),
+        (
+            "messaging",
+            "get_conversation",
+            "get_conversation",
+            {"linkedin_username": "alice"},
+        ),
+        (
+            "messaging",
+            "search_conversations",
+            "search_conversations",
+            {"keywords": "hello"},
+        ),
+        ("feed", "get_feed", "extract_feed", {}),
+    ],
+)
+async def test_a_landing_off_linkedin_reaches_a_masked_client_by_name(
+    module_name, tool_name, method, arguments
+):
+    """The one useful fact, where the browser landed, survives the masking.
+
+    And the session stays: this is the network, so the recovery for an expired
+    session, which retires the profile and opens a login, must not run.
+    """
+    import importlib
+
+    from fastmcp.exceptions import ToolError
+
+    from linkedin_mcp_server.core.destination import raise_if_off_linkedin
+    from linkedin_mcp_server.core.exceptions import OffLinkedInLandingError
+
+    try:
+        raise_if_off_linkedin("https://portal.invalid/interstitial?token=s3cret")
+    except OffLinkedInLandingError as landed:
+        refusal = landed
+
+    module = importlib.import_module(f"linkedin_mcp_server.tools.{module_name}")
+    mcp = FastMCP("test", mask_error_details=True)
+    getattr(module, f"register_{module_name}_tools")(mcp)
+    extractor = _make_mock_extractor({})
+    setattr(extractor, method, AsyncMock(side_effect=refusal))
+
+    with (
+        patch(
+            f"linkedin_mcp_server.tools.{module_name}.get_ready_extractor",
+            AsyncMock(return_value=extractor),
+        ),
+        patch(
+            "linkedin_mcp_server.dependencies.handle_auth_error",
+            new_callable=AsyncMock,
+        ) as relogin,
+        pytest.raises(ToolError) as excinfo,
+    ):
+        await mcp.call_tool(tool_name, arguments)
+
+    message = str(excinfo.value)
+    assert "https://portal.invalid" in message
+    assert "instead of LinkedIn" in message
+    assert "s3cret" not in message
+    relogin.assert_not_awaited()
+
+
 class TestPersonTool:
-    async def test_get_person_profile_success(self, mock_context):
+    async def test_get_person_profile_success(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/in/test-user/",
             "sections": {"main_profile": "John Doe\nSoftware Engineer"},
@@ -87,14 +634,21 @@ class TestPersonTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_person_profile")
-        result = await tool_fn("test-user", mock_context, extractor=mock_extractor)
+        result = await tool_fn(
+            "https://de.linkedin.com/in/test-user/",
+            mock_context,
+        )
         assert result["url"] == "https://www.linkedin.com/in/test-user/"
         assert "main_profile" in result["sections"]
         assert "pages_visited" not in result
         assert "sections_requested" not in result
+        assert mock_extractor.read_person.await_args.args[0] == "test-user"
 
-    async def test_get_person_profile_with_sections(self, mock_context):
+    async def test_get_person_profile_with_sections(
+        self, mock_context, serve_extractor
+    ):
         """Verify sections parameter is passed through."""
         expected = {
             "url": "https://www.linkedin.com/in/test-user/",
@@ -111,24 +665,26 @@ class TestPersonTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_person_profile")
         result = await tool_fn(
             "test-user",
             mock_context,
             sections="experience,contact_info",
-            extractor=mock_extractor,
         )
         assert "main_profile" in result["sections"]
         assert "experience" in result["sections"]
         assert "contact_info" in result["sections"]
-        # Verify scrape_person was called exactly once with a set[str]
-        mock_extractor.scrape_person.assert_awaited_once()
-        call_args = mock_extractor.scrape_person.call_args
+        # Verify read_person was called exactly once with a set[str]
+        mock_extractor.read_person.assert_awaited_once()
+        call_args = mock_extractor.read_person.call_args
         assert isinstance(call_args[0][1], set)
         assert "experience" in call_args[0][1]
         assert "contact_info" in call_args[0][1]
 
-    async def test_get_person_profile_passes_callbacks(self, mock_context):
+    async def test_get_person_profile_passes_callbacks(
+        self, mock_context, serve_extractor
+    ):
         """Verify tool wires MCPContextProgressCallback to the extractor."""
         expected = {
             "url": "https://www.linkedin.com/in/test-user/",
@@ -141,15 +697,18 @@ class TestPersonTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_person_profile")
-        await tool_fn("test-user", mock_context, extractor=mock_extractor)
+        await tool_fn("test-user", mock_context)
 
-        call_kwargs = mock_extractor.scrape_person.call_args.kwargs
+        call_kwargs = mock_extractor.read_person.call_args.kwargs
         assert "callbacks" in call_kwargs
         assert isinstance(call_kwargs["callbacks"], MCPContextProgressCallback)
 
-    async def test_get_person_profile_passes_max_scrolls(self, mock_context):
-        """Verify max_scrolls parameter is forwarded to scrape_person."""
+    async def test_get_person_profile_passes_max_scrolls(
+        self, mock_context, serve_extractor
+    ):
+        """Verify max_scrolls parameter is forwarded to read_person."""
         expected = {
             "url": "https://www.linkedin.com/in/test-user/",
             "sections": {"main_profile": "John Doe"},
@@ -161,15 +720,15 @@ class TestPersonTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_person_profile")
         await tool_fn(
             "test-user",
             mock_context,
             max_scrolls=15,
-            extractor=mock_extractor,
         )
 
-        call_kwargs = mock_extractor.scrape_person.call_args.kwargs
+        call_kwargs = mock_extractor.read_person.call_args.kwargs
         assert call_kwargs["max_scrolls"] == 15
 
     async def test_get_person_profile_rejects_invalid_max_scrolls(self, mock_context):
@@ -189,7 +748,9 @@ class TestPersonTool:
                 {"linkedin_username": "test-user", "max_scrolls": 0},
             )
 
-    async def test_get_person_profile_unknown_section(self, mock_context):
+    async def test_get_person_profile_unknown_section(
+        self, mock_context, serve_extractor
+    ):
         expected = {
             "url": "https://www.linkedin.com/in/test-user/",
             "sections": {"main_profile": "John Doe"},
@@ -201,31 +762,32 @@ class TestPersonTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_person_profile")
         result = await tool_fn(
             "test-user",
             mock_context,
             sections="bogus_section",
-            extractor=mock_extractor,
         )
         assert result["unknown_sections"] == ["bogus_section"]
 
-    async def test_get_person_profile_error(self, mock_context):
+    async def test_get_person_profile_error(self, mock_context, serve_extractor):
         from fastmcp.exceptions import ToolError
 
         from linkedin_mcp_server.exceptions import SessionExpiredError
 
         mock_extractor = MagicMock()
-        mock_extractor.scrape_person = AsyncMock(side_effect=SessionExpiredError())
+        mock_extractor.read_person = AsyncMock(side_effect=SessionExpiredError())
 
         from linkedin_mcp_server.tools.person import register_person_tools
 
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_person_profile")
         with pytest.raises(ToolError, match="Session expired"):
-            await tool_fn("test-user", mock_context, extractor=mock_extractor)
+            await tool_fn("test-user", mock_context)
 
     async def test_get_person_profile_auth_error(self, monkeypatch):
         """Auth failures in the DI layer trigger auto-relogin and report the login browser."""
@@ -234,8 +796,13 @@ class TestPersonTool:
         from linkedin_mcp_server.core.exceptions import AuthenticationError
         from linkedin_mcp_server.exceptions import AuthenticationStartedError
 
+        # Live on purpose: a bare mock's ``is_closed()`` is truthy, which reads
+        # as a closed page and sends the call down the shutdown path instead of
+        # the auth failure this test is about.
         mock_browser = MagicMock()
-        mock_browser.page = MagicMock()
+        mock_browser.page.is_closed.return_value = False
+        mock_browser.page_crashed = False
+        mock_browser.context.browser.is_connected.return_value = True
         monkeypatch.setattr(
             "linkedin_mcp_server.dependencies.ensure_tool_ready_or_raise",
             AsyncMock(return_value=None),
@@ -273,9 +840,12 @@ class TestPersonTool:
         with pytest.raises(ToolError, match="Session expired"):
             await mcp.call_tool("get_person_profile", {"linkedin_username": "test"})
 
-    async def test_search_people(self, mock_context):
+    async def test_search_people(self, mock_context, serve_extractor):
         expected = {
-            "url": "https://www.linkedin.com/search/results/people/?keywords=AI+engineer&location=New+York",
+            "url": (
+                "https://www.linkedin.com/search/results/people/"
+                "?keywords=AI+engineer&geoUrn=%5B%22103644278%22%5D"
+            ),
             "sections": {"search_results": "Jane Doe\nAI Engineer at Acme\nNew York"},
         }
         mock_extractor = _make_mock_extractor(expected)
@@ -285,20 +855,22 @@ class TestPersonTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "search_people")
-        result = await tool_fn(
-            "AI engineer", mock_context, location="New York", extractor=mock_extractor
-        )
+        result = await tool_fn("AI engineer", mock_context, location="103644278")
         assert "search_results" in result["sections"]
         assert "pages_visited" not in result
         mock_extractor.search_people.assert_awaited_once_with(
             "AI engineer",
-            "New York",
+            "103644278",
             network=None,
             current_company=None,
+            connection_of=None,
         )
 
-    async def test_search_people_with_network_and_company_filters(self, mock_context):
+    async def test_search_people_with_network_and_company_filters(
+        self, mock_context, serve_extractor
+    ):
         expected = {
             "url": (
                 "https://www.linkedin.com/search/results/people/"
@@ -316,13 +888,13 @@ class TestPersonTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "search_people")
         result = await tool_fn(
             "engineer",
             mock_context,
             network=["F"],
             current_company="1115",
-            extractor=mock_extractor,
         )
         assert "search_results" in result["sections"]
         mock_extractor.search_people.assert_awaited_once_with(
@@ -330,6 +902,41 @@ class TestPersonTool:
             None,
             network=["F"],
             current_company="1115",
+            connection_of=None,
+        )
+
+    async def test_search_people_with_connection_of_filter(
+        self, mock_context, serve_extractor
+    ):
+        expected = {
+            "url": (
+                "https://www.linkedin.com/search/results/people/"
+                "?keywords=&network=%5B%22F%22%5D"
+                "&connectionOf=%5B%22ACoAADdZSNYBiaacxEw6je-wVIKjGkKp-it0gD8%22%5D"
+            ),
+            "sections": {"search_results": "Jane Doe\n1st"},
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.person import register_person_tools
+
+        mcp = FastMCP("test")
+        register_person_tools(mcp)
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "search_people")
+        await tool_fn(
+            "",
+            mock_context,
+            network=["F"],
+            connection_of="ACoAADdZSNYBiaacxEw6je-wVIKjGkKp-it0gD8",
+        )
+        mock_extractor.search_people.assert_awaited_once_with(
+            "",
+            None,
+            network=["F"],
+            current_company=None,
+            connection_of="ACoAADdZSNYBiaacxEw6je-wVIKjGkKp-it0gD8",
         )
 
     @pytest.mark.parametrize(
@@ -392,17 +999,18 @@ class TestPersonTool:
             None,
             network=["F"],
             current_company=None,
+            connection_of=None,
         )
 
     async def test_search_people_validation_error_surfaced_as_tool_error(
-        self, mock_context
+        self, mock_context, serve_extractor
     ):
         """A FilterValidationError raised by the extractor should surface to
         the MCP client as a ToolError carrying the same message, rather than
         being collapsed to the generic "Error calling tool" mask."""
         from fastmcp.exceptions import ToolError
 
-        from linkedin_mcp_server.scraping.contracts import FilterValidationError
+        from linkedin_mcp_server.linkedin.contracts import FilterValidationError
         from linkedin_mcp_server.tools.person import register_person_tools
 
         mock_extractor = MagicMock()
@@ -412,17 +1020,17 @@ class TestPersonTool:
 
         mcp = FastMCP("test")
         register_person_tools(mcp)
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "search_people")
 
         with pytest.raises(ToolError, match="must be a numeric URN"):
             await tool_fn(
                 "engineer",
                 mock_context,
-                current_company="SAP",
-                extractor=mock_extractor,
+                current_company="1115",
             )
 
-    async def test_connect_with_person(self, mock_context):
+    async def test_connect_with_person(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/in/test-user/",
             "status": "connected",
@@ -436,12 +1044,12 @@ class TestPersonTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "connect_with_person")
         result = await tool_fn(
-            "test-user",
+            "https://www.linkedin.com/in/test-user/",
             mock_context,
             note="Let us connect.",
-            extractor=mock_extractor,
         )
 
         assert result["status"] == "connected"
@@ -451,7 +1059,7 @@ class TestPersonTool:
             note="Let us connect.",
         )
 
-    async def test_connect_with_person_no_note(self, mock_context):
+    async def test_connect_with_person_no_note(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/in/test-user/",
             "status": "connected",
@@ -465,11 +1073,11 @@ class TestPersonTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "connect_with_person")
         result = await tool_fn(
             "test-user",
             mock_context,
-            extractor=mock_extractor,
         )
 
         assert result["status"] == "connected"
@@ -478,7 +1086,9 @@ class TestPersonTool:
             note=None,
         )
 
-    async def test_connect_with_person_custom_note_limit_reached(self, mock_context):
+    async def test_connect_with_person_custom_note_limit_reached(
+        self, mock_context, serve_extractor
+    ):
         """The custom_note_limit_reached status returns LinkedIn's message."""
         expected = {
             "url": "https://www.linkedin.com/in/test-user/",
@@ -493,12 +1103,12 @@ class TestPersonTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "connect_with_person")
         result = await tool_fn(
             "test-user",
             mock_context,
             note="Hello!",
-            extractor=mock_extractor,
         )
 
         assert result["status"] == "custom_note_limit_reached"
@@ -519,8 +1129,13 @@ class TestPersonTool:
         from linkedin_mcp_server.core.exceptions import AuthenticationError
         from linkedin_mcp_server.exceptions import AuthenticationStartedError
 
+        # Live on purpose: a bare mock's ``is_closed()`` is truthy, which reads
+        # as a closed page and sends the call down the shutdown path instead of
+        # the auth failure this test is about.
         mock_browser = MagicMock()
-        mock_browser.page = MagicMock()
+        mock_browser.page.is_closed.return_value = False
+        mock_browser.page_crashed = False
+        mock_browser.context.browser.is_connected.return_value = True
         monkeypatch.setattr(
             "linkedin_mcp_server.dependencies.ensure_tool_ready_or_raise",
             AsyncMock(return_value=None),
@@ -561,9 +1176,69 @@ class TestPersonTool:
                 {"linkedin_username": "test"},
             )
 
+    @pytest.mark.parametrize("found_by", ["startup", "read"])
+    async def test_a_restricted_account_is_reported_not_relogged(
+        self, monkeypatch, serve_extractor, found_by: str
+    ):
+        """The session stays in place and no login window opens.
+
+        Found either by the startup feed check or by a navigation mid-read;
+        both reach the tool body, which routes only auth failures to re-login.
+        """
+        from fastmcp.exceptions import ToolError
+
+        from linkedin_mcp_server.core.exceptions import AccountRestrictedError
+        from linkedin_mcp_server.exceptions import AuthenticationStartedError
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.dependencies.ensure_tool_ready_or_raise",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "linkedin_mcp_server.dependencies.get_or_create_browser",
+            AsyncMock(side_effect=AccountRestrictedError()),
+        )
+        monkeypatch.setattr(
+            "linkedin_mcp_server.dependencies.get_runtime_policy",
+            lambda: "managed",
+        )
+        close_browser = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "linkedin_mcp_server.dependencies.close_browser", close_browser
+        )
+        relogin = AsyncMock(
+            side_effect=AuthenticationStartedError(
+                "Session expired. A login browser window has been opened."
+            )
+        )
+        monkeypatch.setattr(
+            "linkedin_mcp_server.dependencies.invalidate_auth_and_trigger_relogin",
+            relogin,
+        )
+        if found_by == "read":
+            extractor = MagicMock()
+            extractor.read_person = AsyncMock(side_effect=AccountRestrictedError())
+            serve_extractor(extractor)
+
+        from linkedin_mcp_server.tools.person import register_person_tools
+
+        mcp = FastMCP("test")
+        register_person_tools(mcp)
+
+        with pytest.raises(ToolError) as exc_info:
+            await mcp.call_tool(
+                "get_person_profile",
+                {"linkedin_username": "test-user"},
+            )
+
+        # Whole, and nothing appended: no issue template for LinkedIn's decision.
+        assert str(exc_info.value) == str(AccountRestrictedError())
+        relogin.assert_not_awaited()
+        close_browser.assert_not_awaited()
+
 
 class TestCompanyTools:
-    async def test_get_company_profile(self, mock_context):
+    async def test_get_company_profile(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/company/testcorp/",
             "sections": {"about": "TestCorp\nWe build things"},
@@ -575,12 +1250,55 @@ class TestCompanyTools:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_company_profile")
-        result = await tool_fn("testcorp", mock_context, extractor=mock_extractor)
+        result = await tool_fn(
+            "https://uk.linkedin.com/company/testcorp/",
+            mock_context,
+        )
         assert "about" in result["sections"]
         assert "pages_visited" not in result
+        assert (
+            mock_extractor.read_company.await_args.args[0]
+            == "https://uk.linkedin.com/company/testcorp/"
+        )
 
-    async def test_get_company_posts_normalizes_a_pasted_link(self, mock_context):
+    @pytest.mark.parametrize(
+        "tool_name", ["get_company_profile", "get_company_employees"]
+    )
+    @pytest.mark.parametrize("slug", ["linkedin.com", "lnkd.in"])
+    async def test_company_collision_slug_reaches_reader(
+        self, mock_context, serve_extractor, tool_name, slug
+    ):
+        from linkedin_mcp_server.linkedin.company import CompanyReader
+        from linkedin_mcp_server.tools.company import register_company_tools
+
+        capture = MagicMock()
+        capture.capture = AsyncMock(
+            return_value=ExtractedSection(text="company text", references=[])
+        )
+        reader = CompanyReader(MagicMock(), capture)
+        mcp = FastMCP("test")
+        register_company_tools(mcp)
+
+        serve_extractor(reader)
+        tool_fn = await get_tool_fn(mcp, tool_name)
+        result = await tool_fn(f"/company/{slug}/", mock_context)
+
+        suffix = "/" if tool_name == "get_company_profile" else "/people/"
+        url = f"https://www.linkedin.com/company/{slug}{suffix}"
+        assert result["url"] == url
+        assert result["sections"]
+        capture.capture.assert_awaited_once()
+        assert capture.capture.await_args is not None
+        capture_suffix = "/about/" if tool_name == "get_company_profile" else suffix
+        assert capture.capture.await_args.args[0] == (
+            f"https://www.linkedin.com/company/{slug}{capture_suffix}"
+        )
+
+    async def test_get_company_posts_normalizes_a_pasted_link(
+        self, mock_context, serve_extractor
+    ):
         """get_company_posts builds its URL in the tool, not in the extractor.
 
         That makes it the one wiring point the extractor tests cannot reach, and
@@ -594,11 +1312,11 @@ class TestCompanyTools:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_company_posts")
         result = await tool_fn(
             "https://de.linkedin.com/company/testcorp/",
             mock_context,
-            extractor=mock_extractor,
         )
         assert result["url"] == "https://www.linkedin.com/company/testcorp/posts/"
         assert (
@@ -606,7 +1324,9 @@ class TestCompanyTools:
             == "https://www.linkedin.com/company/testcorp/posts/"
         )
 
-    async def test_get_company_posts_refuses_a_traversal_value(self, mock_context):
+    async def test_get_company_posts_refuses_a_traversal_value(
+        self, mock_context, serve_extractor
+    ):
         mock_extractor = _make_mock_extractor({})
 
         from linkedin_mcp_server.tools.company import register_company_tools
@@ -614,12 +1334,15 @@ class TestCompanyTools:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_company_posts")
         with pytest.raises(Exception):
-            await tool_fn("../../feed", mock_context, extractor=mock_extractor)
+            await tool_fn("../../feed", mock_context)
         mock_extractor.extract_page.assert_not_called()
 
-    async def test_get_company_profile_passes_callbacks(self, mock_context):
+    async def test_get_company_profile_passes_callbacks(
+        self, mock_context, serve_extractor
+    ):
         """Verify tool wires MCPContextProgressCallback to the extractor."""
         expected = {
             "url": "https://www.linkedin.com/company/testcorp/",
@@ -632,14 +1355,17 @@ class TestCompanyTools:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_company_profile")
-        await tool_fn("testcorp", mock_context, extractor=mock_extractor)
+        await tool_fn("testcorp", mock_context)
 
-        call_kwargs = mock_extractor.scrape_company.call_args.kwargs
+        call_kwargs = mock_extractor.read_company.call_args.kwargs
         assert "callbacks" in call_kwargs
         assert isinstance(call_kwargs["callbacks"], MCPContextProgressCallback)
 
-    async def test_get_company_profile_unknown_section(self, mock_context):
+    async def test_get_company_profile_unknown_section(
+        self, mock_context, serve_extractor
+    ):
         expected = {
             "url": "https://www.linkedin.com/company/testcorp/",
             "sections": {"about": "TestCorp\nWe build things"},
@@ -651,13 +1377,12 @@ class TestCompanyTools:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_company_profile")
-        result = await tool_fn(
-            "testcorp", mock_context, sections="bogus", extractor=mock_extractor
-        )
+        result = await tool_fn("testcorp", mock_context, sections="bogus")
         assert result["unknown_sections"] == ["bogus"]
 
-    async def test_get_company_posts(self, mock_context):
+    async def test_get_company_posts(self, mock_context, serve_extractor):
         mock_extractor = MagicMock()
         mock_extractor.extract_page = AsyncMock(
             return_value=ExtractedSection(text="Post 1\nPost 2", references=[])
@@ -668,14 +1393,34 @@ class TestCompanyTools:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_company_posts")
-        result = await tool_fn("testcorp", mock_context, extractor=mock_extractor)
+        result = await tool_fn("testcorp", mock_context)
         assert "posts" in result["sections"]
         assert result["sections"]["posts"] == "Post 1\nPost 2"
         assert "pages_visited" not in result
         assert "sections_requested" not in result
 
-    async def test_get_company_posts_omits_rate_limited_sentinel(self, mock_context):
+    async def test_get_company_posts_passes_max_scrolls(
+        self, mock_context, serve_extractor
+    ):
+        """Verify max_scrolls parameter is forwarded to extract_page."""
+        mock_extractor = _make_mock_extractor({})
+
+        from linkedin_mcp_server.tools.company import register_company_tools
+
+        mcp = FastMCP("test")
+        register_company_tools(mcp)
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "get_company_posts")
+        await tool_fn("testcorp", mock_context, max_scrolls=25)
+
+        assert mock_extractor.extract_page.call_args.kwargs["max_scrolls"] == 25
+
+    async def test_get_company_posts_omits_rate_limited_sentinel(
+        self, mock_context, serve_extractor
+    ):
         mock_extractor = MagicMock()
         mock_extractor.extract_page = AsyncMock(
             return_value=ExtractedSection(text=RATE_LIMITED_SECTION_TEXT, references=[])
@@ -686,12 +1431,15 @@ class TestCompanyTools:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_company_posts")
-        result = await tool_fn("testcorp", mock_context, extractor=mock_extractor)
+        result = await tool_fn("testcorp", mock_context)
         assert result["sections"] == {}
         assert result["section_errors"]["posts"]["error_type"] == "rate_limit"
 
-    async def test_get_company_posts_returns_section_errors(self, mock_context):
+    async def test_get_company_posts_returns_section_errors(
+        self, mock_context, serve_extractor
+    ):
         mock_extractor = MagicMock()
         mock_extractor.extract_page = AsyncMock(
             return_value=ExtractedSection(
@@ -706,14 +1454,17 @@ class TestCompanyTools:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_company_posts")
-        result = await tool_fn("testcorp", mock_context, extractor=mock_extractor)
+        result = await tool_fn("testcorp", mock_context)
         assert result["sections"] == {}
         assert result["section_errors"]["posts"]["issue_template_path"] == (
             "/tmp/company-posts-issue.md"
         )
 
-    async def test_get_company_posts_omits_orphaned_references(self, mock_context):
+    async def test_get_company_posts_omits_orphaned_references(
+        self, mock_context, serve_extractor
+    ):
         mock_extractor = MagicMock()
         mock_extractor.extract_page = AsyncMock(
             return_value=ExtractedSection(
@@ -733,14 +1484,15 @@ class TestCompanyTools:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_company_posts")
-        result = await tool_fn("testcorp", mock_context, extractor=mock_extractor)
+        result = await tool_fn("testcorp", mock_context)
         assert result["sections"] == {}
         assert "references" not in result
 
 
 class TestJobTools:
-    async def test_get_job_details(self, mock_context):
+    async def test_get_job_details(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/jobs/view/12345/",
             "sections": {"job_posting": "Software Engineer\nGreat opportunity"},
@@ -752,12 +1504,54 @@ class TestJobTools:
         mcp = FastMCP("test")
         register_job_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_job_details")
-        result = await tool_fn("12345", mock_context, extractor=mock_extractor)
+        result = await tool_fn(
+            "https://www.linkedin.com/jobs/view/12345/",
+            mock_context,
+        )
         assert "job_posting" in result["sections"]
         assert "pages_visited" not in result
+        mock_extractor.read_job.assert_awaited_once_with("12345")
 
-    async def test_search_jobs(self, mock_context):
+    async def test_get_job_apply_url(self, mock_context, serve_extractor):
+        expected = {
+            "url": "https://www.linkedin.com/jobs/view/12345/",
+            "apply": {"type": "external", "url": "https://jobs.example.com/12345"},
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.job import register_job_tools
+
+        mcp = FastMCP("test")
+        register_job_tools(mcp)
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "get_job_apply_url")
+        result = await tool_fn("12345", mock_context)
+        assert result == expected
+        mock_extractor.get_job_apply_url.assert_awaited_once_with("12345")
+
+    async def test_get_easy_apply_form(self, mock_context, serve_extractor):
+        expected = {
+            "url": "https://www.linkedin.com/jobs/view/12345/",
+            "apply": {"type": "easy_apply"},
+            "form": {"steps": [], "complete": True},
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.job import register_job_tools
+
+        mcp = FastMCP("test")
+        register_job_tools(mcp)
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "get_easy_apply_form")
+        result = await tool_fn("12345", mock_context)
+        assert result == expected
+        mock_extractor.get_easy_apply_form.assert_awaited_once_with("12345")
+
+    async def test_search_jobs(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/jobs/search/?keywords=python",
             "sections": {"search_results": "Job 1\nJob 2"},
@@ -769,14 +1563,15 @@ class TestJobTools:
         mcp = FastMCP("test")
         register_job_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "search_jobs")
-        result = await tool_fn(
-            "python", mock_context, location="Remote", extractor=mock_extractor
-        )
+        result = await tool_fn("python", mock_context, location="Remote")
         assert "search_results" in result["sections"]
         assert "pages_visited" not in result
 
-    async def test_search_jobs_is_bounded_by_the_registered_timeout(self, mock_context):
+    async def test_search_jobs_is_bounded_by_the_registered_timeout(
+        self, mock_context, serve_extractor
+    ):
         """The loop stops itself by the same figure FastMCP cancels on.
 
         Registered with a non-default timeout, because dropping the argument
@@ -802,8 +1597,9 @@ class TestJobTools:
         mcp = FastMCP("test")
         register_job_tools(mcp, tool_timeout=60.0)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "search_jobs")
-        await tool_fn("python", mock_context, extractor=mock_extractor)
+        await tool_fn("python", mock_context)
 
         passed = mock_extractor.search_jobs.await_args.kwargs["tool_timeout"]
         assert passed <= 60.0
@@ -846,9 +1642,9 @@ class TestJobTools:
         passed = mock_extractor.search_jobs.await_args.kwargs["tool_timeout"]
         assert passed < 59.9
 
-    async def test_get_saved_jobs(self, mock_context):
+    async def test_get_saved_jobs(self, mock_context, serve_extractor):
         expected = {
-            "url": "https://www.linkedin.com/my-items/saved-jobs/",
+            "url": "https://www.linkedin.com/jobs-tracker/?stage=saved",
             "sections": {"saved_jobs": "Saved Job 1\nSaved Job 2"},
             "job_ids": ["111", "222"],
         }
@@ -859,15 +1655,53 @@ class TestJobTools:
         mcp = FastMCP("test")
         register_job_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_saved_jobs")
-        result = await tool_fn(mock_context, max_pages=2, extractor=mock_extractor)
+        result = await tool_fn(mock_context, max_pages=2)
         assert "saved_jobs" in result["sections"]
         assert result["job_ids"] == ["111", "222"]
-        mock_extractor.get_saved_jobs.assert_awaited_once_with(max_pages=2)
+        mock_extractor.get_saved_jobs.assert_awaited_once_with(
+            max_pages=2, stage="saved"
+        )
+
+    async def test_dismiss_job(self, mock_context, serve_extractor):
+        expected = {
+            "url": (
+                "https://www.linkedin.com/jobs/search/"
+                "?keywords=Engineer+Acme&geoId=92000000"
+            ),
+            "job_id": "12345",
+            "keywords": "Engineer Acme",
+            "dismissed": True,
+            "already_dismissed": False,
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.job import register_job_tools
+
+        mcp = FastMCP("test")
+        register_job_tools(mcp)
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "dismiss_job")
+        result = await tool_fn("12345", mock_context)
+        assert result == expected
+        mock_extractor.dismiss_job.assert_awaited_once_with("12345")
+
+    async def test_dismiss_job_is_marked_destructive(self):
+        from linkedin_mcp_server.tools.job import register_job_tools
+
+        mcp = FastMCP("test")
+        register_job_tools(mcp)
+
+        tool = await mcp.get_tool("dismiss_job")
+        assert tool is not None and tool.annotations is not None
+        assert tool.annotations.read_only_hint is False
+        assert tool.annotations.destructive_hint is True
 
 
 class TestGetSidebarProfilesTool:
-    async def test_get_sidebar_profiles_success(self, mock_context):
+    async def test_get_sidebar_profiles_success(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/in/test-user/",
             "sidebar_profiles": {
@@ -881,14 +1715,20 @@ class TestGetSidebarProfilesTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_sidebar_profiles")
-        result = await tool_fn("test-user", mock_context, extractor=mock_extractor)
+        result = await tool_fn(
+            "https://www.linkedin.com/in/test-user/",
+            mock_context,
+        )
 
         assert result["url"] == "https://www.linkedin.com/in/test-user/"
         assert "more_profiles_for_you" in result["sidebar_profiles"]
         mock_extractor.get_sidebar_profiles.assert_awaited_once_with("test-user")
 
-    async def test_get_sidebar_profiles_empty_result(self, mock_context):
+    async def test_get_sidebar_profiles_empty_result(
+        self, mock_context, serve_extractor
+    ):
         expected = {
             "url": "https://www.linkedin.com/in/test-user/",
             "sidebar_profiles": {},
@@ -900,12 +1740,13 @@ class TestGetSidebarProfilesTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_sidebar_profiles")
-        result = await tool_fn("test-user", mock_context, extractor=mock_extractor)
+        result = await tool_fn("test-user", mock_context)
 
         assert result["sidebar_profiles"] == {}
 
-    async def test_get_sidebar_profiles_error(self, mock_context):
+    async def test_get_sidebar_profiles_error(self, mock_context, serve_extractor):
         from fastmcp.exceptions import ToolError
 
         from linkedin_mcp_server.exceptions import SessionExpiredError
@@ -920,13 +1761,14 @@ class TestGetSidebarProfilesTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_sidebar_profiles")
         with pytest.raises(ToolError, match="Session expired"):
-            await tool_fn("test-user", mock_context, extractor=mock_extractor)
+            await tool_fn("test-user", mock_context)
 
 
 class TestMessagingTools:
-    async def test_get_inbox_success(self, mock_context):
+    async def test_get_inbox_success(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/messaging/",
             "sections": {"inbox": "Conversation 1\nConversation 2"},
@@ -938,33 +1780,17 @@ class TestMessagingTools:
         mcp = FastMCP("test")
         register_messaging_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_inbox")
-        result = await tool_fn(mock_context, extractor=mock_extractor)
+        result = await tool_fn(mock_context)
 
         assert result["sections"]["inbox"] == "Conversation 1\nConversation 2"
         mock_extractor.get_inbox.assert_awaited_once_with(limit=20)
 
-    async def test_get_conversation_success(self, mock_context):
+    async def test_get_conversation_success(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/messaging/thread/abc123/",
-            "sections": {
-                "messages": [
-                    {
-                        "timestamp": "2026-02-10T15:17:00",
-                        "status": "sent",
-                        "sender": 0,
-                        "content": "Hello!",
-                    }
-                ],
-                "members": [
-                    {
-                        "kind": "person",
-                        "url": "/in/alice/",
-                        "name": "Alice",
-                        "is_self": True,
-                    },
-                ],
-            },
+            "sections": {"conversation": "Hello!\nHi there!"},
         }
         mock_extractor = _make_mock_extractor(expected)
 
@@ -973,80 +1799,88 @@ class TestMessagingTools:
         mcp = FastMCP("test")
         register_messaging_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_conversation")
         result = await tool_fn(
-            mock_context, linkedin_username="testuser", extractor=mock_extractor
+            mock_context,
+            linkedin_username="https://www.linkedin.com/in/testuser/",
         )
 
-        assert result["sections"]["messages"][0]["content"] == "Hello!"
-        assert result["sections"]["members"][0]["url"] == "/in/alice/"
+        assert result["sections"]["conversation"] == "Hello!\nHi there!"
         mock_extractor.get_conversation.assert_awaited_once_with(
-            linkedin_username="testuser",
-            thread_id=None,
-            message_url=None,
-            index=0,
-            max_scrolls=3,
+            linkedin_username="testuser", thread_id=None, index=0
         )
 
-    async def test_get_invitation_conversation_success(self, mock_context):
-        expected = {
-            "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/",
-            "sections": {"messages": [], "members": []},
-        }
-        mock_extractor = _make_mock_extractor(expected)
-        message_url = "/messaging/compose/?recipient=ACoAAB&invitation=urn"
+    async def test_get_conversation_normalizes_a_thread_url(
+        self, mock_context, serve_extractor
+    ):
+        mock_extractor = _make_mock_extractor(
+            {
+                "url": "https://www.linkedin.com/messaging/thread/abc123/",
+                "sections": {"conversation": "Hello!"},
+            }
+        )
 
         from linkedin_mcp_server.tools.messaging import register_messaging_tools
 
         mcp = FastMCP("test")
         register_messaging_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_conversation")
         await tool_fn(
             mock_context,
-            linkedin_username="testuser",
-            message_url=message_url,
-            extractor=mock_extractor,
+            thread_id="https://www.linkedin.com/messaging/thread/abc123/",
         )
 
         mock_extractor.get_conversation.assert_awaited_once_with(
-            linkedin_username="testuser",
-            thread_id=None,
-            message_url=message_url,
-            index=0,
-            max_scrolls=3,
+            linkedin_username=None, thread_id="abc123", index=0
         )
 
-    async def test_archive_conversation_success(self, mock_context):
-        expected = {
-            "url": "https://www.linkedin.com/messaging/",
-            "status": "archived",
-            "archived": True,
-            "performed": True,
-        }
-        mock_extractor = _make_mock_extractor(expected)
+    async def test_get_conversation_thread_id_takes_precedence_over_username(self):
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mock_extractor = _make_mock_extractor(
+            {"url": "https://www.linkedin.com/messaging/thread/abc123/", "sections": {}}
+        )
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+        ready = AsyncMock(return_value=mock_extractor)
+
+        with patch("linkedin_mcp_server.tools.messaging.get_ready_extractor", ready):
+            await mcp.call_tool(
+                "get_conversation",
+                {
+                    "linkedin_username": "/feed/",
+                    "thread_id": "https://www.linkedin.com/messaging/thread/abc123/",
+                    "index": 2,
+                },
+            )
+
+        ready.assert_awaited_once()
+        mock_extractor.get_conversation.assert_awaited_once_with(
+            linkedin_username="/feed/", thread_id="abc123", index=2
+        )
+
+    async def test_get_conversation_rejects_missing_identifier_before_extractor(self):
+        from fastmcp.exceptions import ToolError
 
         from linkedin_mcp_server.tools.messaging import register_messaging_tools
 
         mcp = FastMCP("test")
         register_messaging_tools(mcp)
+        ready = AsyncMock(side_effect=AssertionError("get_ready_extractor was called"))
 
-        tool_fn = await get_tool_fn(mcp, "archive_conversation")
-        result = await tool_fn(
-            mock_context,
-            thread_id="thread-123",
-            extractor=mock_extractor,
+        with patch("linkedin_mcp_server.tools.messaging.get_ready_extractor", ready):
+            with pytest.raises(ToolError) as raised:
+                await mcp.call_tool("get_conversation", {})
+
+        assert str(raised.value) == (
+            "Provide at least one of linkedin_username or thread_id"
         )
+        ready.assert_not_awaited()
 
-        assert result["status"] == "archived"
-        mock_extractor.archive_conversation.assert_awaited_once_with(
-            linkedin_username=None,
-            thread_id="thread-123",
-            message_url=None,
-            index=0,
-        )
-
-    async def test_search_conversations_success(self, mock_context):
+    async def test_search_conversations_success(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/messaging/",
             "sections": {"search_results": "Result 1\nResult 2"},
@@ -1058,13 +1892,217 @@ class TestMessagingTools:
         mcp = FastMCP("test")
         register_messaging_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "search_conversations")
-        result = await tool_fn("hello", mock_context, extractor=mock_extractor)
+        result = await tool_fn("hello", mock_context)
 
         assert result["sections"]["search_results"] == "Result 1\nResult 2"
         mock_extractor.search_conversations.assert_awaited_once_with("hello", limit=20)
 
-    async def test_send_message_success(self, mock_context):
+    async def test_archive_conversation_normalizes_the_thread_id(
+        self, mock_context, serve_extractor
+    ):
+        expected = {
+            "url": "https://www.linkedin.com/messaging/thread/2-abc/",
+            "thread_id": "2-abc",
+            "participant": "Ada Lovelace",
+            "status": "archived",
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "archive_conversation")
+        result = await tool_fn(mock_context, thread_id="/messaging/thread/2-abc/")
+
+        assert result == expected
+        mock_extractor.archive_conversation.assert_awaited_once_with(thread_id="2-abc")
+
+    async def test_archive_conversation_refuses_a_path_before_the_browser(self):
+        from fastmcp.exceptions import ToolError
+
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+        ready = AsyncMock(side_effect=AssertionError("get_ready_extractor was called"))
+
+        with patch("linkedin_mcp_server.tools.messaging.get_ready_extractor", ready):
+            with pytest.raises(ToolError, match="thread_id is not a LinkedIn id"):
+                await mcp.call_tool("archive_conversation", {"thread_id": "../feed"})
+
+        ready.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("tool", "section"),
+        [("get_inbox", "inbox"), ("search_conversations", "search_results")],
+    )
+    async def test_listing_section_errors_pass_through_unchanged(
+        self, mock_context, serve_extractor, tool, section
+    ):
+        expected = {
+            "url": "https://www.linkedin.com/messaging/",
+            "sections": {section: "Ada Lovelace"},
+            "references": {
+                section: [
+                    {
+                        "kind": "conversation",
+                        "url": "/messaging/thread/2-ada/",
+                        "context": section,
+                        "text": "Ada Lovelace",
+                    }
+                ]
+            },
+            "section_errors": {
+                section: {
+                    "error_type": "thread_attribution_stopped",
+                    "error_message": "Click-derived conversation references stop.",
+                }
+            },
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, tool)
+        if tool == "get_inbox":
+            result = await tool_fn(mock_context)
+        else:
+            result = await tool_fn("ada", mock_context)
+
+        assert result == expected
+
+    @staticmethod
+    def _diagnostics_marker(monkeypatch):
+        """Stand in for the issue-report builder so no artifact is written."""
+        monkeypatch.setattr(
+            "linkedin_mcp_server.error_handler.build_issue_diagnostics",
+            lambda *args, **kwargs: {"marker": True},
+        )
+        monkeypatch.setattr(
+            "linkedin_mcp_server.error_handler.format_tool_error_with_diagnostics",
+            lambda message, diagnostics: f"{message}\n[issue diagnostics]",
+        )
+
+    async def test_an_operation_error_from_get_conversation_keeps_diagnostics(
+        self, monkeypatch
+    ):
+        """Mapper control: the base operation error takes the diagnostics path."""
+        from fastmcp.exceptions import ToolError
+
+        from linkedin_mcp_server.core.exceptions import LinkedInOperationError
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        self._diagnostics_marker(monkeypatch)
+        mock_extractor = _make_mock_extractor({})
+        mock_extractor.get_conversation = AsyncMock(
+            side_effect=LinkedInOperationError("Could not verify index 0.")
+        )
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        with patch(
+            "linkedin_mcp_server.tools.messaging.get_ready_extractor",
+            AsyncMock(return_value=mock_extractor),
+        ):
+            with pytest.raises(ToolError) as raised:
+                await mcp.call_tool("get_conversation", {"linkedin_username": "jacki"})
+
+        assert str(raised.value) == "Could not verify index 0.\n[issue diagnostics]"
+
+    async def test_an_unverifiable_username_index_is_refused_with_diagnostics(
+        self, monkeypatch, mock_page
+    ):
+        """The real owner's refusal, through the registered tool and mapper.
+
+        Only the page boundaries and the scan outcome are scripted: the first
+        matching row's click did not open a different thread. The refusal must
+        name the reason and keep the issue diagnostics, which it loses if the
+        owner raises it as a caller-reference error.
+
+        The tool receives the conversation owner wired the way the facade wires
+        it; the facade's own delegation is covered by the facade contract tests
+        and this module may not import the facade.
+        """
+        from fastmcp.exceptions import ToolError
+
+        from linkedin_mcp_server.linkedin.content import PageContentReader
+        from linkedin_mcp_server.linkedin.conversations import (
+            ConversationReader,
+            _StoppedRow,
+            _ThreadRefScan,
+        )
+        from linkedin_mcp_server.linkedin.navigation import PageNavigator
+        from linkedin_mcp_server.linkedin.profile_page import ProfilePageReader
+        from linkedin_mcp_server.linkedin.session import PageSession
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        async def no_message_target() -> Any:
+            raise AssertionError("the conversation owner reads no message target")
+
+        self._diagnostics_marker(monkeypatch)
+        session = PageSession(mock_page)
+        extractor = ConversationReader(
+            session,
+            PageNavigator(session),
+            PageContentReader(session),
+            ProfilePageReader(session, no_message_target),
+        )
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+        stopped = _ThreadRefScan(
+            refs=[], stopped_at=_StoppedRow("Select conversation with Jacki", 0)
+        )
+        root = AsyncMock()
+        navigate = AsyncMock()
+
+        with (
+            patch(
+                "linkedin_mcp_server.tools.messaging.get_ready_extractor",
+                AsyncMock(return_value=extractor),
+            ),
+            patch.object(PageSession, "check_rate_limit", new_callable=AsyncMock),
+            patch.object(PageSession, "dismiss_modal", new_callable=AsyncMock),
+            patch.object(PageNavigator, "_navigate_to_page", navigate),
+            patch.object(
+                ProfilePageReader,
+                "_read_profile_display_name",
+                new_callable=AsyncMock,
+                return_value="Jacki",
+            ),
+            patch.object(
+                ConversationReader,
+                "_extract_conversation_thread_refs",
+                new_callable=AsyncMock,
+                return_value=stopped,
+            ),
+            patch.object(PageContentReader, "_extract_root_content", root),
+        ):
+            with pytest.raises(ToolError) as raised:
+                await mcp.call_tool("get_conversation", {"linkedin_username": "jacki"})
+
+        assert str(raised.value) == (
+            "Could not verify conversation index 0 for jacki: 0 conversation(s) "
+            "were verified before a matching row that did not open a different "
+            "thread within the poll budget. It may already be open, or the click "
+            "may not have navigated in time. Pass a known thread_id instead."
+            "\n[issue diagnostics]"
+        )
+        assert [call.args[0] for call in navigate.await_args_list] == [
+            "https://www.linkedin.com/in/jacki/",
+            "https://www.linkedin.com/messaging/compose/",
+        ]
+        root.assert_not_awaited()
+
+    async def test_send_message_success(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/messaging/thread/abc123/",
             "status": "sent",
@@ -1079,13 +2117,13 @@ class TestMessagingTools:
         mcp = FastMCP("test")
         register_messaging_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "send_message")
         result = await tool_fn(
-            "testuser",
+            "https://www.linkedin.com/in/testuser/",
             "Hello!",
             True,
             mock_context,
-            extractor=mock_extractor,
         )
 
         assert result["status"] == "sent"
@@ -1110,7 +2148,7 @@ class TestMessagingTools:
             "connection request is accepted."
         ) in description
 
-    async def test_send_message_schema_explains_single_line_controls(self):
+    async def test_send_message_schema_explains_lines_and_controls(self):
         from linkedin_mcp_server.tools.messaging import register_messaging_tools
 
         mcp = FastMCP("test")
@@ -1120,8 +2158,11 @@ class TestMessagingTools:
         assert tool is not None
         message_schema = tool.parameters["properties"]["message"]
         assert " ".join(message_schema["description"].split()) == (
-            "Message text to send; line breaks are preserved. Other control "
-            "characters are rejected."
+            "Message text. LF, CRLF and CR all end a line; an empty line "
+            "separates paragraphs and is kept. Whitespace-only lines count as "
+            "empty, and leading and trailing whitespace of the whole message is "
+            "removed, as LinkedIn does when sending. Tab, other control "
+            "characters, DEL, U+0085, U+2028 and U+2029 are refused."
         )
 
     @pytest.mark.parametrize("message", ["", "   \t\n"], ids=["empty", "whitespace"])
@@ -1154,16 +2195,18 @@ class TestMessagingTools:
         assert result["retry_safe"] is True
         assert result["url"] == "https://www.linkedin.com/in/testuser/"
 
+    _REFUSED_CODEPOINTS = (
+        *(codepoint for codepoint in range(32) if codepoint not in (10, 13)),
+        127,
+        0x85,
+        0x2028,
+        0x2029,
+    )
+
     @pytest.mark.parametrize(
         "message",
-        [
-            f"First{chr(codepoint)}Second"
-            for codepoint in (*range(10), *range(11, 13), *range(14, 32), 127)
-        ],
-        ids=[
-            f"U+{codepoint:04X}"
-            for codepoint in (*range(10), *range(11, 13), *range(14, 32), 127)
-        ],
+        [f"First{chr(codepoint)}Second" for codepoint in _REFUSED_CODEPOINTS],
+        ids=[f"U+{codepoint:04X}" for codepoint in _REFUSED_CODEPOINTS],
     )
     async def test_send_message_refuses_controls_before_a_session(
         self, mock_context, message
@@ -1183,9 +2226,31 @@ class TestMessagingTools:
         ready.assert_not_awaited()
         assert result["status"] == "invalid_message"
         assert result["message"] == (
-            "Message must not contain control characters or tabs."
+            "Message must not contain control characters other than line breaks."
         )
         assert result["retry_safe"] is True
+
+    async def test_send_message_forwards_line_breaks_unchanged(
+        self, mock_context, serve_extractor
+    ):
+        """The tool refuses but never rewrites; the sender normalizes."""
+        mock_extractor = _make_mock_extractor(
+            {"status": "sent", "sent": True, "retry_safe": False}
+        )
+
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "send_message")
+        result = await tool_fn("testuser", "First\r\nSecond", True, mock_context)
+
+        assert result["status"] == "sent"
+        mock_extractor.send_message.assert_awaited_once_with(
+            "testuser", "First\r\nSecond", confirm_send=True, profile_urn=None
+        )
 
     @pytest.mark.parametrize(
         "username",
@@ -1242,11 +2307,11 @@ class TestMessagingTools:
     ):
         """The last await can discard an answer that says a message went out.
 
-        `ctx.report_progress` is the final await inside FastMCP's
-        `anyio.fail_after()`, so a deadline landing there raises
-        `CancelledError` past `except Exception` and throws away the result
-        the send already produced. Nothing can hand it back afterwards, and
-        the log line is then the only record.
+        `ctx.report_progress` is the final await of the tool. The tool's own
+        deadline no longer reaches it (#889), but a cancellation from outside
+        still raises `CancelledError` past `except Exception` and throws away
+        the result the send already produced. Nothing can hand it back
+        afterwards, and the log line is then the only record.
 
         Silent where the result says a retry is safe: nothing was submitted,
         so there is no duplicate delivery to warn about. That is `retry_safe`
@@ -1292,7 +2357,7 @@ class TestMessagingTools:
         warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert (SEND_INTERRUPTED_WARNING in warnings) is warns, warnings
 
-    async def test_send_message_with_profile_urn(self, mock_context):
+    async def test_send_message_with_profile_urn(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/messaging/thread/abc123/",
             "status": "sent",
@@ -1307,14 +2372,14 @@ class TestMessagingTools:
         mcp = FastMCP("test")
         register_messaging_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "send_message")
         result = await tool_fn(
             "testuser",
             "Hello!",
             True,
             mock_context,
-            profile_urn="ACoAAB1IelEB",
-            extractor=mock_extractor,
+            profile_urn=" ACoAAB1IelEB ",
         )
 
         assert result["status"] == "sent"
@@ -1322,41 +2387,22 @@ class TestMessagingTools:
             "testuser", "Hello!", confirm_send=True, profile_urn="ACoAAB1IelEB"
         )
 
-    async def test_message_invitation_sender_success(self, mock_context):
-        expected = {
-            "url": "https://www.linkedin.com/messaging/thread/abc123/",
-            "status": "confirmation_required",
-            "message": "Set confirm_send=true to send the message.",
-            "recipient_selected": True,
-            "sent": False,
-        }
-        mock_extractor = _make_mock_extractor(expected)
-
-        from linkedin_mcp_server.tools.messaging import register_messaging_tools
-
-        mcp = FastMCP("test")
-        register_messaging_tools(mcp)
-
-        tool_fn = await get_tool_fn(mcp, "message_invitation_sender")
-        result = await tool_fn(
+        mock_extractor.send_message.reset_mock()
+        await tool_fn(
             "testuser",
-            "/messaging/compose/?recipient=ACoAAB&invitation=urn",
             "Hello!",
-            False,
+            True,
             mock_context,
-            extractor=mock_extractor,
+            profile_urn="urn:li:fsd_profile:ACoAAB1IelEB",
         )
-
-        assert result["status"] == "confirmation_required"
-        assert result["sent"] is False
         mock_extractor.send_message.assert_awaited_once_with(
             "testuser",
             "Hello!",
-            confirm_send=False,
-            compose_url="/messaging/compose/?recipient=ACoAAB&invitation=urn",
+            confirm_send=True,
+            profile_urn="urn:li:fsd_profile:ACoAAB1IelEB",
         )
 
-    async def test_send_message_error(self, mock_context):
+    async def test_send_message_error(self, mock_context, serve_extractor):
         from fastmcp.exceptions import ToolError
 
         from linkedin_mcp_server.exceptions import SessionExpiredError
@@ -1369,6 +2415,7 @@ class TestMessagingTools:
         mcp = FastMCP("test")
         register_messaging_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "send_message")
         with pytest.raises(ToolError, match="Session expired"):
             await tool_fn(
@@ -1376,12 +2423,140 @@ class TestMessagingTools:
                 "Hello!",
                 True,
                 mock_context,
-                extractor=mock_extractor,
             )
+
+    async def test_send_message_description_points_replies_elsewhere(self):
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        tool = await mcp.get_tool("send_message")
+        assert tool is not None and tool.description is not None
+        description = " ".join(tool.description.split())
+        assert "use reply_to_conversation with the thread's id instead" in description
+        assert "Until a thread-targeted send path is available" not in description
+
+    async def test_reply_to_conversation_forwards_the_thread(
+        self, mock_context, serve_extractor
+    ):
+        expected = {
+            "url": "https://www.linkedin.com/messaging/thread/2-abc/",
+            "status": "sent",
+            "sent": True,
+            "retry_safe": False,
+            "thread_id": "2-abc",
+            "participant": "Ada Lovelace",
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "reply_to_conversation")
+        result = await tool_fn("2-abc", "Hello!", True, mock_context)
+
+        assert result == expected
+        mock_extractor.reply_to_conversation.assert_awaited_once_with(
+            "2-abc", "Hello!", confirm_send=True
+        )
+
+    async def test_reply_to_conversation_outlives_a_stalled_notification(
+        self, mock_context, serve_extractor
+    ):
+        """A deadline in the last await would discard a confirmed reply."""
+        expected = {
+            "url": "https://www.linkedin.com/messaging/thread/2-abc/",
+            "status": "sent",
+            "sent": True,
+            "retry_safe": False,
+            "thread_id": "2-abc",
+            "participant": "Ada Lovelace",
+        }
+        calls = 0
+
+        async def stall_on_completion(**_: Any) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                await anyio.sleep_forever()
+
+        mock_context.report_progress = stall_on_completion
+
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        serve_extractor(_make_mock_extractor(expected))
+        tool_fn = await get_tool_fn(mcp, "reply_to_conversation")
+        with anyio.fail_after(1):
+            result = await tool_fn("2-abc", "Hello!", True, mock_context)
+
+        assert calls == 2
+        assert result == expected
+
+    async def test_reply_to_conversation_is_a_write(self):
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        tool = await mcp.get_tool("reply_to_conversation")
+        assert tool is not None and tool.annotations is not None
+        assert not tool.annotations.read_only_hint
+        assert tool.annotations.destructive_hint is True
+        assert tool.parameters["required"] == ["thread_id", "message", "confirm_send"]
+
+    @pytest.mark.parametrize("message", ["", "tab\there"], ids=["blank", "c0"])
+    async def test_reply_to_conversation_refuses_before_a_session(
+        self, mock_context, message
+    ):
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "reply_to_conversation")
+        with patch(
+            "linkedin_mcp_server.tools.messaging.get_ready_extractor",
+            new_callable=AsyncMock,
+        ) as ready:
+            result = await tool_fn("2-abc", message, True, mock_context)
+
+        ready.assert_not_awaited()
+        assert result["status"] == "invalid_message"
+        assert result["retry_safe"] is True
+        assert result["url"] == "https://www.linkedin.com/messaging/thread/2-abc/"
+
+    async def test_reply_to_conversation_maps_a_bad_thread_id(self, mock_context):
+        from fastmcp.exceptions import ToolError
+
+        from linkedin_mcp_server.core.exceptions import InvalidReferenceError
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "reply_to_conversation")
+        with (
+            patch(
+                "linkedin_mcp_server.tools.messaging.get_ready_extractor",
+                new_callable=AsyncMock,
+            ) as ready,
+            pytest.raises(ToolError) as excinfo,
+        ):
+            await tool_fn("../../feed", "", True, mock_context)
+
+        ready.assert_not_awaited()
+        assert isinstance(excinfo.value.__cause__, InvalidReferenceError)
 
 
 class TestGetMyProfileTool:
-    async def test_get_my_profile_success(self, mock_context):
+    async def test_get_my_profile_success(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/in/johndoe/",
             "sections": {"main_profile": "John Doe\nSoftware Engineer"},
@@ -1393,13 +2568,14 @@ class TestGetMyProfileTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_my_profile")
-        result = await tool_fn(mock_context, extractor=mock_extractor)
+        result = await tool_fn(mock_context)
         assert result["url"] == "https://www.linkedin.com/in/johndoe/"
         assert "main_profile" in result["sections"]
         mock_extractor.get_my_profile.assert_awaited_once()
 
-    async def test_get_my_profile_with_sections(self, mock_context):
+    async def test_get_my_profile_with_sections(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/in/johndoe/",
             "sections": {"main_profile": "John Doe", "experience": "Work history"},
@@ -1411,16 +2587,15 @@ class TestGetMyProfileTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_my_profile")
-        result = await tool_fn(
-            mock_context, sections="experience", extractor=mock_extractor
-        )
+        result = await tool_fn(mock_context, sections="experience")
         assert "main_profile" in result["sections"]
         assert "experience" in result["sections"]
         call_kwargs = mock_extractor.get_my_profile.call_args.kwargs
         assert "experience" in call_kwargs["sections"]
 
-    async def test_get_my_profile_passes_callbacks(self, mock_context):
+    async def test_get_my_profile_passes_callbacks(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/in/johndoe/",
             "sections": {"main_profile": "John Doe"},
@@ -1432,14 +2607,15 @@ class TestGetMyProfileTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_my_profile")
-        await tool_fn(mock_context, extractor=mock_extractor)
+        await tool_fn(mock_context)
 
         call_kwargs = mock_extractor.get_my_profile.call_args.kwargs
         assert "callbacks" in call_kwargs
         assert isinstance(call_kwargs["callbacks"], MCPContextProgressCallback)
 
-    async def test_get_my_profile_unknown_section(self, mock_context):
+    async def test_get_my_profile_unknown_section(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/in/johndoe/",
             "sections": {"main_profile": "John Doe"},
@@ -1451,13 +2627,12 @@ class TestGetMyProfileTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_my_profile")
-        result = await tool_fn(
-            mock_context, sections="bogus_section", extractor=mock_extractor
-        )
+        result = await tool_fn(mock_context, sections="bogus_section")
         assert result["unknown_sections"] == ["bogus_section"]
 
-    async def test_get_my_profile_error(self, mock_context):
+    async def test_get_my_profile_error(self, mock_context, serve_extractor):
         from fastmcp.exceptions import ToolError
 
         from linkedin_mcp_server.exceptions import SessionExpiredError
@@ -1470,13 +2645,14 @@ class TestGetMyProfileTool:
         mcp = FastMCP("test")
         register_person_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_my_profile")
         with pytest.raises(ToolError, match="Session expired"):
-            await tool_fn(mock_context, extractor=mock_extractor)
+            await tool_fn(mock_context)
 
 
 class TestSearchCompaniesTool:
-    async def test_search_companies_success(self, mock_context):
+    async def test_search_companies_success(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/search/results/companies/?keywords=fintech",
             "sections": {"search_results": "Stripe\nFintech company\nSan Francisco"},
@@ -1488,12 +2664,13 @@ class TestSearchCompaniesTool:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "search_companies")
-        result = await tool_fn("fintech", mock_context, extractor=mock_extractor)
+        result = await tool_fn("fintech", mock_context)
         assert "search_results" in result["sections"]
         mock_extractor.search_companies.assert_awaited_once_with("fintech")
 
-    async def test_search_companies_error(self, mock_context):
+    async def test_search_companies_error(self, mock_context, serve_extractor):
         from fastmcp.exceptions import ToolError
 
         from linkedin_mcp_server.exceptions import SessionExpiredError
@@ -1506,13 +2683,14 @@ class TestSearchCompaniesTool:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "search_companies")
         with pytest.raises(ToolError, match="Session expired"):
-            await tool_fn("fintech", mock_context, extractor=mock_extractor)
+            await tool_fn("fintech", mock_context)
 
 
 class TestGetCompanyEmployeesTool:
-    async def test_get_company_employees_success(self, mock_context):
+    async def test_get_company_employees_success(self, mock_context, serve_extractor):
         expected = {
             "url": "https://www.linkedin.com/company/anthropic/people/",
             "sections": {"employees": "Jane Doe\nResearch Engineer\nSan Francisco"},
@@ -1524,14 +2702,20 @@ class TestGetCompanyEmployeesTool:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_company_employees")
-        result = await tool_fn("anthropic", mock_context, extractor=mock_extractor)
+        result = await tool_fn(
+            "https://www.linkedin.com/company/anthropic/",
+            mock_context,
+        )
         assert "employees" in result["sections"]
         mock_extractor.get_company_employees.assert_awaited_once_with(
-            "anthropic", keywords=None
+            "https://www.linkedin.com/company/anthropic/", keywords=None
         )
 
-    async def test_get_company_employees_with_keywords(self, mock_context):
+    async def test_get_company_employees_with_keywords(
+        self, mock_context, serve_extractor
+    ):
         expected = {
             "url": "https://www.linkedin.com/company/anthropic/people/?keywords=engineer",
             "sections": {"employees": "Jane Doe\nResearch Engineer"},
@@ -1543,16 +2727,15 @@ class TestGetCompanyEmployeesTool:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_company_employees")
-        result = await tool_fn(
-            "anthropic", mock_context, keywords="engineer", extractor=mock_extractor
-        )
+        result = await tool_fn("anthropic", mock_context, keywords="engineer")
         assert "employees" in result["sections"]
         mock_extractor.get_company_employees.assert_awaited_once_with(
             "anthropic", keywords="engineer"
         )
 
-    async def test_get_company_employees_error(self, mock_context):
+    async def test_get_company_employees_error(self, mock_context, serve_extractor):
         from fastmcp.exceptions import ToolError
 
         from linkedin_mcp_server.exceptions import SessionExpiredError
@@ -1567,35 +2750,27 @@ class TestGetCompanyEmployeesTool:
         mcp = FastMCP("test")
         register_company_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_company_employees")
         with pytest.raises(ToolError, match="Session expired"):
-            await tool_fn("anthropic", mock_context, extractor=mock_extractor)
+            await tool_fn("anthropic", mock_context)
 
 
 class TestFeedTools:
-    async def test_get_feed_success(self, mock_context):
-        """sections["feed"] is the structured FeedPost list, not raw text."""
-        posts: list[FeedPost] = [
+    async def test_get_feed_success(self, mock_context, serve_extractor):
+        mock_extractor = MagicMock()
+        posts = [
             {
-                "url": "/feed/update/urn:li:activity:1/",
-                "post_age": "21min",
-                "author": {
-                    "name": "Sami B",
-                    "profile_url": "/in/sami/",
-                    "headline": "Data scientist",
-                    "degree": "1st",
-                },
-                "content": "Hello world",
-                "is_promoted": False,
-                "media": None,
-                "reactions_count": 1,
-                "comment_count": None,
-                "repost_count": None,
+                "url": "/feed/update/urn:li:activity:123/",
+                "post_age": "1h",
+                "author": {"name": "Alice"},
+                "content": "Post body",
             }
         ]
-        mock_extractor = MagicMock()
         mock_extractor.extract_feed = AsyncMock(
-            return_value=ExtractedSection(text="", references=[], posts=posts)
+            return_value=SimpleNamespace(
+                text="", references=[], posts=posts, error=None
+            )
         )
 
         from linkedin_mcp_server.tools.feed import register_feed_tools
@@ -1603,23 +2778,20 @@ class TestFeedTools:
         mcp = FastMCP("test")
         register_feed_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_feed")
-        result = await tool_fn(mock_context, extractor=mock_extractor)
+        result = await tool_fn(mock_context)
         assert result["url"] == "https://www.linkedin.com/feed/"
-        # the tool must populate the section key (guards against the else
-        # branch being dropped) ...
         assert "feed" in result["sections"]
-        # ... and surface the structured list verbatim.
         assert result["sections"]["feed"] == posts
-        assert result["sections"]["feed"][0]["author"]["degree"] == "1st"
         assert "posts" not in result
 
-    async def test_get_feed_surfaces_references(self, mock_context):
+    async def test_get_feed_surfaces_references(self, mock_context, serve_extractor):
         """References from the extractor flow through to the tool result."""
         mock_extractor = MagicMock()
         mock_extractor.extract_feed = AsyncMock(
             return_value=ExtractedSection(
-                text="",
+                text="Some feed text",
                 references=[
                     {
                         "kind": "feed_post",
@@ -1639,15 +2811,57 @@ class TestFeedTools:
         mcp = FastMCP("test")
         register_feed_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_feed")
-        result = await tool_fn(mock_context, extractor=mock_extractor)
+        result = await tool_fn(mock_context)
         assert "posts" not in result
         assert "feed" in result["references"]
         urls = [r["url"] for r in result["references"]["feed"]]
         assert "/posts/alice_hello-ugcPost-1-xx" in urls
         assert "/feed/update/urn:li:activity:1234567890/" in urls
 
-    async def test_get_feed_rate_limited_surfaces_section_error(self, mock_context):
+    async def test_get_feed_keeps_references_without_visible_posts(
+        self, mock_context, serve_extractor
+    ):
+        mock_extractor = MagicMock()
+        mock_extractor.extract_feed = AsyncMock(
+            return_value=ExtractedSection(
+                text="",
+                references=[
+                    {
+                        "kind": "feed_post",
+                        "url": "/posts/orphan-ugcPost-1-xx",
+                        "context": "feed",
+                    }
+                ],
+            )
+        )
+
+        from linkedin_mcp_server.tools.feed import register_feed_tools
+
+        mcp = FastMCP("test")
+        register_feed_tools(mcp)
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "get_feed")
+        result = await tool_fn(mock_context)
+        assert result == {
+            "url": "https://www.linkedin.com/feed/",
+            "sections": {"feed": []},
+            "references": {
+                "feed": [
+                    {
+                        "kind": "feed_post",
+                        "url": "/posts/orphan-ugcPost-1-xx",
+                        "context": "feed",
+                    }
+                ]
+            },
+        }
+
+    async def test_get_feed_rate_limited_surfaces_section_error(
+        self, mock_context, serve_extractor
+    ):
         """Rate-limit sentinel becomes a typed section_errors entry."""
         mock_extractor = MagicMock()
         mock_extractor.extract_feed = AsyncMock(
@@ -1659,8 +2873,9 @@ class TestFeedTools:
         mcp = FastMCP("test")
         register_feed_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_feed")
-        result = await tool_fn(mock_context, extractor=mock_extractor)
+        result = await tool_fn(mock_context)
         assert "feed" not in result["sections"]
         assert result["section_errors"]["feed"]["error_type"] == "rate_limit"
         assert (
@@ -1668,7 +2883,7 @@ class TestFeedTools:
             == RATE_LIMITED_SECTION_TEXT
         )
 
-    async def test_get_feed_returns_section_errors(self, mock_context):
+    async def test_get_feed_returns_section_errors(self, mock_context, serve_extractor):
         mock_extractor = MagicMock()
         mock_extractor.extract_feed = AsyncMock(
             return_value=ExtractedSection(
@@ -1683,8 +2898,9 @@ class TestFeedTools:
         mcp = FastMCP("test")
         register_feed_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "get_feed")
-        result = await tool_fn(mock_context, extractor=mock_extractor)
+        result = await tool_fn(mock_context)
         assert result["sections"] == {}
         assert "feed" in result["section_errors"]
 
@@ -1717,435 +2933,8 @@ class TestFeedTools:
             await mcp.call_tool("get_feed", {"num_posts": 51})
 
 
-class TestNormalizeFeedPost:
-    """Python-side normalization of raw cards from _FEED_POSTS_JS."""
-
-    def _raw(self, **overrides: Any) -> dict[str, Any]:
-        base: dict[str, Any] = {
-            "url": "/feed/update/urn:li:activity:7/",
-            "post_age": "15h",
-            "author": {
-                "name": "Corentin Hugot",
-                "profile_url": "/in/corentin/",
-                "headline": "Co-founder",
-                "degree": "2nd",
-            },
-            "content": "I applied to YC 5 times",
-            "is_promoted": False,
-            "media": None,
-            "reactions_count": 141,
-            "comment_count": 34,
-            "repost_count": 1,
-        }
-        base.update(overrides)
-        return base
-
-    def test_native_post_round_trips(self):
-        assert _normalize_feed_post(self._raw()) == self._raw()
-
-    def test_sponsored_post_author_shape(self):
-        raw = self._raw(
-            url=None,
-            post_age=None,
-            is_promoted=True,
-            author={
-                "name": "Vanta",
-                "profile_url": "/company/vanta/",
-                "headline": "137,470 followers",
-                "degree": None,
-            },
-            content="Achieve SOC 2 compliance",
-            reactions_count=3,
-            comment_count=None,
-            repost_count=None,
-        )
-        post = _normalize_feed_post(raw)
-        assert post is not None
-        assert post["is_promoted"] is True
-        assert post["author"]["profile_url"] == "/company/vanta/"
-        assert post["author"]["headline"] == "137,470 followers"
-        assert post["author"]["degree"] is None
-        assert post["url"] is None
-        assert post["post_age"] is None
-
-    def test_silent_post_counts_are_none(self):
-        post = _normalize_feed_post(
-            self._raw(reactions_count=None, comment_count=None, repost_count=None)
-        )
-        assert post is not None
-        assert post["reactions_count"] is None
-        assert post["comment_count"] is None
-        assert post["repost_count"] is None
-
-    @pytest.mark.parametrize(
-        "media,expected",
-        [
-            (
-                {"type": "image", "url": "https://media.licdn.com/x.jpg"},
-                {"type": "image", "url": "https://media.licdn.com/x.jpg"},
-            ),
-            (
-                {"type": "video", "url": "https://media.licdn.com/v.mp4"},
-                {"type": "video", "url": "https://media.licdn.com/v.mp4"},
-            ),
-            (
-                {"type": "link", "url": "https://lnkd.in/abc"},
-                {"type": "link", "url": "https://lnkd.in/abc"},
-            ),
-            ({"type": "video", "url": None}, None),  # no src -> dropped
-            ({"type": "bogus", "url": "https://x"}, None),  # bad type
-            (None, None),
-            ("notadict", None),
-        ],
-    )
-    def test_media_normalization(self, media, expected):
-        post = _normalize_feed_post(self._raw(media=media))
-        assert post is not None
-        assert post["media"] == expected
-
-    @pytest.mark.parametrize(
-        "raw_degree,expected",
-        [
-            ("1st", "1st"),
-            ("2nd", "2nd"),
-            ("3rd+", "3rd+"),
-            ("• 1st", "1st"),
-            ("1ST", "1st"),
-            ("", None),
-            ("first", None),
-            (None, None),
-        ],
-    )
-    def test_degree_normalization(self, raw_degree, expected):
-        author = dict(self._raw()["author"], degree=raw_degree)
-        post = _normalize_feed_post(self._raw(author=author))
-        assert post is not None
-        assert post["author"]["degree"] == expected
-
-    @pytest.mark.parametrize(
-        "raw_age,expected",
-        [
-            ("21min", "21min"),
-            ("15h", "15h"),
-            ("1d", "1d"),
-            ("2mo", "2mo"),
-            ("3w", "3w"),
-            ("1y", "1y"),
-            ("21m", None),  # ambiguous bare form; JS emits the long token
-            ("yesterday", None),
-            ("", None),
-            (None, None),
-        ],
-    )
-    def test_age_validation(self, raw_age, expected):
-        post = _normalize_feed_post(self._raw(post_age=raw_age))
-        assert post is not None
-        assert post["post_age"] == expected
-
-    def test_count_coercion(self):
-        post = _normalize_feed_post(
-            self._raw(reactions_count="141", comment_count=-3, repost_count=True)
-        )
-        assert post is not None
-        assert post["reactions_count"] == 141  # numeric string coerced
-        assert post["comment_count"] is None  # negative -> None
-        assert post["repost_count"] is None  # bool rejected
-
-    def test_truncated_content_preserved(self):
-        post = _normalize_feed_post(self._raw(content="line one\nline two"))
-        assert post is not None
-        assert post["content"] == "line one\nline two"
-
-    def test_chrome_with_no_signal_dropped(self):
-        raw = self._raw(
-            url=None,
-            content=None,
-            author={
-                "name": None,
-                "profile_url": None,
-                "headline": None,
-                "degree": None,
-            },
-        )
-        assert _normalize_feed_post(raw) is None
-
-    def test_non_dict_dropped(self):
-        assert _normalize_feed_post("nope") is None
-        assert _normalize_feed_post(None) is None
-
-
-class TestNetworkTools:
-    async def test_get_pending_invitations_success(self, mock_context):
-        expected = {
-            "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/",
-            "invitations": [
-                {
-                    "type": "page_follow",
-                    "invitation_age": "1h",
-                    "sender": {
-                        "name": "Juan Manuel M. Pérez",
-                        "url": "/in/juanmanuelperez/",
-                        "headline": None,
-                        "mutual_connections": None,
-                    },
-                    "note": None,
-                    "target": {
-                        "page": {
-                            "name": "Magical Potion Consulting",
-                            "url": "/company/magical-potion-consulting/",
-                        },
-                        "newsletter": None,
-                    },
-                    "message_url": None,
-                }
-            ],
-        }
-        mock_extractor = _make_mock_extractor(expected)
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        tool_fn = await get_tool_fn(mcp, "get_pending_invitations")
-        result = await tool_fn(mock_context, extractor=mock_extractor)
-
-        assert list(result) == ["url", "invitations"]
-        assert result["invitations"][0]["type"] == "page_follow"
-        assert result["invitations"][0]["sender"]["url"] == "/in/juanmanuelperez/"
-        mock_extractor.get_pending_invitations.assert_awaited_once_with(
-            limit=20,
-            kind="received",
-        )
-
-    async def test_get_pending_invitations_sent_kind(self, mock_context):
-        expected = {
-            "url": "https://www.linkedin.com/mynetwork/invitation-manager/sent/",
-            "invitations": [
-                {
-                    "type": "connection_request",
-                    "invitation_age": "1w",
-                    "recipient": {
-                        "name": "Laurent SORBIER",
-                        "url": "/in/laurent-sorbier/",
-                        "headline": "chargé d’affaires chez belectric",
-                    },
-                }
-            ],
-        }
-        mock_extractor = _make_mock_extractor(expected)
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        tool_fn = await get_tool_fn(mcp, "get_pending_invitations")
-        result = await tool_fn(
-            mock_context,
-            limit=5,
-            kind="sent",
-            extractor=mock_extractor,
-        )
-
-        assert result["url"].endswith("/sent/")
-        invitation = result["invitations"][0]
-        assert invitation["recipient"]["headline"] == "chargé d’affaires chez belectric"
-        assert "sender" not in invitation
-        mock_extractor.get_pending_invitations.assert_awaited_once_with(
-            limit=5,
-            kind="sent",
-        )
-
-    async def test_get_pending_invitations_structured_content_shape(self):
-        expected = {
-            "url": "https://www.linkedin.com/mynetwork/invitation-manager/received/",
-            "invitations": [],
-        }
-        mock_extractor = _make_mock_extractor(expected)
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        with patch(
-            "linkedin_mcp_server.tools.network.get_ready_extractor",
-            new_callable=AsyncMock,
-            return_value=mock_extractor,
-        ):
-            result = await mcp.call_tool(
-                "get_pending_invitations",
-                {"kind": "received", "limit": 2},
-            )
-
-        assert result.structured_content == expected
-        assert list(result.structured_content or {}) == ["url", "invitations"]
-
-    async def test_get_pending_invitations_rejects_invalid_kind(self):
-        from fastmcp.exceptions import ValidationError
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        with pytest.raises(ValidationError, match="kind"):
-            await mcp.call_tool("get_pending_invitations", {"kind": "archived"})
-
-    async def test_get_pending_invitations_rejects_excessive_limit(self):
-        from fastmcp.exceptions import ValidationError
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        with pytest.raises(ValidationError, match="limit"):
-            await mcp.call_tool("get_pending_invitations", {"limit": 101})
-
-    async def test_invitation_action_tools_are_registered(self):
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        assert await mcp.get_tool("ignore_connection_request") is not None
-        assert await mcp.get_tool("withdraw_invitation") is not None
-        # The public surface intentionally does not expose accept — the
-        # tool only ignores. (Accept remains available internally via
-        # extractor.act_on_invitation for connect_with_person's
-        # auto-accept path.)
-        assert await mcp.get_tool("respond_to_invitation") is None
-
-    async def test_ignore_connection_request_success(self, mock_context):
-        expected = {
-            "url": "https://www.linkedin.com/in/alice/",
-            "status": "ignored",
-            "message": "Invitation ignored.",
-            "action": "ignore",
-            "linkedin_username": "alice",
-            "performed": True,
-            "profile_url": "/in/alice/",
-        }
-        mock_extractor = _make_mock_extractor(expected)
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        tool_fn = await get_tool_fn(mcp, "ignore_connection_request")
-        result = await tool_fn(
-            linkedin_username="alice",
-            ctx=mock_context,
-            extractor=mock_extractor,
-        )
-
-        assert result["action"] == "ignore"
-        assert result["status"] == "ignored"
-        mock_extractor.act_on_invitation.assert_awaited_once_with("alice", "ignore")
-
-    async def test_withdraw_invitation_success(self, mock_context):
-        expected = {
-            "url": "https://www.linkedin.com/mynetwork/invitation-manager/sent/",
-            "status": "withdrawn",
-            "message": "Invitation withdrawn.",
-            "action": "withdraw",
-            "linkedin_username": "bob",
-            "performed": True,
-            "profile_url": "/in/bob/",
-        }
-        mock_extractor = _make_mock_extractor(expected)
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        tool_fn = await get_tool_fn(mcp, "withdraw_invitation")
-        result = await tool_fn(
-            linkedin_username="bob",
-            ctx=mock_context,
-            extractor=mock_extractor,
-        )
-
-        assert result["status"] == "withdrawn"
-        assert result["action"] == "withdraw"
-        mock_extractor.act_on_invitation.assert_awaited_once_with("bob", "withdraw")
-
-    async def test_get_connections_success(self, mock_context):
-        expected = {
-            "url": "https://www.linkedin.com/mynetwork/invite-connect/connections/",
-            "connections": [
-                {
-                    "name": "Rob Choy",
-                    "url": "/in/robchoy/",
-                    "headline": "Founder & investor",
-                    "connected_on": "2026-05-25",
-                },
-                {
-                    "name": "Santiago Moreno",
-                    "url": "/in/santiago-moreno-7098138b/",
-                    "headline": "Regional Operations Manager - RWE Renewables France",
-                    "connected_on": "2026-05-24",
-                },
-            ],
-        }
-        mock_extractor = _make_mock_extractor(expected)
-        mock_extractor.get_connections = AsyncMock(return_value=expected)
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        tool_fn = await get_tool_fn(mcp, "get_connections")
-        result = await tool_fn(mock_context, extractor=mock_extractor)
-
-        assert list(result) == ["url", "connections"]
-        assert result["connections"][0]["url"] == "/in/robchoy/"
-        assert result["connections"][0]["connected_on"] == "2026-05-25"
-        mock_extractor.get_connections.assert_awaited_once_with(limit=20)
-
-    async def test_get_connections_structured_content_shape(self):
-        expected = {
-            "url": "https://www.linkedin.com/mynetwork/invite-connect/connections/",
-            "connections": [],
-        }
-        mock_extractor = _make_mock_extractor(expected)
-        mock_extractor.get_connections = AsyncMock(return_value=expected)
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        with patch(
-            "linkedin_mcp_server.tools.network.get_ready_extractor",
-            new_callable=AsyncMock,
-            return_value=mock_extractor,
-        ):
-            result = await mcp.call_tool("get_connections", {"limit": 5})
-
-        assert result.structured_content == expected
-        assert list(result.structured_content or {}) == ["url", "connections"]
-        mock_extractor.get_connections.assert_awaited_once_with(limit=5)
-
-    async def test_get_connections_rejects_excessive_limit(self):
-        from fastmcp.exceptions import ValidationError
-
-        from linkedin_mcp_server.tools.network import register_network_tools
-
-        mcp = FastMCP("test")
-        register_network_tools(mcp)
-
-        with pytest.raises(ValidationError, match="limit"):
-            await mcp.call_tool("get_connections", {"limit": 101})
-
-
 class TestPostTools:
-    async def test_search_posts_success(self, mock_context):
+    async def test_search_posts_success(self, mock_context, serve_extractor):
         expected = {
             "url": (
                 "https://www.linkedin.com/search/results/content/"
@@ -2160,28 +2949,30 @@ class TestPostTools:
         mcp = FastMCP("test")
         register_post_tools(mcp)
 
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "search_posts")
         result = await tool_fn(
             "Buscamos Unity",
             mock_context,
             date_posted="past-week",
-            extractor=mock_extractor,
+            content_type="documents",
         )
         assert "search_results" in result["sections"]
         mock_extractor.search_posts.assert_awaited_once_with(
             "Buscamos Unity",
             date_posted="past-week",
+            content_type="documents",
             max_pages=3,
         )
 
     async def test_search_posts_validation_error_surfaced_as_tool_error(
-        self, mock_context
+        self, mock_context, serve_extractor
     ):
         """A FilterValidationError from the extractor surfaces to the client as
         a ToolError carrying the same message, not the generic mask."""
         from fastmcp.exceptions import ToolError
 
-        from linkedin_mcp_server.scraping.contracts import FilterValidationError
+        from linkedin_mcp_server.linkedin.contracts import FilterValidationError
         from linkedin_mcp_server.tools.post import register_post_tools
 
         mock_extractor = MagicMock()
@@ -2191,6 +2982,7 @@ class TestPostTools:
 
         mcp = FastMCP("test")
         register_post_tools(mcp)
+        serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "search_posts")
 
         with pytest.raises(ToolError, match="Invalid date_posted"):
@@ -2198,7 +2990,6 @@ class TestPostTools:
                 "python",
                 mock_context,
                 date_posted="last-year",
-                extractor=mock_extractor,
             )
 
     async def test_search_posts_rejects_zero_max_pages(self, mock_context):
@@ -2231,17 +3022,15 @@ class TestToolTimeouts:
             "get_company_profile",
             "get_company_posts",
             "get_job_details",
+            "get_job_apply_url",
             "search_jobs",
             "get_saved_jobs",
             "get_inbox",
             "get_conversation",
             "search_conversations",
+            "archive_conversation",
             "send_message",
-            "message_invitation_sender",
-            "get_pending_invitations",
-            "get_connections",
-            "ignore_connection_request",
-            "withdraw_invitation",
+            "reply_to_conversation",
             "get_feed",
             "search_posts",
             "close_session",
@@ -2269,17 +3058,15 @@ class TestToolTimeouts:
             "search_companies",
             "get_company_employees",
             "get_job_details",
+            "get_job_apply_url",
             "search_jobs",
             "get_saved_jobs",
             "get_inbox",
             "get_conversation",
             "search_conversations",
+            "archive_conversation",
             "send_message",
-            "message_invitation_sender",
-            "get_pending_invitations",
-            "get_connections",
-            "ignore_connection_request",
-            "withdraw_invitation",
+            "reply_to_conversation",
             "get_feed",
             "search_posts",
             "close_session",
